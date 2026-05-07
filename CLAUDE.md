@@ -69,18 +69,19 @@ These are the shapes downstream code depends on. Pinned here so changes are deli
 **`opencode.py`** — async client. All methods take/return JSON-native types; no transformation of payloads.
 ```python
 async def create_session(directory: str) -> str
-    # POST /session?directory=<directory> with body {}.
+    # POST /session?directory=<abs_dir> with body {}.
     # Returns the SERVER-ASSIGNED session id (regex ^ses.* per the SDK schema —
     # we don't pick the id; we use it as :sessionID in subsequent calls).
 
 async def send_message(session_id: str, prompt: str, directory: str) -> dict
-    # POST /session/:id/message?directory=... with body {"parts":[{"type":"text","text":prompt}]}.
+    # POST /session/:id/message?directory=<abs_dir> with body
+    #   {"parts":[{"type":"text","text":prompt}]}.
     # Blocks until agent loop completes; returns the raw JSON envelope
     # ({info, parts}) — only the FINAL assistant message — see per-task flow.
 
 async def list_messages(session_id: str, directory: str) -> list[dict]
-    # GET /session/:id/message?directory=...; returns the full message list as-is.
-    # This is the canonical source of intermediate tool-loop steps.
+    # GET /session/:id/message?directory=<abs_dir>; returns the full message
+    # list as-is. This is the canonical source of intermediate tool-loop steps.
 
 async def stream_events(directory: str) -> AsyncIterator[dict]
     # GET /event SSE. Exposed for debugging only; runner does NOT consume this.
@@ -88,7 +89,18 @@ async def stream_events(directory: str) -> AsyncIterator[dict]
 
 `?directory=` is honored on every instance route by `InstanceMiddleware`
 (`opencode/packages/opencode/src/server/routes/instance/middleware.ts`); it can
-also be passed as the `x-opencode-directory` header.
+also be passed as the `x-opencode-directory` header. The middleware runs
+`AppFileSystem.resolve(...)` on the value, which is Node's `path.resolve()` —
+**a relative value is anchored on OpenCode's CWD, NOT on `workspace_root`**.
+The runner therefore sends the **absolute path** of the pre-cloned dir;
+sending just the subfolder name silently mis-anchors onto `opencode/<name>/`.
+
+**Auth** (when `OPENCODE_SERVER_PASSWORD` is set on the server side):
+HTTP Basic, with username defaulting to `"opencode"`
+(`opencode/packages/opencode/src/server/auth.ts`). The client sends
+`Authorization: Basic <base64(username:password)>`. There is **no**
+`x-opencode-server-password` header — that name is from no version of OpenCode
+and any code that sets it is a bug.
 
 **`swebench.py:load_samples(split, seed, n)`** — sample selection is **fully deterministic** given `(split, seed, n)`:
 1. Load all samples for the split.
@@ -243,13 +255,13 @@ scripts/curl_smoke.sh swebench      # send a real SWE-bench prompt
 
 ## Per-task flow (runner.py:_run_one)
 
-1. Compute `directory = f"session-<instance_id>-<short_uuid>"` (the workspace folder name; **not** the OpenCode session id).
-2. **Pre-clone the repo**: `git clone <sample.repo> <workspace_root>/<directory>` and `git -C <...> checkout <sample.base_commit>`. Synchronous, fail-fast — done by runner before any OpenCode call. This sidesteps the in-agent `git clone` hang.
-3. POST `/session?directory=<directory>` with body `{}` → server returns the assigned `session_id` (matches `^ses.*`). Then POST `/session/<session_id>/message?directory=<directory>` (synchronous; blocks until the agent loop finishes). RTT measured with `time.monotonic()`.
-4. **Always GET `/session/<session_id>/message?directory=<directory>` after** — the synchronous POST response carries only the FINAL assistant message; intermediate tool-loop steps are only available via the list endpoint.
-5. Write a TaskRecord with the raw message dump and basic metadata. The TaskRecord stores `directory` (our name) and `session_id` (server-assigned) as separate fields.
+1. Compute `directory = f"session-<instance_id>-<short_uuid>"` (the workspace folder name; **not** the OpenCode session id) and `abs_dir = workspace_root / directory`.
+2. **Pre-clone the repo**: `git clone <sample.repo> <abs_dir>` and `git -C <abs_dir> checkout <sample.base_commit>`. Synchronous, fail-fast — done by runner before any OpenCode call. This sidesteps the in-agent `git clone` hang.
+3. POST `/session?directory=<abs_dir>` with body `{}` → server returns the assigned `session_id` (matches `^ses.*`). Then POST `/session/<session_id>/message?directory=<abs_dir>` (synchronous; blocks until the agent loop finishes). RTT measured with `time.monotonic()`. The directory query value MUST be the absolute path — see Module contracts above.
+4. **Always GET `/session/<session_id>/message?directory=<abs_dir>` after** — the synchronous POST response carries only the FINAL assistant message; intermediate tool-loop steps are only available via the list endpoint.
+5. Write a TaskRecord with the raw message dump and basic metadata. The TaskRecord stores `directory` (the folder NAME, relative — for human readability) and `session_id` (server-assigned) as separate fields. The absolute path is recoverable as `<workspace_root>/<directory>`.
 
-OpenCode behavior when `?directory=<id>` points to an **already-existing** pre-cloned dir under EXPERIMENTAL_WORKSPACES needs to be verified against the vendored `opencode/` source — the assumption here is that it accepts and uses the existing dir as-is.
+OpenCode accepts a `?directory=` that points to an already-existing pre-cloned dir under `OPENCODE_EXPERIMENTAL_WORKSPACES=true` — verified against the vendored middleware (it just `path.resolve()`s the value and uses the resulting directory as the agent's working directory).
 
 ## Concurrency, errors, cleanup
 
@@ -303,7 +315,8 @@ Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > buil
 ## Conventions / gotchas
 
 - **Vendored sources are authoritative for any implementation detail.** When in doubt about a CLI flag, an env var, or a wire-format detail of OpenCode/Dynamo/vLLM, read the vendored source (`opencode/`, `dynamo/`) — do not rely on memory or external docs that may not match the pinned version.
-- **OpenCode is headless-only**, launched as `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <h> --port <p>` from `opencode/`. No TUI, no shared global workspace. Every session/message call must include `?directory=<unique>` (`InstanceMiddleware` reads it). Without the env var, concurrent agents will trample each other in a single CWD.
+- **OpenCode is headless-only**, launched as `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <h> --port <p>` from `opencode/`. No TUI, no shared global workspace. Every session/message call must include `?directory=<absolute path>` (`InstanceMiddleware` reads it). Without the env var, concurrent agents will trample each other in a single CWD. **Always send the absolute path** — `InstanceMiddleware` calls `AppFileSystem.resolve()` (Node `path.resolve()`) so a bare folder name resolves against OpenCode's CWD (= the `opencode/` repo), not against `workspace_root`.
+- **OpenCode auth is HTTP Basic** when `OPENCODE_SERVER_PASSWORD` is set on the server. Username defaults to `"opencode"` (override via `OPENCODE_SERVER_USERNAME` server-side). The client sends `Authorization: Basic <base64(user:pass)>`. There is no `x-opencode-server-password` header — do not invent one.
 - **Runner pre-clones; agent does not.** SWE-bench tasks have repo+base_commit. Runner does the clone+checkout synchronously before opening the OpenCode session. The agent operates on a pre-prepared checkout, never `git clone`s itself (this has been observed to hang the agent loop).
 - **System prompt lives on the user message** (`info.system`), and OpenCode types it as `string[]`. Consumers should normalize lists to `"\n\n".join(...)`.
 - **Each PD worker needs a unique NIXL side-channel port.** vLLM defaults all workers to 5600 and they collide on a single host. `testbed.sh` exports `VLLM_NIXL_SIDE_CHANNEL_HOST` (per worker, from `worker.host`) and `VLLM_NIXL_SIDE_CHANNEL_PORT` (`nixl_port_base + rank*100`). Do not rely on vLLM defaults.
@@ -324,4 +337,8 @@ Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > buil
 
 ## Branch
 
-Active development branch: `claude/setup-agent-scheduler-tests-Mzol4`. Push directly here unless told otherwise.
+`main` is the active branch — the scaffolding has merged. Push fixes directly to `main` unless told otherwise.
+
+## Test suite (interface-drift detectors)
+
+`tests/test_*_interface.py` and `tests/test_opencode_template.py` exist specifically to fail-loudly when a vendored submodule renames a flag or schema field that the testbed depends on. They grep `dynamo/` and `opencode/` source for known names; they do NOT need the components running. If one of these tests starts failing, **read the vendored source first** before patching the test — the test exists to catch real upstream drift, not to be silenced.
