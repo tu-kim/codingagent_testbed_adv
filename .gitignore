@@ -1,0 +1,25 @@
+# Runtime artifacts (see CLAUDE.md)
+logs/
+results/
+
+# Rendered from deploy/opencode.json.tmpl at launch
+opencode/opencode.json
+
+# Local secrets / overrides
+.env
+.env.local
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

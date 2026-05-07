@@ -1,0 +1,6 @@
+[submodule "dynamo"]
+	path = dynamo
+	url = https://github.com/ai-dynamo/dynamo.git
+[submodule "opencode"]
+	path = opencode
+	url = https://github.com/anomalyco/opencode.git
