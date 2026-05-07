@@ -1,0 +1,128 @@
+"""Verify deploy/opencode.json.tmpl renders to a structure that matches the
+schema expected by the vendored opencode/ submodule. No network."""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_TMPL = _REPO_ROOT / "deploy" / "opencode.json.tmpl"
+_OPENCODE_PROVIDER_TS = (
+    _REPO_ROOT / "opencode" / "packages" / "opencode" / "src" / "config" / "provider.ts"
+)
+_OPENCODE_CONFIG_TS = (
+    _REPO_ROOT / "opencode" / "packages" / "opencode" / "src" / "config" / "config.ts"
+)
+
+
+def _render(
+    *,
+    dynamo_base_url: str = "http://127.0.0.1:8000/v1",
+    served_name: str = "local",
+    model_name: str = "qwen3-coder-30b-a3b",
+    provider_id: str = "dynamo",
+) -> dict:
+    """Mirror testbed.sh's sed substitution and parse the result."""
+    text = _TMPL.read_text()
+    text = text.replace("{{DYNAMO_BASE_URL}}", dynamo_base_url)
+    text = text.replace("{{MODEL_SERVED_NAME}}", served_name)
+    text = text.replace("{{MODEL_NAME}}", model_name)
+    text = text.replace("{{PROVIDER_ID}}", provider_id)
+    return json.loads(text)
+
+
+def test_template_has_no_unsubstituted_placeholders():
+    """Catch the case where someone adds {{FOO}} to the template but forgets to
+    teach testbed.sh to substitute it — the resulting file would crash OpenCode."""
+    raw = _TMPL.read_text()
+    leftover = re.findall(r"\{\{[A-Z_]+\}\}", raw)
+    # Each placeholder must be substituted in deploy/testbed.sh.
+    sh = (_REPO_ROOT / "deploy" / "testbed.sh").read_text()
+    for ph in leftover:
+        assert ph in sh, f"template uses {ph!r} but deploy/testbed.sh has no sed for it"
+
+
+def test_rendered_template_is_valid_json():
+    cfg = _render()
+    assert isinstance(cfg, dict)
+
+
+def test_rendered_template_has_provider_block_with_required_fields():
+    cfg = _render(provider_id="dynamo", served_name="local", model_name="qwen3-coder-30b-a3b")
+    assert "provider" in cfg
+    assert "dynamo" in cfg["provider"]
+    block = cfg["provider"]["dynamo"]
+    # The four fields the OpenCode provider Info schema actually consumes:
+    assert block["name"] == "dynamo"
+    assert block["npm"] == "@ai-sdk/openai-compatible"
+    assert block["options"]["baseURL"] == "http://127.0.0.1:8000/v1"
+    assert block["options"]["apiKey"] == "unused"
+    # The model registry uses the served-name as the key (= the id sent
+    # upstream to Dynamo) and `name` as a display label.
+    assert "local" in block["models"]
+    assert block["models"]["local"]["name"] == "qwen3-coder-30b-a3b"
+
+
+def test_rendered_template_pins_model_to_provider_slash_served_name():
+    cfg = _render(provider_id="dynamo", served_name="local")
+    # OpenCode's top-level `model` field is `provider/model` per the schema
+    # comment in opencode/packages/opencode/src/config/config.ts.
+    assert cfg["model"] == "dynamo/local"
+
+
+@pytest.mark.skipif(not _OPENCODE_PROVIDER_TS.exists(), reason="vendored opencode/ not present")
+def test_provider_npm_field_name_matches_vendored_schema():
+    """If OpenCode renames `provider.<id>.npm` to something else, our render breaks."""
+    src = _OPENCODE_PROVIDER_TS.read_text()
+    # The Info struct must declare an `npm:` field. We're being deliberately
+    # loose to tolerate Schema.optional(...) wrappings.
+    assert re.search(r"\bnpm:\s*Schema\.", src), (
+        "opencode/packages/opencode/src/config/provider.ts no longer declares "
+        "an `npm` field on the provider Info struct — opencode.json.tmpl is "
+        "now broken."
+    )
+
+
+@pytest.mark.skipif(not _OPENCODE_CONFIG_TS.exists(), reason="vendored opencode/ not present")
+def test_top_level_model_field_exists_in_vendored_schema():
+    src = _OPENCODE_CONFIG_TS.read_text()
+    assert re.search(r"\bmodel:\s*Schema\.optional\(ConfigModelID\)", src), (
+        "opencode/packages/opencode/src/config/config.ts no longer declares a "
+        "top-level `model` field — opencode.json.tmpl needs to change."
+    )
+
+
+def test_substitution_is_idempotent_across_runs(tmp_path: Path):
+    """testbed.sh runs `sed -e ... opencode.json.tmpl > opencode/opencode.json`
+    on every `up opencode`. The output must be byte-identical for the same inputs."""
+    a = subprocess.run(
+        [
+            "sed",
+            "-e", "s|{{DYNAMO_BASE_URL}}|http://127.0.0.1:8000/v1|g",
+            "-e", "s|{{MODEL_SERVED_NAME}}|local|g",
+            "-e", "s|{{MODEL_NAME}}|qwen3-coder-30b-a3b|g",
+            "-e", "s|{{PROVIDER_ID}}|dynamo|g",
+            str(_TMPL),
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    b = subprocess.run(
+        [
+            "sed",
+            "-e", "s|{{DYNAMO_BASE_URL}}|http://127.0.0.1:8000/v1|g",
+            "-e", "s|{{MODEL_SERVED_NAME}}|local|g",
+            "-e", "s|{{MODEL_NAME}}|qwen3-coder-30b-a3b|g",
+            "-e", "s|{{PROVIDER_ID}}|dynamo|g",
+            str(_TMPL),
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert a == b
+    # And every substitution actually fired (no '{{...}}' left over).
+    assert "{{" not in a

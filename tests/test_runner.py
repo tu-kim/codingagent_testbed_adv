@@ -77,8 +77,17 @@ async def test_happy_path_records_success_and_messages(tmp_path: Path):
     assert rec.directory.startswith("session-django__django-1-")
     assert rec.rtt_s is not None and rec.rtt_s >= 0.0
     assert rec.messages == [{"info": {}, "parts": []}]
-    # send_message was called with the same directory we recorded.
-    assert client.send_calls[0][2] == rec.directory
+    # Runner must send an ABSOLUTE path to OpenCode — its InstanceMiddleware
+    # resolves `?directory=` against its own CWD, so a bare subfolder name
+    # would silently mis-anchor onto opencode/<name>/ instead of
+    # <workspace_root>/<name>/.
+    sent = client.send_calls[0][2]
+    assert Path(sent).is_absolute(), f"directory passed to OpenCode must be absolute, got {sent!r}"
+    assert sent == str(tmp_path / rec.directory)
+    # create_session got the same absolute path.
+    assert client.create_calls[0] == sent
+    # list_messages too.
+    assert client.list_calls[0][1] == sent
 
 
 async def test_clone_failure_marks_clone_stage(monkeypatch, tmp_path: Path):

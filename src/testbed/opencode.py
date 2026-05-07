@@ -17,16 +17,23 @@ from .config import OpenCodeCfg
 
 
 class OpenCodeClient:
-    def __init__(self, cfg: OpenCodeCfg, *, password: str | None = None) -> None:
-        headers: dict[str, str] = {}
-        if password:
-            headers["x-opencode-server-password"] = password
+    def __init__(
+        self,
+        cfg: OpenCodeCfg,
+        *,
+        password: str | None = None,
+        username: str = "opencode",
+    ) -> None:
+        # OpenCode authenticates via HTTP Basic when OPENCODE_SERVER_PASSWORD is
+        # set on the server. The username defaults to "opencode" (see
+        # opencode/packages/opencode/src/server/auth.ts:19).
+        auth = httpx.BasicAuth(username, password) if password else None
         # POST /session/:id/message blocks until the agent loop completes,
         # which can take many minutes. Keep read timeout open-ended.
         self._client = httpx.AsyncClient(
             base_url=f"http://{cfg.host}:{cfg.port}",
             timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None),
-            headers=headers,
+            auth=auth,
         )
 
     async def __aenter__(self) -> "OpenCodeClient":

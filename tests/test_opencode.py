@@ -60,14 +60,61 @@ async def test_list_messages_returns_response_unchanged(respx_mock, cfg):
 
 
 @respx.mock(assert_all_called=True)
-async def test_password_header_is_set_when_provided(respx_mock, cfg):
+async def test_basic_auth_header_with_default_username(respx_mock, cfg):
+    """OpenCode authenticates via HTTP Basic; username defaults to 'opencode'."""
+    import base64
+
     route = respx_mock.post(f"{_BASE}/session", params={"directory": "wkspace"}).mock(
         return_value=httpx.Response(200, json={"id": "ses_ok"})
     )
     async with OpenCodeClient(cfg, password="hunter2") as client:
         await client.create_session(directory="wkspace")
     headers = route.calls[0].request.headers
-    assert headers.get("x-opencode-server-password") == "hunter2"
+    expected = "Basic " + base64.b64encode(b"opencode:hunter2").decode()
+    assert headers.get("authorization") == expected
+    # The legacy header must NOT be sent — it has no effect server-side.
+    assert "x-opencode-server-password" not in {k.lower() for k in headers.keys()}
+
+
+@respx.mock(assert_all_called=True)
+async def test_basic_auth_header_with_custom_username(respx_mock, cfg):
+    import base64
+
+    route = respx_mock.post(f"{_BASE}/session", params={"directory": "wkspace"}).mock(
+        return_value=httpx.Response(200, json={"id": "ses_ok"})
+    )
+    async with OpenCodeClient(cfg, password="hunter2", username="alice") as client:
+        await client.create_session(directory="wkspace")
+    headers = route.calls[0].request.headers
+    expected = "Basic " + base64.b64encode(b"alice:hunter2").decode()
+    assert headers.get("authorization") == expected
+
+
+@respx.mock(assert_all_called=True)
+async def test_no_auth_header_when_password_unset(respx_mock, cfg):
+    route = respx_mock.post(f"{_BASE}/session", params={"directory": "wkspace"}).mock(
+        return_value=httpx.Response(200, json={"id": "ses_ok"})
+    )
+    async with OpenCodeClient(cfg) as client:
+        await client.create_session(directory="wkspace")
+    headers = route.calls[0].request.headers
+    # httpx normalizes header keys to lowercase.
+    assert "authorization" not in {k.lower() for k in headers.keys()}
+
+
+@respx.mock(assert_all_called=True)
+async def test_directory_query_passes_absolute_path_unchanged(respx_mock, cfg):
+    """OpenCode resolves `?directory=` via path.resolve() against its CWD; the
+    runner sends an absolute path so the middleware finds the pre-cloned dir."""
+    abs_path = "/tmp/testbed-workspaces/session-django__django-1-abc12345"
+    route = respx_mock.post(f"{_BASE}/session", params={"directory": abs_path}).mock(
+        return_value=httpx.Response(200, json={"id": "ses_abs"})
+    )
+    async with OpenCodeClient(cfg) as client:
+        sid = await client.create_session(directory=abs_path)
+    assert sid == "ses_abs"
+    sent = route.calls[0].request.url.params.get("directory")
+    assert sent == abs_path
 
 
 def test_normalize_system_prompt_joins_string_array():

@@ -70,6 +70,11 @@ async def _run_one(
     instance_id = sample["instance_id"]
     directory = f"session-{instance_id}-{uuid.uuid4().hex[:8]}"
     dest = workspace_root / directory
+    # OpenCode's InstanceMiddleware resolves `?directory=` via `path.resolve()`
+    # against its own CWD (opencode/packages/opencode/src/server/routes/instance/middleware.ts).
+    # We pre-clone to <workspace_root>/<directory>, so we MUST send the absolute
+    # path or OpenCode will look in opencode/<directory> instead.
+    abs_dir = str(dest)
 
     async with sem:
         # Stage 1: clone.
@@ -89,7 +94,7 @@ async def _run_one(
 
         # Stage 2: create session.
         try:
-            session_id = await client.create_session(directory=directory)
+            session_id = await client.create_session(directory=abs_dir)
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,
@@ -106,7 +111,7 @@ async def _run_one(
         prompt = swebench.render_prompt(sample)
         t0 = time.monotonic()
         try:
-            await client.send_message(session_id, prompt, directory=directory)
+            await client.send_message(session_id, prompt, directory=abs_dir)
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,
@@ -122,7 +127,7 @@ async def _run_one(
 
         # Stage 4: list messages. RTT is already valid — failure here keeps success=True.
         try:
-            messages = await client.list_messages(session_id, directory=directory)
+            messages = await client.list_messages(session_id, directory=abs_dir)
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,

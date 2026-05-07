@@ -31,10 +31,14 @@ require() {
 require curl
 require jq
 
-# Use a stable per-run directory so multiple smokes don't trample.
+# Use a stable per-run directory so multiple smokes don't trample. OpenCode's
+# InstanceMiddleware resolves ?directory= against its own CWD, so we send the
+# absolute path of the dir we just created.
 DIR_NAME="smoke-$(date -u +%Y%m%dT%H%M%S)-$$"
 WORKSPACE_ROOT=$(cfg .workspace_root)
-mkdir -p "$WORKSPACE_ROOT/$DIR_NAME"
+DIR_ABS="$WORKSPACE_ROOT/$DIR_NAME"
+mkdir -p "$DIR_ABS"
+DIR_QS=$(jq -rn --arg d "$DIR_ABS" '$d|@uri')
 
 smoke_routes() {
   echo "== routes =="
@@ -53,12 +57,12 @@ smoke_opencode() {
   local sid
   sid=$(curl -fsS -H 'content-type: application/json' \
     -d '{}' \
-    "$OC/session?directory=$DIR_NAME" | jq -r '.id')
+    "$OC/session?directory=$DIR_QS" | jq -r '.id')
   echo "session: $sid"
   curl -fsS -H 'content-type: application/json' \
     -d '{"parts":[{"type":"text","text":"Reply with the single word: hello"}]}' \
-    "$OC/session/$sid/message?directory=$DIR_NAME" | jq '.info.id // .'
-  curl -fsS "$OC/session/$sid/message?directory=$DIR_NAME" | jq 'length'
+    "$OC/session/$sid/message?directory=$DIR_QS" | jq '.info.id // .'
+  curl -fsS "$OC/session/$sid/message?directory=$DIR_QS" | jq 'length'
 }
 
 smoke_swebench() {
@@ -70,11 +74,11 @@ smoke_swebench() {
   local sid
   sid=$(curl -fsS -H 'content-type: application/json' \
     -d '{}' \
-    "$OC/session?directory=$DIR_NAME" | jq -r '.id')
+    "$OC/session?directory=$DIR_QS" | jq -r '.id')
   echo "session: $sid"
   curl -fsS -H 'content-type: application/json' \
     -d "$payload" \
-    "$OC/session/$sid/message?directory=$DIR_NAME" | jq '.info.id // .'
+    "$OC/session/$sid/message?directory=$DIR_QS" | jq '.info.id // .'
 }
 
 case "${1-all}" in
