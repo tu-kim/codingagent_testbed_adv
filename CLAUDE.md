@@ -19,10 +19,10 @@ SWE-bench sample
                            │
                            ▼ (OpenAI Chat Completions)
                  Dynamo frontend (:8000/v1)
-                  --router-mode {round-robin|least-loaded|kv}
-                  worker discovery via NATS
+                  --router-mode {round-robin|least-loaded|kv|...}
+                  worker discovery via etcd (default); NATS is the request/event plane
                            │
-                           ▼ (KV cache transfer over NIXL)
+                           ▼ (KV cache transfer via vLLM's NixlConnector)
                  vLLM workers
                    prefill (kv_producer) ──► decode (kv_consumer)
 ```
@@ -69,19 +69,26 @@ These are the shapes downstream code depends on. Pinned here so changes are deli
 **`opencode.py`** — async client. All methods take/return JSON-native types; no transformation of payloads.
 ```python
 async def create_session(directory: str) -> str
-    # POST /session?directory=<directory>; returns session_id
+    # POST /session?directory=<directory> with body {}.
+    # Returns the SERVER-ASSIGNED session id (regex ^ses.* per the SDK schema —
+    # we don't pick the id; we use it as :sessionID in subsequent calls).
 
 async def send_message(session_id: str, prompt: str, directory: str) -> dict
-    # POST /session/:id/message?directory=...; blocks until agent loop completes;
-    # returns the raw JSON envelope (which carries only the FINAL assistant message — see per-task flow).
+    # POST /session/:id/message?directory=... with body {"parts":[{"type":"text","text":prompt}]}.
+    # Blocks until agent loop completes; returns the raw JSON envelope
+    # ({info, parts}) — only the FINAL assistant message — see per-task flow.
 
 async def list_messages(session_id: str, directory: str) -> list[dict]
     # GET /session/:id/message?directory=...; returns the full message list as-is.
     # This is the canonical source of intermediate tool-loop steps.
 
-async def stream_events(session_id: str, directory: str) -> AsyncIterator[dict]
+async def stream_events(directory: str) -> AsyncIterator[dict]
     # GET /event SSE. Exposed for debugging only; runner does NOT consume this.
 ```
+
+`?directory=` is honored on every instance route by `InstanceMiddleware`
+(`opencode/packages/opencode/src/server/routes/instance/middleware.ts`); it can
+also be passed as the `x-opencode-directory` header.
 
 **`swebench.py:load_samples(split, seed, n)`** — sample selection is **fully deterministic** given `(split, seed, n)`:
 1. Load all samples for the split.
@@ -107,7 +114,7 @@ model:
   served_name: local              # OpenCode provider id used in opencode.json
 
 vllm:
-  kv_connector: NIXL              # vLLM kv-transfer connector
+  kv_connector: NixlConnector     # vLLM kv-transfer connector class name (matches what vLLM expects)
   nixl_port_base: 6000            # rank N → VLLM_NIXL_SIDE_CHANNEL_PORT = base + N*100
 
   # Each worker entry:
@@ -137,10 +144,14 @@ vllm:
   extra_args: ""                  # appended to every vLLM serve invocation
 
 dynamo:
-  host: 127.0.0.1
-  port: 8000
-  router_mode: round-robin        # round-robin | least-loaded | kv
-  nats_url: nats://127.0.0.1:4222 # NATS endpoint for worker discovery (must be reachable)
+  host: 127.0.0.1                 # → --http-host on dynamo.frontend
+  port: 8000                      # → --http-port on dynamo.frontend
+  router_mode: round-robin        # round-robin | least-loaded | kv | random | power-of-two | direct | device-aware-weighted
+  discovery_backend: etcd         # → --discovery-backend (kubernetes | etcd | file | mem)
+  etcd_endpoints: http://127.0.0.1:2379   # → ETCD_ENDPOINTS env on every dynamo process
+  nats_url: nats://127.0.0.1:4222         # → NATS_SERVER env (request/event plane, NOT discovery)
+  request_plane: tcp              # → --request-plane (tcp | nats | http)
+  event_plane: nats               # → --event-plane (nats | zmq)
 
 opencode:
   host: 127.0.0.1
@@ -152,25 +163,27 @@ There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=
 
 ### Worker role injection (kv_role + disaggregation_mode)
 
-Each worker needs role-specific Dynamo/vLLM args:
-- entries under `prefill_workers` → `kv_role=kv_producer`, `disaggregation_mode=prefill`
-- entries under `decode_workers` → `kv_role=kv_consumer`, `disaggregation_mode=decode`
+Each worker needs role-specific Dynamo/vLLM args. `testbed.sh` injects these at launch:
+- `prefill_workers[]` → `--disaggregation-mode prefill` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`
+- `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'`
 
-`testbed.sh` injects these at launch. **Exact arg names and JSON shape are not pinned in this doc** — they depend on the Dynamo version vendored in `dynamo/`. The launch script reads the actual flag schema from the vendored source (and `dynamo/<binary> --help`) so the testbed tracks whatever version is checked in.
+The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`).
 
-### Discovery: NATS (chosen for distributed deploy)
+### Discovery vs. NATS
 
-NATS was picked over file-based discovery because file-based only works when Dynamo and all workers share a filesystem. NATS scales naturally across nodes — every worker connects to `dynamo.nats_url`, registers, and Dynamo's frontend subscribes. For local single-node use, run `nats-server` on `127.0.0.1:4222` once; for multi-node, point all `host` entries' deploys at a NATS reachable from each.
+Two separate concerns:
+- **Discovery** is how the frontend learns about workers. Default `--discovery-backend etcd`; choices: `kubernetes | etcd | file | mem`. Set `ETCD_ENDPOINTS` on every dynamo process. (CLAUDE.md previously said "discovery via NATS" — that was wrong; NATS does not appear in the discovery enum.)
+- **Request/Event plane** is how requests + KV events flow once workers are discovered. NATS is the default event plane and an option for the request plane. Set `NATS_SERVER` on every dynamo process.
 
-NATS is treated as an **external prerequisite**: `testbed.sh up` does not start it. `testbed.sh up nats` is provided as a single-node convenience that runs `nats-server` locally with default config.
+Both etcd and NATS are treated as **external prerequisites**. `testbed.sh up etcd` and `testbed.sh up nats` exist as single-node conveniences only.
 
 ## Lifecycle: one script, four verbs
 
 `deploy/testbed.sh` is the only thing you need to remember. It is self-contained — no `_lib.sh`, no Makefile, no docker-compose.
 
 ```
-deploy/testbed.sh up     [nats|workers|frontend|opencode|all]   # default: all (= workers + frontend + opencode)
-deploy/testbed.sh down   [nats|workers|frontend|opencode|all]   # default: all
+deploy/testbed.sh up     [nats|etcd|workers|frontend|opencode|all]   # default: all (= workers + frontend + opencode)
+deploy/testbed.sh down   [nats|etcd|workers|frontend|opencode|all]   # default: all
 deploy/testbed.sh status
 deploy/testbed.sh logs   <component>
 ```
@@ -185,9 +198,9 @@ All PID files and component logs are written to **`./logs/`** (created relative 
 4. passes `--max-model-len`, `--max-num-batched-tokens`, `--max-num-seqs`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--kv-transfer-config` (with `kv_connector`) plus `vllm.extra_args`,
 5. spawns the worker locally. (Multi-node SSH spawn is TBD; for now keep all worker hosts at 127.0.0.1.)
 
-`up frontend` starts `dynamo.frontend` on `dynamo.port` with `--router-mode` from yaml, pointing discovery at `dynamo.nats_url`. Assumes NATS is reachable.
+`up frontend` starts `dynamo.frontend` with `--http-host`, `--http-port`, `--router-mode`, `--discovery-backend`, `--request-plane`, and `--event-plane` from yaml, exporting `NATS_SERVER` and `ETCD_ENDPOINTS` into the child env. Assumes NATS and etcd (or whichever discovery backend is configured) are reachable.
 
-`up opencode` renders `opencode/opencode.json` from the template, then runs `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun dev serve --host <host> --port <port>` from inside the vendored `opencode/` directory. (TBD: exact `bun dev serve` flags and the templated variables in `opencode.json.tmpl` are derived from `opencode/`'s docs.)
+`up opencode` renders `opencode/opencode.json` from the template, then runs `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <host> --port <port>` from inside the vendored `opencode/` directory. (`bun dev` is the bun shorthand for `bun run dev`; the actual flag is `--hostname`, not `--host`, per `opencode/packages/opencode/src/cli/network.ts`.)
 
 `up` with no arg brings up `workers → frontend → opencode` in order; `down` reverses.
 
@@ -230,11 +243,11 @@ scripts/curl_smoke.sh swebench      # send a real SWE-bench prompt
 
 ## Per-task flow (runner.py:_run_one)
 
-1. Compute `session_id = "session-<instance_id>-<short_uuid>"`.
-2. **Pre-clone the repo**: `git clone <sample.repo> <workspace_root>/<session_id>` and `git -C <...> checkout <sample.base_commit>`. Synchronous, fail-fast — done by runner before any OpenCode call. This sidesteps the in-agent `git clone` hang.
-3. POST `/session?directory=<session_id>`, then POST `/session/:id/message?directory=<session_id>` (synchronous; blocks until the agent loop finishes). RTT measured with `time.monotonic()`.
-4. **Always GET `/session/:id/message?directory=<session_id>` after** — the synchronous POST response carries only the FINAL assistant message; intermediate tool-loop steps are only available via the list endpoint.
-5. Write a TaskRecord with the raw message dump and basic metadata.
+1. Compute `directory = f"session-<instance_id>-<short_uuid>"` (the workspace folder name; **not** the OpenCode session id).
+2. **Pre-clone the repo**: `git clone <sample.repo> <workspace_root>/<directory>` and `git -C <...> checkout <sample.base_commit>`. Synchronous, fail-fast — done by runner before any OpenCode call. This sidesteps the in-agent `git clone` hang.
+3. POST `/session?directory=<directory>` with body `{}` → server returns the assigned `session_id` (matches `^ses.*`). Then POST `/session/<session_id>/message?directory=<directory>` (synchronous; blocks until the agent loop finishes). RTT measured with `time.monotonic()`.
+4. **Always GET `/session/<session_id>/message?directory=<directory>` after** — the synchronous POST response carries only the FINAL assistant message; intermediate tool-loop steps are only available via the list endpoint.
+5. Write a TaskRecord with the raw message dump and basic metadata. The TaskRecord stores `directory` (our name) and `session_id` (server-assigned) as separate fields.
 
 OpenCode behavior when `?directory=<id>` points to an **already-existing** pre-cloned dir under EXPERIMENTAL_WORKSPACES needs to be verified against the vendored `opencode/` source — the assumption here is that it accepts and uses the existing dir as-is.
 
@@ -262,7 +275,7 @@ OpenCode behavior when `?directory=<id>` points to an **already-existing** pre-c
   ```json
   {
     "instance_id": "django__django-12345",
-    "session_id": "session-django__django-12345-a1b2c3d4",
+    "session_id": "ses_a1b2c3d4...",
     "directory": "session-django__django-12345-a1b2c3d4",
     "arrival_offset_s": 3.21,
     "rtt_s": 42.31,
@@ -290,12 +303,14 @@ Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > buil
 ## Conventions / gotchas
 
 - **Vendored sources are authoritative for any implementation detail.** When in doubt about a CLI flag, an env var, or a wire-format detail of OpenCode/Dynamo/vLLM, read the vendored source (`opencode/`, `dynamo/`) — do not rely on memory or external docs that may not match the pinned version.
-- **OpenCode is headless-only**, launched as `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun dev serve` from `opencode/`. No TUI, no shared global workspace. Every session/message call must include `?directory=<unique>`. Without the env var, concurrent agents will trample each other in a single CWD.
+- **OpenCode is headless-only**, launched as `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <h> --port <p>` from `opencode/`. No TUI, no shared global workspace. Every session/message call must include `?directory=<unique>` (`InstanceMiddleware` reads it). Without the env var, concurrent agents will trample each other in a single CWD.
 - **Runner pre-clones; agent does not.** SWE-bench tasks have repo+base_commit. Runner does the clone+checkout synchronously before opening the OpenCode session. The agent operates on a pre-prepared checkout, never `git clone`s itself (this has been observed to hang the agent loop).
 - **System prompt lives on the user message** (`info.system`), and OpenCode types it as `string[]`. Consumers should normalize lists to `"\n\n".join(...)`.
 - **Each PD worker needs a unique NIXL side-channel port.** vLLM defaults all workers to 5600 and they collide on a single host. `testbed.sh` exports `VLLM_NIXL_SIDE_CHANNEL_HOST` (per worker, from `worker.host`) and `VLLM_NIXL_SIDE_CHANNEL_PORT` (`nixl_port_base + rank*100`). Do not rely on vLLM defaults.
-- **kv_role + disaggregation_mode are derived, not configured.** Workers in `prefill_workers` get producer/prefill role injection; `decode_workers` get consumer/decode. Exact flag names come from parsing the vendored Dynamo, not from this doc.
-- **NATS is external.** For multi-node deploys, NATS runs as its own service. `testbed.sh up nats` exists only as a single-node convenience.
+- **kv_role + disaggregation_mode are derived, not configured.** Workers in `prefill_workers` get `--disaggregation-mode prefill` and `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`; `decode_workers` get the `decode`/`kv_consumer` variant.
+- **etcd and NATS are external.** Discovery is etcd by default; NATS is the request/event plane. `testbed.sh up etcd` and `testbed.sh up nats` are single-node conveniences only.
+- **`bun dev` vs `bun run dev`**: `bun dev` is the bun shorthand and `bun run dev` is the explicit form; both invoke the `dev` script from `opencode/package.json`. `--hostname` (not `--host`) is the OpenCode flag — see `opencode/packages/opencode/src/cli/network.ts`.
+- **OpenCode session ids are server-generated** and match `^ses.*` (per the SDK schema). The runner stores them as `session_id` in the trace; `directory` is the runner-chosen workspace folder name.
 - **PGID-based teardown** is necessary because OpenCode's `.opencode` worker and vLLM's TP/PP shards `setsid` out of the parent. The logic is inlined in `testbed.sh` (no `_lib.sh`). `down opencode` also runs `kill_port` on `opencode.port` as a backstop.
 - **Single config file invariant**: do NOT introduce a second config source (e.g. a separate `workers.env`). If a new knob is needed, add it to `testbed.yaml` and teach `config.py` + `testbed.sh` to read it.
 - **Logs path is fixed**: `./logs/` (relative to `testbed.sh`'s CWD). PID files: `./logs/<component>.pid`. Stdout/stderr: `./logs/<component>.log`.

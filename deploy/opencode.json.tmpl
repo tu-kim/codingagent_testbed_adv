@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "{{PROVIDER_ID}}": {
+      "name": "{{PROVIDER_ID}}",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "{{DYNAMO_BASE_URL}}",
+        "apiKey": "unused"
+      },
+      "models": {
+        "{{MODEL_SERVED_NAME}}": {
+          "name": "{{MODEL_NAME}}"
+        }
+      }
+    }
+  },
+  "model": "{{PROVIDER_ID}}/{{MODEL_SERVED_NAME}}"
+}

@@ -1,0 +1,55 @@
+# Single source of truth for the testbed.
+# Schema is mirrored by src/testbed/config.py — keep them in sync.
+# Override any value via TESTBED__SECTION__KEY env vars (parsed as YAML scalars).
+
+# Shared by OpenCode (parent of session subdirs) and runner (clone target).
+workspace_root: /tmp/testbed-workspaces
+
+model:
+  name: qwen3-coder-30b-a3b      # HF id or local path; default
+  served_name: local             # OpenCode provider model id used in opencode.json
+
+vllm:
+  kv_connector: NixlConnector    # vLLM KV-transfer connector class name
+  nixl_port_base: 6000           # rank N → VLLM_NIXL_SIDE_CHANNEL_PORT = base + N*100
+
+  # Each worker entry:
+  #   host: where this worker is deployed. Default 127.0.0.1.
+  #         Doubles as VLLM_NIXL_SIDE_CHANNEL_HOST for that worker.
+  #         Single-node only at present; multi-node SSH spawn is TBD.
+  #   gpus: comma-separated GPU ids. Must satisfy len(split(',')) == tp * pp.
+  prefill_workers:
+    - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1 }
+  decode_workers:
+    - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1 }
+
+  prefill:
+    max_model_len: 32768
+    max_num_batched_tokens: 8192
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.90
+    kv_cache_dtype: auto         # auto | fp8 | fp8_e4m3 | fp8_e5m2
+
+  decode:
+    max_model_len: 32768
+    max_num_batched_tokens: 2048
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.90
+    kv_cache_dtype: auto
+
+  extra_args: ""                 # appended to every vLLM serve invocation
+
+dynamo:
+  host: 127.0.0.1                # → --http-host on dynamo.frontend
+  port: 8000                     # → --http-port on dynamo.frontend
+  router_mode: round-robin       # round-robin | least-loaded | kv | random | power-of-two | direct | device-aware-weighted
+  discovery_backend: etcd        # → --discovery-backend (kubernetes | etcd | file | mem)
+  etcd_endpoints: http://127.0.0.1:2379   # → ETCD_ENDPOINTS env on every dynamo process
+  nats_url: nats://127.0.0.1:4222         # → NATS_SERVER env on every dynamo process
+  request_plane: tcp             # → --request-plane (tcp | nats | http)
+  event_plane: nats              # → --event-plane (nats | zmq)
+
+opencode:
+  host: 127.0.0.1                # → --hostname on `opencode serve`
+  port: 4096                     # → --port on `opencode serve`
+  experimental_workspaces: true  # → OPENCODE_EXPERIMENTAL_WORKSPACES=true env
