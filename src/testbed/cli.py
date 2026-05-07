@@ -1,0 +1,81 @@
+"""Click entrypoint for the testbed: `run` and `smoke`."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from dataclasses import asdict
+from pathlib import Path
+
+import click
+
+from . import config as config_mod
+from . import runner as runner_mod
+from . import swebench
+from .opencode import OpenCodeClient
+
+
+@click.group()
+def main() -> None:
+    """testbed CLI."""
+
+
+@main.command("run")
+@click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
+@click.option("--num-samples", default=10, show_default=True, type=int)
+@click.option("--qps", default=0.5, show_default=True, type=float)
+@click.option("--seed", default=42, show_default=True, type=int)
+@click.option("--max-in-flight", default=16, show_default=True, type=int)
+@click.option("--router", default="", show_default=True, help="Recorded into config.json only.")
+@click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
+@click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
+def run_cmd(
+    split: str,
+    num_samples: int,
+    qps: float,
+    seed: int,
+    max_in_flight: int,
+    router: str,
+    out: Path,
+    config_path: Path | None,
+) -> None:
+    """Run a Poisson workload through OpenCode."""
+    cfg = config_mod.load(config_path)
+    asyncio.run(
+        runner_mod.run(
+            cfg,
+            split=split,
+            num_samples=num_samples,
+            qps=qps,
+            seed=seed,
+            max_in_flight=max_in_flight,
+            out_dir=out,
+            router_label=router,
+        )
+    )
+
+
+@main.command("smoke")
+@click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
+@click.option("--seed", default=42, show_default=True, type=int)
+@click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
+def smoke_cmd(split: str, seed: int, config_path: Path | None) -> None:
+    """Run a single end-to-end task and print the resulting TaskRecord."""
+    cfg = config_mod.load(config_path)
+    sample = swebench.load_samples(split, seed, 1)[0]
+    workspace_root = Path(cfg.workspace_root)
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    password = os.environ.get("OPENCODE_SERVER_PASSWORD") or None
+
+    async def _go() -> None:
+        sem = asyncio.Semaphore(1)
+        async with OpenCodeClient(cfg.opencode, password=password) as client:
+            rec = await runner_mod._run_one(client, sample, 0.0, workspace_root, sem)
+            click.echo(json.dumps(asdict(rec), indent=2))
+
+    asyncio.run(_go())
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
