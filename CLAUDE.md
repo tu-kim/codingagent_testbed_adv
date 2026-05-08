@@ -216,10 +216,26 @@ All PID files and component logs are written to **`./logs/`** (created relative 
 
 `up` with no arg brings up `workers → frontend → opencode` in order; `down` reverses.
 
+## Prerequisites (host install)
+
+These must be on `PATH` before `testbed.sh up` will work. The exact commands
+live in `README.md` under "Prerequisites" — do not duplicate them here, just
+the rationale for each pin:
+
+| Tool | Pin | Why |
+|------|-----|-----|
+| `yq` | apt | `testbed.sh` reads `testbed.yaml` via `yq` (kislyuk's Python yq, jq filters) |
+| `nats-server` | apt | `testbed.sh up nats` single-node convenience (port 4222) |
+| `etcd` / `etcdctl` | tarball v3.5.17 → `/usr/local/bin` | apt etcd is too old; Dynamo's default `--discovery-backend` is etcd |
+| `vllm` | pip `==0.19.0` | matches Dynamo 1.1's vendored AsyncEngineArgs surface; bumping vLLM may break flag pass-through in `dynamo.vllm` |
+| `nixl` | pip | KV-transfer connector class vLLM dlopen's when `--kv-transfer-config` selects `NixlConnector` |
+
+If any of these drift (e.g., user upgrades vLLM and `dynamo.vllm` starts rejecting flags), update the pin here AND in the README install block AND re-run `tests/test_dynamo_interface.py` against the new vendored source.
+
 ## Build (TBD)
 
 Vendored sources are built per their own install guides:
-- **`opencode/`** — bun-based. Follow `opencode/README.md`. Runtime entrypoint: `bun dev serve`.
+- **`opencode/`** — bun-based. Follow `opencode/README.md`. Runtime entrypoint: `bun run dev serve` (the `dev` script in the root package.json shells into `packages/opencode` and forwards trailing argv to yargs).
 - **`dynamo/`** — must be built with the **vLLM backend** selected. Follow `dynamo/README.md` (or its `BUILD.md` equivalent), passing whichever feature flag the vendored version uses to enable the vLLM backend.
 
 Concrete build commands will be folded into this doc once each vendor folder is analyzed and pinned.
