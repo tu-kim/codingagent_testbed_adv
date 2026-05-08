@@ -23,3 +23,8 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# Claude Code per-user state. .claude/agents/ IS tracked (project-shared
+# keeper definitions); the rest is per-user/runtime and should not be.
+.claude/settings.local.json
+.claude/agent-memory/
