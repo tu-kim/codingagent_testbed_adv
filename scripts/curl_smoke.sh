@@ -42,7 +42,7 @@ DIR_QS=$(jq -rn --arg d "$DIR_ABS" '$d|@uri')
 
 smoke_routes() {
   echo "== routes =="
-  curl -fsS "$OC/openapi.json" | jq '.paths | keys'
+  curl -fsS "$OC/doc" | jq '.paths | keys'
 }
 
 smoke_dynamo() {
