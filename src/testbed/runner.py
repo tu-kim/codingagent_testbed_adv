@@ -66,6 +66,7 @@ async def _run_one(
     arrival_offset_s: float,
     workspace_root: Path,
     sem: asyncio.Semaphore,
+    task_timeout_s: float | None = None,
 ) -> TaskRecord:
     instance_id = sample["instance_id"]
     directory = f"session-{instance_id}-{uuid.uuid4().hex[:8]}"
@@ -108,10 +109,34 @@ async def _run_one(
             )
 
         # Stage 3: send message (blocks for the whole agent loop). Time it.
+        # Wrap ONLY this call in asyncio.wait_for: stages 1/2/4 are fast and
+        # the hang we observe is always inside the agent loop (model stuck
+        # in a tool cycle, vLLM KV-transfer stall, or OpenCode SSE never
+        # closing — opencode.py uses read=None on purpose to allow long
+        # legit runs). task_timeout_s=None disables the cap.
         prompt = swebench.render_prompt(sample)
         t0 = time.monotonic()
         try:
-            await client.send_message(session_id, prompt, directory=abs_dir)
+            send_coro = client.send_message(session_id, prompt, directory=abs_dir)
+            if task_timeout_s is not None:
+                await asyncio.wait_for(send_coro, timeout=task_timeout_s)
+            else:
+                await send_coro
+        except asyncio.TimeoutError as exc:
+            return TaskRecord(
+                instance_id=instance_id,
+                session_id=session_id,
+                directory=directory,
+                arrival_offset_s=arrival_offset_s,
+                rtt_s=time.monotonic() - t0,
+                success=False,
+                error={
+                    "stage": "timeout",
+                    "type": "TimeoutError",
+                    "msg": f"send_message exceeded task_timeout_s={task_timeout_s}",
+                },
+                messages=[],
+            )
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,
@@ -182,6 +207,7 @@ async def run(
     max_in_flight: int,
     out_dir: Path,
     router_label: str,
+    task_timeout_s: float | None = None,
 ) -> None:
     """Drive `num_samples` SWE-bench tasks at `qps` Poisson rate."""
     samples = swebench.load_samples(split, seed, num_samples)
@@ -197,6 +223,7 @@ async def run(
         "qps": qps,
         "seed": seed,
         "max_in_flight": max_in_flight,
+        "task_timeout_s": task_timeout_s,
         "router": router_label,
         "model": cfg.model.model_dump(mode="json"),
         "config": resolved_snapshot(cfg),
@@ -216,7 +243,14 @@ async def run(
             async for i in poisson.arrivals(offsets, start_monotonic=start):
                 tasks.append(
                     asyncio.create_task(
-                        _run_one(client, samples[i], offsets[i], workspace_root, sem)
+                        _run_one(
+                            client,
+                            samples[i],
+                            offsets[i],
+                            workspace_root,
+                            sem,
+                            task_timeout_s=task_timeout_s,
+                        )
                     )
                 )
 

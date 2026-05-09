@@ -286,14 +286,15 @@ OpenCode accepts a `?directory=` that points to an already-existing pre-cloned d
 
 **Error policy**: fail-fast per task, no retry. The run as a whole never aborts on per-task failures.
 
-| Failure point                                  | TaskRecord written?     | `success` | `rtt_s`               | `error.stage` |
-|------------------------------------------------|-------------------------|-----------|-----------------------|---------------|
-| `git clone` / `git checkout`                   | yes                     | false     | null                  | `clone`       |
-| `POST /session` (non-2xx or timeout)           | yes                     | false     | null                  | `session`     |
-| `POST /session/:id/message` (non-2xx/timeout)  | yes                     | false     | wall-clock to failure | `message`     |
-| `GET /session/:id/message` (after good POST)   | yes                     | true      | from the POST         | `list`        |
+| Failure point                                              | TaskRecord written? | `success` | `rtt_s`               | `error.stage` |
+|------------------------------------------------------------|---------------------|-----------|-----------------------|---------------|
+| `git clone` / `git checkout`                               | yes                 | false     | null                  | `clone`       |
+| `POST /session` (non-2xx or HTTP error)                    | yes                 | false     | null                  | `session`     |
+| `POST /session/:id/message` (non-2xx/network)              | yes                 | false     | wall-clock to failure | `message`     |
+| `POST /session/:id/message` exceeded `--task-timeout-s`    | yes                 | false     | task_timeout_s        | `timeout`     |
+| `GET /session/:id/message` (after good POST)               | yes                 | true      | from the POST         | `list`        |
 
-`error.stage = "list"` means RTT is valid but `messages` may be empty/partial.
+`error.stage = "list"` means RTT is valid but `messages` may be empty/partial. `error.stage = "timeout"` means the agent loop was wall-clock-aborted at `task_timeout_s`; the OpenCode session/workspace may still hold partial progress (inspect via `GET /session/:id/message` or `<workspace_root>/<directory>` on disk).
 
 **Cleanup**: none. `<workspace_root>/<session_id>` directories accumulate across runs. Prune manually (`rm -rf /tmp/testbed-workspaces/session-*`) between large runs. Per-task cleanup is intentionally avoided so failing runs can be inspected.
 

@@ -136,6 +136,50 @@ async def test_list_failure_keeps_success_true_and_rtt_from_post(tmp_path: Path)
     assert rec.rtt_s is not None and rec.rtt_s >= 0.0
 
 
+class _HangingClient(_FakeClient):
+    """send_message blocks indefinitely — simulates an agent loop hang."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_started = asyncio.Event()
+
+    async def send_message(self, session_id: str, prompt: str, directory: str) -> dict:
+        self.send_started.set()
+        # Sleep way longer than any test would tolerate, so the only way out
+        # is the runner's asyncio.wait_for cap.
+        await asyncio.sleep(3600)
+        return {"info": {}, "parts": []}
+
+
+async def test_message_timeout_marks_timeout_stage(tmp_path: Path):
+    """When send_message exceeds task_timeout_s, the runner must abort it
+    with error.stage='timeout' instead of hanging the whole run."""
+    client = _HangingClient()
+    sem = asyncio.Semaphore(1)
+    rec = await _run_one(
+        client, _SAMPLE, 0.0, tmp_path, sem, task_timeout_s=0.05
+    )
+    assert client.send_started.is_set(), "send_message must have started"
+    assert rec.success is False
+    assert rec.error and rec.error["stage"] == "timeout"
+    assert rec.error["type"] == "TimeoutError"
+    # rtt_s reflects wall-clock to the abort, not None.
+    assert rec.rtt_s is not None and rec.rtt_s >= 0.05
+    # session_id was acquired before the hang, so it's recoverable for diagnosis.
+    assert rec.session_id == "ses_test"
+    # No list_messages call happens after a timeout.
+    assert client.list_calls == []
+
+
+async def test_no_timeout_when_task_timeout_s_is_none(tmp_path: Path):
+    """task_timeout_s=None must preserve the prior unbounded behavior."""
+    client = _FakeClient()
+    sem = asyncio.Semaphore(1)
+    rec = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, task_timeout_s=None)
+    assert rec.success is True
+    assert rec.error is None
+
+
 def test_summary_p50_p95_and_zero_count():
     assert _summary([]) == {"count": 0, "success_rate": None, "rtt_s": {"p50": None, "p95": None}}
 
