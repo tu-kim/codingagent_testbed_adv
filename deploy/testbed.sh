@@ -233,17 +233,27 @@ render_opencode_config() {
 
 up_opencode() {
   render_opencode_config
-  local host port experimental
+  local host port experimental oc_cfg
   host=$(cfg_get_env OPENCODE__HOST .opencode.host)
   port=$(cfg_get_env OPENCODE__PORT .opencode.port)
   experimental=$(cfg_get_env OPENCODE__EXPERIMENTAL_WORKSPACES .opencode.experimental_workspaces)
+  # Match render_opencode_config's output path (kept stable: rendered file is
+  # already in .gitignore at opencode/opencode.json).
+  oc_cfg="$OPENCODE_DIR/opencode.json"
 
   local exp_env="false"
   [[ "$experimental" == "true" ]] && exp_env="true"
 
+  # OPENCODE_CONFIG forces OpenCode to load this exact file regardless of
+  # launch CWD or per-request ?directory= (config.ts:563-566). Without it,
+  # OpenCode walks up from ?directory=<workspace> looking for opencode.json
+  # (paths.ts:10-21), never reaching our rendered file -- which causes the
+  # provider/model config to be ignored and HF (auto-enabled by HF_TOKEN) to
+  # take over, routing inference to router.huggingface.co.
   pushd "$OPENCODE_DIR" >/dev/null
   spawn opencode \
     "OPENCODE_EXPERIMENTAL_WORKSPACES=$exp_env" \
+    "OPENCODE_CONFIG=$oc_cfg" \
     -- \
     bun run dev serve --hostname "$host" --port "$port"
   popd >/dev/null

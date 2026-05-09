@@ -98,6 +98,44 @@ def test_top_level_model_field_exists_in_vendored_schema():
     )
 
 
+def test_rendered_template_disables_huggingface_provider():
+    """Without this, OpenCode auto-enables the huggingface provider whenever
+    HF_TOKEN is exported (provider.ts ~line 162 `input.env.some(item => env[item])`)
+    and silently routes inference to https://router.huggingface.co/v1, bypassing
+    the configured local Dynamo. The disabled_providers list is consumed at
+    provider.ts:1133 (`new Set(cfg.disabled_providers ?? [])`)."""
+    cfg = _render()
+    assert cfg.get("disabled_providers") == ["huggingface"], (
+        "opencode.json.tmpl must keep huggingface in disabled_providers; "
+        "removing it lets HF_TOKEN auto-enable the HF provider and override "
+        "the dynamo provider at request time."
+    )
+
+
+@pytest.mark.skipif(not _OPENCODE_CONFIG_TS.exists(), reason="vendored opencode/ not present")
+def test_disabled_providers_field_exists_in_vendored_schema():
+    src = _OPENCODE_CONFIG_TS.read_text()
+    assert re.search(r"\bdisabled_providers:\s*Schema\.", src), (
+        "opencode/packages/opencode/src/config/config.ts no longer declares "
+        "`disabled_providers` — the safety belt in opencode.json.tmpl is now a no-op."
+    )
+
+
+def test_testbed_sh_passes_opencode_config_env_to_spawn():
+    """OpenCode walks up from the per-request ?directory= looking for
+    opencode.json (paths.ts:10-21). Our rendered file lives at
+    $OPENCODE_DIR/opencode.json, which is NOT on that walk path -- so without
+    OPENCODE_CONFIG=<abs> in the spawn env, the rendered config is ignored
+    and HF_TOKEN auto-enables the huggingface provider, sending inference to
+    router.huggingface.co. Guard against silent regression."""
+    sh = (_REPO_ROOT / "deploy" / "testbed.sh").read_text()
+    assert "OPENCODE_CONFIG=" in sh, (
+        "deploy/testbed.sh stopped passing OPENCODE_CONFIG to the OpenCode "
+        "spawn -- per-request config discovery will silently miss "
+        "opencode/opencode.json and fall back to HF_TOKEN auto-enable."
+    )
+
+
 def test_substitution_is_idempotent_across_runs(tmp_path: Path):
     """testbed.sh runs `sed -e ... opencode.json.tmpl > opencode/opencode.json`
     on every `up opencode`. The output must be byte-identical for the same inputs."""
