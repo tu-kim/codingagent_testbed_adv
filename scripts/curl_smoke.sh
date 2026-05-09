@@ -2,7 +2,7 @@
 # Single-request smoke tests against the running testbed stack.
 #
 # Subcommands:
-#   routes    list OpenCode OpenAPI routes
+#   routes    OpenCode liveness probe (GET /global/health)
 #   dynamo    one /v1/chat/completions to Dynamo
 #   opencode  full OpenCode session+message round trip
 #   swebench  send a real SWE-bench prompt through OpenCode
@@ -41,8 +41,16 @@ mkdir -p "$DIR_ABS"
 DIR_QS=$(jq -rn --arg d "$DIR_ABS" '$d|@uri')
 
 smoke_routes() {
-  echo "== routes =="
-  curl -fsS "$OC/doc" | jq '.paths | keys'
+  # Liveness probe. /global/health is exposed by both the legacy hono backend
+  # and the effect-httpapi backend (default on dev/beta/local channels), needs
+  # no directory/workspace query, and is not gated by basic auth's app paths.
+  # Source of truth:
+  #   hono:    opencode/packages/opencode/src/server/routes/global.ts:76
+  #   httpapi: opencode/packages/opencode/src/server/routes/instance/httpapi/groups/global.ts:37
+  echo "== routes (liveness) =="
+  curl -fsS "$OC/global/health" | jq -e '.healthy == true' >/dev/null \
+    && echo "opencode healthy" \
+    || { echo "opencode unhealthy" >&2; exit 1; }
 }
 
 smoke_dynamo() {
