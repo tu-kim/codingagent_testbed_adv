@@ -141,6 +141,17 @@ spawn_worker() {
   fi
   local kv_cfg="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"$kv_role\"}"
 
+  # --dyn-tool-call-parser is decode-only (dynamo/components/src/dynamo/vllm/main.py:647-650).
+  # Empty value => skip the flag entirely.
+  local -a tool_parser_args=()
+  if [[ "$role" == "decode" ]]; then
+    local tool_parser
+    tool_parser=$(cfg_get '.vllm.tool_call_parser // ""')
+    if [[ -n "$tool_parser" ]]; then
+      tool_parser_args=(--dyn-tool-call-parser "$tool_parser")
+    fi
+  fi
+
   local nats_url etcd_endpoints
   nats_url=$(cfg_get_env DYNAMO__NATS_URL .dynamo.nats_url)
   etcd_endpoints=$(cfg_get_env DYNAMO__ETCD_ENDPOINTS .dynamo.etcd_endpoints)
@@ -169,6 +180,7 @@ spawn_worker() {
       --kv-cache-dtype "$kvdtype" \
       --disaggregation-mode "$disagg_mode" \
       --kv-transfer-config "$kv_cfg" \
+      "${tool_parser_args[@]}" \
       "${extra_array[@]}"
 }
 

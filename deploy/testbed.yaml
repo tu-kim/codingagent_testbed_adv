@@ -13,6 +13,17 @@ vllm:
   kv_connector: NixlConnector    # vLLM KV-transfer connector class name
   nixl_port_base: 6000           # rank N → VLLM_NIXL_SIDE_CHANNEL_PORT = base + N*100
 
+  # Dynamo's Rust-side tool-call parser. Applied ONLY to decode workers via
+  # `--dyn-tool-call-parser <name>` (dynamo/components/src/dynamo/vllm/main.py:647-650
+  # skips Prefill). Without it the frontend logs
+  # "tool choice 'auto' specified but no tool parser configured" and the agent
+  # loop receives raw text instead of structured tool_calls. Set to empty
+  # string to disable. Valid names per dynamo/docs/agents/tool-calling.md:38-56:
+  #   deepseek_v3 deepseek_v3_1 deepseek_v3_2 default glm47 harmony hermes
+  #   jamba kimi_k2 llama3_json minimax_m2 mistral nemotron_deci nemotron_nano
+  #   phi4 pythonic qwen3_coder
+  tool_call_parser: qwen3_coder  # default fits qwen3-coder-30b-a3b
+
   # Each worker entry:
   #   host: where this worker is deployed. Default 127.0.0.1.
   #         Doubles as VLLM_NIXL_SIDE_CHANNEL_HOST for that worker.

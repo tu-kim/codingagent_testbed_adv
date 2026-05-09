@@ -31,6 +31,29 @@ DiscoveryBackend = Literal["kubernetes", "etcd", "file", "mem"]
 RequestPlane = Literal["tcp", "nats", "http"]
 EventPlane = Literal["nats", "zmq"]
 KVCacheDtype = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
+# Tool-call parser names registered in dynamo's Rust core. Sourced from
+# dynamo/docs/agents/tool-calling.md:38-56 -- canonical truth at runtime is
+# `dynamo._core.get_tool_parser_names()`. tests/test_dynamo_interface.py
+# fails loudly if upstream renames/removes one.
+ToolCallParser = Literal[
+    "deepseek_v3",
+    "deepseek_v3_1",
+    "deepseek_v3_2",
+    "default",
+    "glm47",
+    "harmony",
+    "hermes",
+    "jamba",
+    "kimi_k2",
+    "llama3_json",
+    "minimax_m2",
+    "mistral",
+    "nemotron_deci",
+    "nemotron_nano",
+    "phi4",
+    "pythonic",
+    "qwen3_coder",
+]
 
 
 class _Strict(BaseModel):
@@ -79,6 +102,11 @@ class VLLMRoleCfg(_Strict):
 class VLLMCfg(_Strict):
     kv_connector: str = "NixlConnector"
     nixl_port_base: int = 6000
+    # Empty string => do not pass --dyn-tool-call-parser (decode worker runs
+    # without server-side parsing; agent will receive raw text). Per
+    # dynamo/components/src/dynamo/vllm/main.py:647-650 this is applied to
+    # decode workers only; prefill workers always skip.
+    tool_call_parser: ToolCallParser | Literal[""] = "qwen3_coder"
     prefill_workers: list[WorkerCfg]
     decode_workers: list[WorkerCfg]
     prefill: VLLMRoleCfg
@@ -141,10 +169,17 @@ def _apply_env_overrides(data: dict[str, Any], environ: dict[str, str] | None = 
         if not m:
             continue
         path = [seg.lower() for seg in m.group(1).split("__")]
-        try:
-            parsed = yaml.safe_load(raw)
-        except yaml.YAMLError:
-            parsed = raw
+        # `yaml.safe_load("")` returns None, which breaks fields whose schema
+        # accepts the literal empty string as an opt-out (e.g.
+        # vllm.tool_call_parser: ToolCallParser | Literal[""]). Preserve the
+        # raw "" so a `TESTBED__FOO__BAR=` env var disables the field cleanly.
+        if raw == "":
+            parsed: Any = ""
+        else:
+            try:
+                parsed = yaml.safe_load(raw)
+            except yaml.YAMLError:
+                parsed = raw
         _walk_set(data, path, parsed)
     return data
 

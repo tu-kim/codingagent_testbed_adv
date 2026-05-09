@@ -17,6 +17,11 @@ _FRONTEND_MAIN = _DYNAMO / "components" / "src" / "dynamo" / "frontend" / "__mai
 _VLLM_BACKEND_ARGS = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "backend_args.py"
 _VLLM_MAIN = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "__main__.py"
 _VLLM_CONSTANTS = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "constants.py"
+_VLLM_MAIN_PY = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "main.py"
+_RUNTIME_ARGS = (
+    _DYNAMO / "components" / "src" / "dynamo" / "common" / "configuration" / "groups" / "runtime_args.py"
+)
+_TOOL_CALLING_DOC = _DYNAMO / "docs" / "agents" / "tool-calling.md"
 _RUNTIME_ENV_NAMES = (
     _DYNAMO / "lib" / "runtime" / "src" / "config" / "environment_names.rs"
 )
@@ -212,4 +217,97 @@ def test_testbed_sh_exports_unique_nixl_ports_via_rank_offset():
     # The rank offset must use rank * 100 (matches the CLAUDE.md contract).
     assert re.search(r"nixl_base\s*\+\s*rank\s*\*\s*100", sh) or re.search(
         r"nixl_port_base\s*\+\s*rank\s*\*\s*100", sh
+    )
+
+
+# ---------- Tool-call parser (decode-only invariant) ----------
+
+def test_dyn_tool_call_parser_flag_declared_upstream():
+    """Dynamo bypasses vLLM's --enable-auto-tool-choice and runs its own
+    Rust-side parsers selected via --dyn-tool-call-parser. If the flag name
+    drifts, decode workers will silently lose tool-call parsing and the
+    frontend logs 'tool choice auto specified but no tool parser configured'."""
+    src = _RUNTIME_ARGS.read_text()
+    assert 'flag_name="--dyn-tool-call-parser"' in src, (
+        "dynamo runtime_args.py no longer declares --dyn-tool-call-parser; "
+        "deploy/testbed.sh's spawn_worker (decode branch) is broken."
+    )
+
+
+def test_testbed_sh_passes_dyn_tool_call_parser_to_decode_only():
+    """Per dynamo/components/src/dynamo/vllm/main.py:647-650, the parser is
+    skipped on Prefill workers. testbed.sh must inject --dyn-tool-call-parser
+    only when role=decode -- otherwise we either pass it on prefill (harmless
+    but lies in the trace) or pass it always (noise). We encode this as
+    "flag present in file" + "flag absent from the prefill branch", which is
+    robust against nested `fi` shapes (a non-greedy `(.*?)fi` capture would
+    stop at the first inner `fi` and miss flags placed deeper in the block)."""
+    sh = _TESTBED_SH.read_text()
+    assert "--dyn-tool-call-parser" in sh, (
+        "deploy/testbed.sh stopped passing --dyn-tool-call-parser; the "
+        "decode worker will run without server-side parsing and the agent "
+        "loop receives raw text instead of structured tool_calls."
+    )
+    # Same shape used by test_testbed_sh_kv_transfer_config_sets_correct_kv_role_per_role:
+    # the prefill/else/fi block is the only role-conditional block in spawn_worker.
+    prefill_block = re.search(
+        r'if\s*\[\[\s*"\$role"\s*==\s*"prefill"\s*\]\]\s*;\s*then(.*?)else(.*?)fi',
+        sh,
+        re.DOTALL,
+    )
+    assert prefill_block, "spawn_worker no longer has the prefill/else/fi role branch"
+    assert "--dyn-tool-call-parser" not in prefill_block.group(1), (
+        "--dyn-tool-call-parser leaked into the prefill branch — Dynamo "
+        "ignores it there (main.py:647-650 only sets tool_call_parser when "
+        "model_type != ModelType.Prefill), so its presence is a smell."
+    )
+
+
+def test_main_py_skips_tool_parser_on_prefill():
+    """The decode-only invariant we encode in testbed.sh comes directly from
+    dynamo/components/src/dynamo/vllm/main.py. If upstream removes the
+    `model_type != ModelType.Prefill` guard (e.g. starts applying the parser
+    everywhere, or moves the gate elsewhere), our shell branch becomes either
+    redundant or wrong -- catch the drift here."""
+    src = _VLLM_MAIN_PY.read_text()
+    assert re.search(
+        r"model_type\s*!=\s*ModelType\.Prefill\s*:\s*\n?\s*runtime_config\.tool_call_parser",
+        src,
+    ), (
+        "dynamo/components/src/dynamo/vllm/main.py no longer gates "
+        "tool_call_parser on `model_type != ModelType.Prefill`. "
+        "deploy/testbed.sh's decode-only branch may now be wrong; re-read "
+        "the vendored source before editing the test."
+    )
+
+
+def test_config_tool_call_parser_literal_matches_dynamo_doc_table():
+    """testbed.config.ToolCallParser is mirrored from
+    dynamo/docs/agents/tool-calling.md. Drift means our pydantic validator
+    rejects parser names that Dynamo actually accepts (or vice versa). The
+    canonical runtime list is dynamo._core.get_tool_parser_names() but that
+    needs the binary; the markdown table is the authoritative offline source."""
+    doc = _TOOL_CALLING_DOC.read_text()
+    # Names appear in a backticked first column: `| \`<name>\` | ... |`.
+    upstream = set(
+        re.findall(r"^\|\s*`([a-z][a-z0-9_]*)`\s*\|", doc, re.MULTILINE)
+    )
+    # Drop any obvious non-parser tokens that may share the column shape
+    # (defensive; we know "default" is a valid parser entry).
+    assert "qwen3_coder" in upstream, (
+        f"dynamo tool-calling.md no longer lists qwen3_coder; "
+        f"current table values: {sorted(upstream)}"
+    )
+
+    from testbed.config import ToolCallParser
+    import typing
+
+    ours = set(typing.get_args(ToolCallParser))
+    missing_locally = upstream - ours
+    extra_locally = ours - upstream
+    assert not missing_locally and not extra_locally, (
+        f"testbed.config.ToolCallParser drifted from dynamo doc table.\n"
+        f"  upstream-only: {sorted(missing_locally)}\n"
+        f"  ours-only:     {sorted(extra_locally)}\n"
+        f"Update src/testbed/config.py:ToolCallParser to match."
     )

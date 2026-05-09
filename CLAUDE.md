@@ -128,6 +128,7 @@ model:
 vllm:
   kv_connector: NixlConnector     # vLLM kv-transfer connector class name (matches what vLLM expects)
   nixl_port_base: 6000            # rank N → VLLM_NIXL_SIDE_CHANNEL_PORT = base + N*100
+  tool_call_parser: qwen3_coder   # → --dyn-tool-call-parser on DECODE workers only ("" disables)
 
   # Each worker entry:
   #   host: where this worker is deployed. Default 127.0.0.1.
@@ -173,13 +174,13 @@ opencode:
 
 There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=0.5`, `seed=42`) live in `cli.py`. CLI flag > env override > yaml default.
 
-### Worker role injection (kv_role + disaggregation_mode)
+### Worker role injection (kv_role + disaggregation_mode + tool_call_parser)
 
 Each worker needs role-specific Dynamo/vLLM args. `testbed.sh` injects these at launch:
 - `prefill_workers[]` → `--disaggregation-mode prefill` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`
-- `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'`
+- `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` plus (if `vllm.tool_call_parser` is non-empty) `--dyn-tool-call-parser <name>`
 
-The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`).
+The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:647-650` (`if model_type != ModelType.Prefill: runtime_config.tool_call_parser = ...`); applying the parser on prefill is a no-op but a smell.
 
 ### Discovery vs. NATS
 

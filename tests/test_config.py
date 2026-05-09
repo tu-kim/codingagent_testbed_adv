@@ -73,3 +73,31 @@ def test_resolved_snapshot_is_jsonable(tmp_path: Path):
     assert snap["dynamo"]["router_mode"] == "round-robin"
     import json
     json.dumps(snap)  # must not raise
+
+
+def test_tool_call_parser_default_is_qwen3_coder(tmp_path: Path):
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
+    assert cfg.vllm.tool_call_parser == "qwen3_coder"
+
+
+def test_tool_call_parser_rejects_unknown_name(tmp_path: Path):
+    env = {"TESTBED__VLLM__TOOL_CALL_PARSER": "not-a-real-parser"}
+    with pytest.raises(ValidationError):
+        cfg_mod.load(_write(tmp_path, _BASE_YAML), environ=env)
+
+
+def test_tool_call_parser_empty_env_string_disables_cleanly(tmp_path: Path):
+    """`TESTBED__VLLM__TOOL_CALL_PARSER=` (empty) must opt out without
+    triggering pydantic validation. yaml.safe_load("") returns None, which
+    would fail ToolCallParser | Literal[""] -- _apply_env_overrides therefore
+    preserves the raw "" specifically for fields that accept empty-string as
+    a disable sentinel."""
+    env = {"TESTBED__VLLM__TOOL_CALL_PARSER": ""}
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ=env)
+    assert cfg.vllm.tool_call_parser == ""
+
+
+def test_tool_call_parser_yaml_empty_string_disables_cleanly(tmp_path: Path):
+    body = _BASE_YAML + '  tool_call_parser: ""\n'
+    cfg = cfg_mod.load(_write(tmp_path, body), environ={})
+    assert cfg.vllm.tool_call_parser == ""
