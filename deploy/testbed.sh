@@ -256,6 +256,28 @@ up_opencode() {
   local exp_env="false"
   [[ "$experimental" == "true" ]] && exp_env="true"
 
+  # ENV-gated profiling (opencode/packages/opencode/src/profile/profile.ts).
+  # When OPENCODE_PROFILE is set to a truthy value, force OPENCODE_PROFILE_DIR
+  # to <workspace_root>/profiles so per-session NDJSON files from every
+  # concurrent task land in one flat directory and can be aggregated with
+  # scripts/aggregate_profiles.sh.
+  local -a profile_envs=()
+  local profile_enabled="${OPENCODE_PROFILE:-}"
+  if [[ -n "$profile_enabled" && "$profile_enabled" != "0" && "$profile_enabled" != "false" ]]; then
+    local workspace_root profile_dir
+    workspace_root=$(cfg_get .workspace_root)
+    profile_dir="${OPENCODE_PROFILE_DIR:-${workspace_root}/profiles}"
+    mkdir -p "$profile_dir"
+    profile_envs+=(
+      "OPENCODE_PROFILE=$profile_enabled"
+      "OPENCODE_PROFILE_DIR=$profile_dir"
+    )
+    if [[ -n "${OPENCODE_PROFILE_MESSAGES:-}" ]]; then
+      profile_envs+=("OPENCODE_PROFILE_MESSAGES=$OPENCODE_PROFILE_MESSAGES")
+    fi
+    echo "opencode: profiling enabled, OPENCODE_PROFILE_DIR=$profile_dir"
+  fi
+
   # OPENCODE_CONFIG forces OpenCode to load this exact file regardless of
   # launch CWD or per-request ?directory= (config.ts:563-566). Without it,
   # OpenCode walks up from ?directory=<workspace> looking for opencode.json
@@ -263,9 +285,13 @@ up_opencode() {
   # provider/model config to be ignored and HF (auto-enabled by HF_TOKEN) to
   # take over, routing inference to router.huggingface.co.
   pushd "$OPENCODE_DIR" >/dev/null
+  # ${profile_envs[@]+"${profile_envs[@]}"} expands to nothing when the array
+  # is empty -- needed because `set -u` is on and unguarded "${arr[@]}" errors
+  # on older bash (macOS 3.2 / pre-4.4) when the array has zero elements.
   spawn opencode \
     "OPENCODE_EXPERIMENTAL_WORKSPACES=$exp_env" \
     "OPENCODE_CONFIG=$oc_cfg" \
+    ${profile_envs[@]+"${profile_envs[@]}"} \
     -- \
     bun run dev serve --hostname "$host" --port "$port"
   popd >/dev/null

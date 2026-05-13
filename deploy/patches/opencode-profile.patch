@@ -1,0 +1,700 @@
+From 0afe080cd633a71ee8005d39df824d83bc9d3b98 Mon Sep 17 00:00:00 2001
+From: tu-kim <taewoo89.kim@gmail.com>
+Date: Wed, 13 May 2026 11:48:52 +0900
+Subject: [PATCH] profile: ENV-gated agent-loop instrumentation
+
+Adds opencode/packages/opencode/src/profile/profile.ts plus 5 hook call
+sites in session/prompt.ts and session/processor.ts. Captures per-query
+e2e latency, per-step LLM/tool wall-clock split, ISL/OSL from server-
+reported usage tokens, and per-step modelMsgs snapshots. NDJSON output
+at \$OPENCODE_PROFILE_DIR/<sessionID>.jsonl. When OPENCODE_PROFILE is
+unset/0/false every hook is a no-op.
+
+tool.start/end pair fires through Effect.onExit so defects (Tool.execute
+uses Effect.orDie) still produce a paired tool.end with ok:false.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ packages/opencode/src/profile/profile.ts   | 340 +++++++++++++++++++++
+ packages/opencode/src/session/processor.ts |   3 +
+ packages/opencode/src/session/prompt.ts    | 234 ++++++++------
+ 3 files changed, 490 insertions(+), 87 deletions(-)
+ create mode 100644 packages/opencode/src/profile/profile.ts
+
+diff --git a/packages/opencode/src/profile/profile.ts b/packages/opencode/src/profile/profile.ts
+new file mode 100644
+index 000000000..b469f0407
+--- /dev/null
++++ b/packages/opencode/src/profile/profile.ts
+@@ -0,0 +1,340 @@
++// Lightweight, ENV-gated profiling for the agent loop.
++//
++// Turn it on with `OPENCODE_PROFILE=1`. When unset/0/false every Profile.*
++// method is an immediate no-op so the hot path pays only one boolean check.
++//
++// Output: one NDJSON file per session at
++//   ${OPENCODE_PROFILE_DIR}/<sessionID>.jsonl
++// with `OPENCODE_PROFILE_DIR` defaulting to `${tmpdir}/opencode-profile`.
++// The testbed (deploy/testbed.sh up_opencode) sets this to
++// `${workspace_root}/profiles` so all sessions land in one place and can
++// be aggregated with `cat`.
++//
++// Event shape (one JSON object per line):
++//   query.start  {ts, sessionID, directory}
++//   turn.start   {ts, sessionID, step, model, system, messages}
++//   llm.start    {ts, sessionID, step}
++//   llm.end      {ts, sessionID, step, finish, duration_s, tokens}
++//   tool.start   {ts, sessionID, step, callID, name, kind, args_head}
++//   tool.end     {ts, sessionID, step, callID, name, ok, duration_s, [output_chars | error]}
++//   turn.end     {ts, sessionID, step, duration_s, llm_wall_s, tool_wall_s}
++//   query.end    {ts, sessionID, steps, duration_s, aborted}
++//
++// `OPENCODE_PROFILE_MESSAGES` selects message-snapshot fidelity:
++//   count  — counts/roles only
++//   head   — per-part {role, parts, chars, head: first 200 chars}  (default)
++//   full   — entire modelMsgs JSON dumped verbatim (large; debugging only)
++
++import { appendFileSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++type SnapshotLevel = "full" | "head" | "count"
++
++const envEnabled = ((): boolean => {
++  const v = process.env.OPENCODE_PROFILE
++  if (!v) return false
++  const lo = v.toLowerCase()
++  return lo !== "0" && lo !== "false" && lo !== ""
++})()
++
++const profileDir = process.env.OPENCODE_PROFILE_DIR || join(tmpdir(), "opencode-profile")
++
++const SNAPSHOT_LEVEL: SnapshotLevel = ((): SnapshotLevel => {
++  const v = process.env.OPENCODE_PROFILE_MESSAGES
++  return v === "full" || v === "count" ? v : "head"
++})()
++
++const HEAD_CHARS = 200
++
++interface SessionState {
++  startMs: number
++  fd: number
++  step: number
++  llmStartByStep: Map<number, number>
++  llmDurationByStep: Map<number, number>
++  turnStartByStep: Map<number, number>
++  toolStart: Map<string, { ms: number; step: number; name: string }>
++  toolWallByStep: Map<number, number>
++}
++
++const sessions = new Map<string, SessionState>()
++let dirEnsured = false
++
++function ensureDir(): void {
++  if (dirEnsured) return
++  if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true })
++  dirEnsured = true
++}
++
++function getOrInit(sessionID: string): SessionState {
++  let s = sessions.get(sessionID)
++  if (!s) {
++    ensureDir()
++    const fd = openSync(join(profileDir, `${sessionID}.jsonl`), "a")
++    s = {
++      startMs: performance.now(),
++      fd,
++      step: 0,
++      llmStartByStep: new Map(),
++      llmDurationByStep: new Map(),
++      turnStartByStep: new Map(),
++      toolStart: new Map(),
++      toolWallByStep: new Map(),
++    }
++    sessions.set(sessionID, s)
++  }
++  return s
++}
++
++function emit(sessionID: string, row: Record<string, unknown>): void {
++  const s = sessions.get(sessionID)
++  if (!s) return
++  try {
++    appendFileSync(s.fd, JSON.stringify(row) + "\n")
++  } catch {
++    // Profiling must never break the agent loop. Swallow I/O errors silently.
++  }
++}
++
++function nowMs(): number {
++  return performance.now()
++}
++
++function unixTs(): number {
++  return Date.now() / 1000
++}
++
++function roundSec(ms: number): number {
++  return Math.round(ms) / 1000
++}
++
++function contentChars(content: unknown): number {
++  if (typeof content === "string") return content.length
++  if (Array.isArray(content)) {
++    let total = 0
++    for (const p of content) {
++      if (typeof p === "string") total += p.length
++      else if (p && typeof p === "object") {
++        const t = (p as Record<string, unknown>).text
++        if (typeof t === "string") total += t.length
++        else total += JSON.stringify(p).length
++      }
++    }
++    return total
++  }
++  return 0
++}
++
++function contentHead(content: unknown): string {
++  if (typeof content === "string") return content.slice(0, HEAD_CHARS)
++  if (Array.isArray(content)) {
++    for (const p of content) {
++      if (typeof p === "string" && p) return p.slice(0, HEAD_CHARS)
++      if (p && typeof p === "object") {
++        const t = (p as Record<string, unknown>).text
++        if (typeof t === "string" && t) return t.slice(0, HEAD_CHARS)
++      }
++    }
++    return JSON.stringify(content).slice(0, HEAD_CHARS)
++  }
++  return ""
++}
++
++function summarizeMessages(messages: ReadonlyArray<{ role: string; content: unknown }>): Record<string, unknown> {
++  if (SNAPSHOT_LEVEL === "count") {
++    return {
++      messages: {
++        count: messages.length,
++        roles: messages.map((m) => m.role),
++        total_chars: messages.reduce((a, m) => a + contentChars(m.content), 0),
++      },
++    }
++  }
++  if (SNAPSHOT_LEVEL === "full") {
++    return { messages }
++  }
++  return {
++    messages: messages.map((m) => ({
++      role: m.role,
++      parts: Array.isArray(m.content) ? m.content.length : 1,
++      chars: contentChars(m.content),
++      head: contentHead(m.content),
++    })),
++  }
++}
++
++function summarizeSystem(system: ReadonlyArray<string>): Record<string, unknown> {
++  const chars = system.reduce((a, s) => a + s.length, 0)
++  if (SNAPSHOT_LEVEL === "count") return { system: { count: system.length, chars } }
++  if (SNAPSHOT_LEVEL === "full") return { system: { count: system.length, chars, texts: system } }
++  return { system: { count: system.length, chars, head: system[0]?.slice(0, HEAD_CHARS) ?? "" } }
++}
++
++function previewJSON(v: unknown): string {
++  try {
++    return JSON.stringify(v).slice(0, HEAD_CHARS)
++  } catch {
++    return ""
++  }
++}
++
++export const Profile = {
++  enabled: envEnabled,
++  dir: profileDir,
++
++  query: {
++    start(sessionID: string, meta: { directory?: string } = {}): void {
++      if (!envEnabled) return
++      const s = getOrInit(sessionID)
++      s.startMs = nowMs()
++      emit(sessionID, {
++        ev: "query.start",
++        ts: unixTs(),
++        sessionID,
++        directory: meta.directory,
++      })
++    },
++    end(sessionID: string, meta: { steps: number; aborted?: boolean }): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      emit(sessionID, {
++        ev: "query.end",
++        ts: unixTs(),
++        sessionID,
++        steps: meta.steps,
++        duration_s: roundSec(nowMs() - s.startMs),
++        aborted: !!meta.aborted,
++      })
++      try {
++        closeSync(s.fd)
++      } catch {
++        /* ignore */
++      }
++      sessions.delete(sessionID)
++    },
++  },
++
++  turn: {
++    start(
++      sessionID: string,
++      step: number,
++      snap: {
++        system: ReadonlyArray<string>
++        messages: ReadonlyArray<{ role: string; content: unknown }>
++        model?: { id: string; providerID: string }
++      },
++    ): void {
++      if (!envEnabled) return
++      const s = getOrInit(sessionID)
++      s.step = step
++      s.turnStartByStep.set(step, nowMs())
++      s.toolWallByStep.set(step, 0)
++      emit(sessionID, {
++        ev: "turn.start",
++        ts: unixTs(),
++        sessionID,
++        step,
++        model: snap.model,
++        ...summarizeSystem(snap.system),
++        ...summarizeMessages(snap.messages),
++      })
++    },
++    end(sessionID: string, step: number): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      const start = s.turnStartByStep.get(step)
++      if (start == null) return
++      emit(sessionID, {
++        ev: "turn.end",
++        ts: unixTs(),
++        sessionID,
++        step,
++        duration_s: roundSec(nowMs() - start),
++        llm_wall_s: roundSec(s.llmDurationByStep.get(step) ?? 0),
++        tool_wall_s: roundSec(s.toolWallByStep.get(step) ?? 0),
++      })
++      s.turnStartByStep.delete(step)
++    },
++  },
++
++  llm: {
++    start(sessionID: string): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      s.llmStartByStep.set(s.step, nowMs())
++      emit(sessionID, { ev: "llm.start", ts: unixTs(), sessionID, step: s.step })
++    },
++    end(sessionID: string, info: { finish?: string; tokens: unknown }): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      const start = s.llmStartByStep.get(s.step)
++      const duration = start != null ? nowMs() - start : 0
++      s.llmDurationByStep.set(s.step, duration)
++      s.llmStartByStep.delete(s.step)
++      emit(sessionID, {
++        ev: "llm.end",
++        ts: unixTs(),
++        sessionID,
++        step: s.step,
++        finish: info.finish,
++        duration_s: roundSec(duration),
++        tokens: info.tokens,
++      })
++    },
++  },
++
++  tool: {
++    start(
++      sessionID: string,
++      callID: string,
++      name: string,
++      kind: "builtin" | "mcp",
++      args: unknown,
++    ): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      s.toolStart.set(callID, { ms: nowMs(), step: s.step, name })
++      emit(sessionID, {
++        ev: "tool.start",
++        ts: unixTs(),
++        sessionID,
++        step: s.step,
++        callID,
++        name,
++        kind,
++        args_head: previewJSON(args),
++      })
++    },
++    end(
++      sessionID: string,
++      callID: string,
++      info: { ok: boolean; output_chars?: number; error?: string },
++    ): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      const start = s.toolStart.get(callID)
++      if (!start) return
++      const duration = nowMs() - start.ms
++      s.toolStart.delete(callID)
++      s.toolWallByStep.set(start.step, (s.toolWallByStep.get(start.step) ?? 0) + duration)
++      emit(sessionID, {
++        ev: "tool.end",
++        ts: unixTs(),
++        sessionID,
++        step: start.step,
++        callID,
++        name: start.name,
++        ok: info.ok,
++        ...(info.ok ? { output_chars: info.output_chars ?? 0 } : { error: info.error ?? "" }),
++        duration_s: roundSec(duration),
++      })
++    },
++  },
++}
+diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
+index f22da9292..05569c95b 100644
+--- a/packages/opencode/src/session/processor.ts
++++ b/packages/opencode/src/session/processor.ts
+@@ -24,6 +24,7 @@ import { EventV2 } from "@/v2/event"
+ import { SessionEvent } from "@/v2/session-event"
+ import { Modelv2 } from "@/v2/model"
+ import * as DateTime from "effect/DateTime"
++import { Profile } from "@/profile/profile"
+ 
+ const DOOM_LOOP_THRESHOLD = 3
+ const log = Log.create({ service: "session.processor" })
+@@ -426,6 +427,7 @@ export const layer: Layer.Layer<
+             throw value.error
+ 
+           case "start-step":
++            Profile.llm.start(ctx.sessionID)
+             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
+             if (!ctx.assistantMessage.summary) {
+               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+@@ -457,6 +459,7 @@ export const layer: Layer.Layer<
+               usage: value.usage,
+               metadata: value.providerMetadata,
+             })
++            Profile.llm.end(ctx.sessionID, { finish: value.finishReason, tokens: usage.tokens })
+             if (!ctx.assistantMessage.summary) {
+               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+               EventV2.run(SessionEvent.Step.Ended.Sync, {
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index fef8c4383..01415fd7c 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -38,6 +38,7 @@ import { SessionProcessor } from "./processor"
+ import { Tool } from "@/tool/tool"
+ import { Permission } from "@/permission"
+ import { SessionStatus } from "./status"
++import { Profile } from "@/profile/profile"
+ import { LLM } from "./llm"
+ import { Shell } from "@/shell/shell"
+ import { ShellID } from "@/tool/shell/id"
+@@ -425,30 +426,53 @@ NOTE: At any point in time through this workflow you should feel free to ask the
+             return run.promise(
+               Effect.gen(function* () {
+                 const ctx = context(args, options)
+-                yield* plugin.trigger(
+-                  "tool.execute.before",
+-                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
+-                  { args },
+-                )
+-                const result = yield* item.execute(args, ctx)
+-                const output = {
+-                  ...result,
+-                  attachments: result.attachments?.map((attachment) => ({
+-                    ...attachment,
+-                    id: PartID.ascending(),
+-                    sessionID: ctx.sessionID,
+-                    messageID: input.processor.message.id,
+-                  })),
+-                }
+-                yield* plugin.trigger(
+-                  "tool.execute.after",
+-                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
+-                  output,
++                Profile.tool.start(ctx.sessionID, ctx.callID ?? options.toolCallId, item.id, "builtin", args)
++                return yield* Effect.gen(function* () {
++                  yield* plugin.trigger(
++                    "tool.execute.before",
++                    { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
++                    { args },
++                  )
++                  const result = yield* item.execute(args, ctx)
++                  const output = {
++                    ...result,
++                    attachments: result.attachments?.map((attachment) => ({
++                      ...attachment,
++                      id: PartID.ascending(),
++                      sessionID: ctx.sessionID,
++                      messageID: input.processor.message.id,
++                    })),
++                  }
++                  yield* plugin.trigger(
++                    "tool.execute.after",
++                    { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
++                    output,
++                  )
++                  if (options.abortSignal?.aborted) {
++                    yield* input.processor.completeToolCall(options.toolCallId, output)
++                  }
++                  return output
++                }).pipe(
++                  // onExit fires on success AND on defect (Tool.execute uses
++                  // Effect.orDie so failures arrive as defects, not typed
++                  // errors -- tapBoth alone would miss them).
++                  Effect.onExit((exit) =>
++                    Effect.sync(() => {
++                      const callID = ctx.callID ?? options.toolCallId
++                      if (Exit.isSuccess(exit)) {
++                        Profile.tool.end(ctx.sessionID, callID, {
++                          ok: true,
++                          output_chars: (exit.value?.output ?? "").length,
++                        })
++                      } else {
++                        Profile.tool.end(ctx.sessionID, callID, {
++                          ok: false,
++                          error: String(Cause.squash(exit.cause)),
++                        })
++                      }
++                    }),
++                  ),
+                 )
+-                if (options.abortSignal?.aborted) {
+-                  yield* input.processor.completeToolCall(options.toolCallId, output)
+-                }
+-                return output
+               }),
+             )
+           },
+@@ -466,77 +490,96 @@ NOTE: At any point in time through this workflow you should feel free to ask the
+           run.promise(
+             Effect.gen(function* () {
+               const ctx = context(args, opts)
+-              yield* plugin.trigger(
+-                "tool.execute.before",
+-                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
+-                { args },
+-              )
+-              const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
+-                yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
+-                return yield* Effect.promise(() => execute(args, opts))
+-              }).pipe(
+-                Effect.withSpan("Tool.execute", {
+-                  attributes: {
+-                    "tool.name": key,
+-                    "tool.call_id": opts.toolCallId,
+-                    "session.id": ctx.sessionID,
+-                    "message.id": input.processor.message.id,
+-                  },
+-                }),
+-              )
+-              yield* plugin.trigger(
+-                "tool.execute.after",
+-                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
+-                result,
+-              )
++              Profile.tool.start(ctx.sessionID, opts.toolCallId, key, "mcp", args)
++              return yield* Effect.gen(function* () {
++                yield* plugin.trigger(
++                  "tool.execute.before",
++                  { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
++                  { args },
++                )
++                const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
++                  yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
++                  return yield* Effect.promise(() => execute(args, opts))
++                }).pipe(
++                  Effect.withSpan("Tool.execute", {
++                    attributes: {
++                      "tool.name": key,
++                      "tool.call_id": opts.toolCallId,
++                      "session.id": ctx.sessionID,
++                      "message.id": input.processor.message.id,
++                    },
++                  }),
++                )
++                yield* plugin.trigger(
++                  "tool.execute.after",
++                  { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
++                  result,
++                )
+ 
+-              const textParts: string[] = []
+-              const attachments: Omit<MessageV2.FilePart, "id" | "sessionID" | "messageID">[] = []
+-              for (const contentItem of result.content) {
+-                if (contentItem.type === "text") textParts.push(contentItem.text)
+-                else if (contentItem.type === "image") {
+-                  attachments.push({
+-                    type: "file",
+-                    mime: contentItem.mimeType,
+-                    url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
+-                  })
+-                } else if (contentItem.type === "resource") {
+-                  const { resource } = contentItem
+-                  if (resource.text) textParts.push(resource.text)
+-                  if (resource.blob) {
++                const textParts: string[] = []
++                const attachments: Omit<MessageV2.FilePart, "id" | "sessionID" | "messageID">[] = []
++                for (const contentItem of result.content) {
++                  if (contentItem.type === "text") textParts.push(contentItem.text)
++                  else if (contentItem.type === "image") {
+                     attachments.push({
+                       type: "file",
+-                      mime: resource.mimeType ?? "application/octet-stream",
+-                      url: `data:${resource.mimeType ?? "application/octet-stream"};base64,${resource.blob}`,
+-                      filename: resource.uri,
++                      mime: contentItem.mimeType,
++                      url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
+                     })
++                  } else if (contentItem.type === "resource") {
++                    const { resource } = contentItem
++                    if (resource.text) textParts.push(resource.text)
++                    if (resource.blob) {
++                      attachments.push({
++                        type: "file",
++                        mime: resource.mimeType ?? "application/octet-stream",
++                        url: `data:${resource.mimeType ?? "application/octet-stream"};base64,${resource.blob}`,
++                        filename: resource.uri,
++                      })
++                    }
+                   }
+                 }
+-              }
+ 
+-              const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
+-              const metadata = {
+-                ...result.metadata,
+-                truncated: truncated.truncated,
+-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
+-              }
++                const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
++                const metadata = {
++                  ...result.metadata,
++                  truncated: truncated.truncated,
++                  ...(truncated.truncated && { outputPath: truncated.outputPath }),
++                }
+ 
+-              const output = {
+-                title: "",
+-                metadata,
+-                output: truncated.content,
+-                attachments: attachments.map((attachment) => ({
+-                  ...attachment,
+-                  id: PartID.ascending(),
+-                  sessionID: ctx.sessionID,
+-                  messageID: input.processor.message.id,
+-                })),
+-                content: result.content,
+-              }
+-              if (opts.abortSignal?.aborted) {
+-                yield* input.processor.completeToolCall(opts.toolCallId, output)
+-              }
+-              return output
++                const output = {
++                  title: "",
++                  metadata,
++                  output: truncated.content,
++                  attachments: attachments.map((attachment) => ({
++                    ...attachment,
++                    id: PartID.ascending(),
++                    sessionID: ctx.sessionID,
++                    messageID: input.processor.message.id,
++                  })),
++                  content: result.content,
++                }
++                if (opts.abortSignal?.aborted) {
++                  yield* input.processor.completeToolCall(opts.toolCallId, output)
++                }
++                return output
++              }).pipe(
++                Effect.onExit((exit) =>
++                  Effect.sync(() => {
++                    if (Exit.isSuccess(exit)) {
++                      Profile.tool.end(ctx.sessionID, opts.toolCallId, {
++                        ok: true,
++                        output_chars: (exit.value?.output ?? "").length,
++                      })
++                    } else {
++                      Profile.tool.end(ctx.sessionID, opts.toolCallId, {
++                        ok: false,
++                        error: String(Cause.squash(exit.cause)),
++                      })
++                    }
++                  }),
++                ),
++              )
+             }),
+           )
+         tools[key] = item
+@@ -1405,6 +1448,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
+         let step = 0
+         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+ 
++        Profile.query.start(sessionID, { directory: ctx.directory })
++
+         while (true) {
+           yield* status.set(sessionID, { type: "busy" })
+           yield* slog.info("loop", { step })
+@@ -1574,6 +1619,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
+             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
+             const format = lastUser.format ?? { type: "text" as const }
+             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
++            const messagesForLLM = [
++              ...modelMsgs,
++              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : []),
++            ]
++            // Profile-side snapshot fires BEFORE handle.process so the message
++            // shape recorded is exactly what gets sent to the LLM (== modelMsgs
++            // + the max-steps tail).
++            Profile.turn.start(sessionID, step, {
++              system,
++              messages: messagesForLLM,
++              model: { id: model.id, providerID: model.providerID },
++            })
+             const result = yield* handle.process({
+               user: lastUser,
+               agent,
+@@ -1581,11 +1638,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
+               sessionID,
+               parentSessionID: session.parentID,
+               system,
+-              messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : [])],
++              messages: messagesForLLM,
+               tools,
+               model,
+               toolChoice: format.type === "json_schema" ? "required" : undefined,
+             })
++            Profile.turn.end(sessionID, step)
+ 
+             if (structured !== undefined) {
+               handle.message.structured = structured
+@@ -1622,6 +1680,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
+           continue
+         }
+ 
++        Profile.query.end(sessionID, { steps: step })
++
+         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+         return yield* lastAssistant(sessionID)
+       },
+-- 
+2.50.1 (Apple Git-155)
+

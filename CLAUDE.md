@@ -317,6 +317,25 @@ OpenCode accepts a `?directory=` that points to an already-existing pre-cloned d
   On failure, `error` is `{"stage": "clone|session|message|list", "type": "...", "msg": "..."}`. `messages` is the raw OpenCode `list_messages` response with no transformation; `[]` if `error.stage` is upstream of the list call.
 - `summary.json` — strictly: `rtt_s` p50/p95, `success_rate`, `count`. Nothing else.
 
+## OpenCode profiling (ENV-gated)
+
+The profiler lives as a **testbed-owned patch** at `deploy/patches/opencode-profile.patch` (the `opencode/` submodule stays pinned at its upstream tag, e.g. `v1.14.41`, so the parent repo is portable). One-time setup after `git submodule update --init`:
+
+```
+scripts/apply_opencode_patches.sh           # idempotent; safe to re-run
+scripts/apply_opencode_patches.sh --check   # report applied/pending
+scripts/apply_opencode_patches.sh --revert  # back out cleanly
+```
+
+After applying, OpenCode gains `packages/opencode/src/profile/profile.ts` plus 5 hook call sites in `session/prompt.ts` and `session/processor.ts`. Activate with `OPENCODE_PROFILE=1`; every call is a no-op otherwise. `testbed.sh up_opencode` automatically forces `OPENCODE_PROFILE_DIR=<workspace_root>/profiles` when the env var is truthy so all sessions land in one flat directory regardless of `?directory=`.
+
+Knobs (set before `testbed.sh up opencode`):
+- `OPENCODE_PROFILE=1` — enable
+- `OPENCODE_PROFILE_DIR=<abs>` — override default (`<workspace_root>/profiles`)
+- `OPENCODE_PROFILE_MESSAGES=count|head|full` — snapshot fidelity (default `head` = first 200 chars per part)
+
+Per-session NDJSON layout: one file per `sessionID`, events `query.start, turn.start, llm.start, llm.end, tool.start, tool.end, turn.end, query.end`. The `llm.*` pair brackets one server round-trip (= `start-step`/`finish-step` events from AI SDK) and `llm.end.tokens` is the OpenAI usage object (= ISL/OSL). The `tool.*` pair is fired by `Effect.onExit` so failures + dies still produce a `tool.end` with `ok:false`. Aggregate across sessions with `scripts/aggregate_profiles.sh <workspace_root>` (auto-prepends the `/profiles` subdir).
+
 ## Configuration overrides
 
 `.env` (copy from `.env.example`) — secrets only:

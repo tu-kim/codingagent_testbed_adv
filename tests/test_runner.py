@@ -5,11 +5,12 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 from testbed import runner
-from testbed.runner import TaskRecord, _run_one, _summary
+from testbed.runner import TaskRecord, _env_truthy, _run_one, _summary
 
 
 class _FakeClient:
@@ -202,3 +203,213 @@ def test_taskrecord_jsonl_round_trip():
     assert line.endswith("\n")
     parsed = json.loads(line)
     assert parsed == asdict(rec)
+
+
+# ---------------------------------------------------------------------------
+# _env_truthy truth table
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value,expected", [
+    # Falsy: unset, empty, "0", "false" (any case)
+    (None,    False),
+    ("",      False),
+    ("0",     False),
+    ("false", False),
+    ("FALSE", False),
+    ("False", False),
+    # Truthy: anything else
+    ("1",     True),
+    ("true",  True),
+    ("TRUE",  True),
+    ("yes",   True),
+    ("on",    True),
+    ("2",     True),
+    ("enabled", True),
+])
+def test_env_truthy_truth_table(value, expected):
+    assert _env_truthy(value) is expected
+
+
+# ---------------------------------------------------------------------------
+# Minimal TestbedCfg builder — used by run() tests below.
+# ---------------------------------------------------------------------------
+
+def _minimal_cfg(workspace_root: str):
+    """Return a TestbedCfg with only the fields run() actually touches."""
+    from testbed.config import (
+        DynamoCfg,
+        ModelCfg,
+        OpenCodeCfg,
+        TestbedCfg,
+        VLLMCfg,
+        VLLMRoleCfg,
+        WorkerCfg,
+    )
+    role_cfg = VLLMRoleCfg(
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+        max_num_seqs=8,
+        gpu_memory_utilization=0.9,
+    )
+    worker = WorkerCfg(name="w0", gpus="0", tp=1, pp=1)
+    vllm = VLLMCfg(
+        prefill_workers=[worker],
+        decode_workers=[worker],
+        prefill=role_cfg,
+        decode=role_cfg,
+    )
+    return TestbedCfg(
+        workspace_root=workspace_root,
+        model=ModelCfg(name="test-model", served_name="local"),
+        vllm=vllm,
+        dynamo=DynamoCfg(),
+        opencode=OpenCodeCfg(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fake async context manager that yields a _FakeClient
+# ---------------------------------------------------------------------------
+
+class _FakeClientCtx:
+    """Wraps _FakeClient as an async context manager so it can stand in for
+    ``async with OpenCodeClient(...) as client``."""
+
+    def __init__(self, fake_client):
+        self._client = fake_client
+
+    async def __aenter__(self):
+        return self._client
+
+    async def __aexit__(self, *_):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# run() → config.json opencode_profile tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_config_json_opencode_profile_enabled_when_env_set(
+    monkeypatch, tmp_path: Path
+):
+    """OPENCODE_PROFILE=1 → config.json opencode_profile.enabled is True."""
+    monkeypatch.setenv("OPENCODE_PROFILE", "1")
+    monkeypatch.setenv("OPENCODE_PROFILE_DIR", "/tmp/prof")
+    monkeypatch.setenv("OPENCODE_PROFILE_MESSAGES", "50")
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+
+    workspace = tmp_path / "ws"
+    cfg = _minimal_cfg(str(workspace))
+    fake_client = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite",
+                        num_samples=1,
+                        qps=1.0,
+                        seed=42,
+                        max_in_flight=1,
+                        out_dir=tmp_path / "out",
+                        router_label="test",
+                        task_timeout_s=None,
+                    )
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    profile = config_json["opencode_profile"]
+    assert profile["enabled"] is True
+    assert profile["raw"] == "1"
+    assert profile["dir"] == "/tmp/prof"
+    assert profile["messages"] == "50"
+
+
+@pytest.mark.asyncio
+async def test_run_config_json_opencode_profile_disabled_when_env_unset(
+    monkeypatch, tmp_path: Path
+):
+    """Unset OPENCODE_PROFILE → config.json opencode_profile.enabled is False."""
+    monkeypatch.delenv("OPENCODE_PROFILE", raising=False)
+    monkeypatch.delenv("OPENCODE_PROFILE_DIR", raising=False)
+    monkeypatch.delenv("OPENCODE_PROFILE_MESSAGES", raising=False)
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+
+    workspace = tmp_path / "ws"
+    cfg = _minimal_cfg(str(workspace))
+    fake_client = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite",
+                        num_samples=1,
+                        qps=1.0,
+                        seed=42,
+                        max_in_flight=1,
+                        out_dir=tmp_path / "out",
+                        router_label="test",
+                        task_timeout_s=None,
+                    )
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    profile = config_json["opencode_profile"]
+    assert profile["enabled"] is False
+    assert profile["raw"] is None
+    assert profile["dir"] is None
+    assert profile["messages"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_config_json_opencode_profile_dir_and_messages_round_trip(
+    monkeypatch, tmp_path: Path
+):
+    """dir and messages values are captured verbatim when set."""
+    monkeypatch.setenv("OPENCODE_PROFILE", "true")
+    monkeypatch.setenv("OPENCODE_PROFILE_DIR", "/var/prof/run7")
+    monkeypatch.setenv("OPENCODE_PROFILE_MESSAGES", "100")
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+
+    workspace = tmp_path / "ws"
+    cfg = _minimal_cfg(str(workspace))
+    fake_client = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite",
+                        num_samples=1,
+                        qps=1.0,
+                        seed=42,
+                        max_in_flight=1,
+                        out_dir=tmp_path / "out",
+                        router_label="test",
+                        task_timeout_s=None,
+                    )
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    profile = config_json["opencode_profile"]
+    assert profile["enabled"] is True
+    assert profile["dir"] == "/var/prof/run7"
+    assert profile["messages"] == "100"
+
+
+# ---------------------------------------------------------------------------
+# Helper: async generator that yields index values, mimicking poisson.arrivals
+# ---------------------------------------------------------------------------
+
+def _fake_arrivals(indices):
+    """Return a coroutine-based replacement for poisson.arrivals that yields
+    the given index sequence without sleeping."""
+    async def _gen(*_args, **_kwargs):
+        for i in indices:
+            yield i
+    return _gen

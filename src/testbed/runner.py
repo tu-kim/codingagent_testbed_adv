@@ -36,6 +36,14 @@ def _err(stage: str, exc: BaseException) -> dict[str, Any]:
     return {"stage": stage, "type": type(exc).__name__, "msg": str(exc)}
 
 
+def _env_truthy(v: str | None) -> bool:
+    """Mirror the rule in opencode/.../profile/profile.ts: unset/empty/"0"/"false"
+    (case-insensitive) is off; anything else is on."""
+    if not v:
+        return False
+    return v.lower() not in ("0", "false")
+
+
 async def _pre_clone(repo: str, base_commit: str, dest: Path) -> None:
     """git clone <repo> <dest> && git -C <dest> checkout <base_commit>. Fail-fast."""
     if dest.exists():
@@ -217,6 +225,18 @@ async def run(
     workspace_root = Path(cfg.workspace_root)
     workspace_root.mkdir(parents=True, exist_ok=True)
 
+    # OpenCode profiling state is ENV-gated and resolved outside testbed.yaml
+    # (deploy/testbed.sh up_opencode injects OPENCODE_PROFILE_DIR into the
+    # OpenCode child env). Capture whatever is visible on the runner-side
+    # process env at snapshot time so trace reproducibility includes the
+    # profile knobs -- otherwise resolved_snapshot(cfg) is blind to them.
+    opencode_profile = {
+        "enabled": _env_truthy(os.environ.get("OPENCODE_PROFILE")),
+        "raw": os.environ.get("OPENCODE_PROFILE"),
+        "dir": os.environ.get("OPENCODE_PROFILE_DIR"),
+        "messages": os.environ.get("OPENCODE_PROFILE_MESSAGES"),
+    }
+
     invocation = {
         "split": split,
         "num_samples": num_samples,
@@ -227,6 +247,7 @@ async def run(
         "router": router_label,
         "model": cfg.model.model_dump(mode="json"),
         "config": resolved_snapshot(cfg),
+        "opencode_profile": opencode_profile,
     }
     (out_dir / "config.json").write_text(json.dumps(invocation, indent=2) + "\n")
 
