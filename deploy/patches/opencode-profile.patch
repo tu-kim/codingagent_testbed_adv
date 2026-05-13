@@ -1,32 +1,31 @@
-From 0afe080cd633a71ee8005d39df824d83bc9d3b98 Mon Sep 17 00:00:00 2001
+From b36c1ef8b1045c5d47ca1a8aa87053e6fd689059 Mon Sep 17 00:00:00 2001
 From: tu-kim <taewoo89.kim@gmail.com>
-Date: Wed, 13 May 2026 11:48:52 +0900
-Subject: [PATCH] profile: ENV-gated agent-loop instrumentation
+Date: Wed, 13 May 2026 22:42:06 +0900
+Subject: [PATCH] testbed: ENV-gated profile module with step-event
+ decomposition
 
-Adds opencode/packages/opencode/src/profile/profile.ts plus 5 hook call
-sites in session/prompt.ts and session/processor.ts. Captures per-query
-e2e latency, per-step LLM/tool wall-clock split, ISL/OSL from server-
-reported usage tokens, and per-step modelMsgs snapshots. NDJSON output
-at \$OPENCODE_PROFILE_DIR/<sessionID>.jsonl. When OPENCODE_PROFILE is
-unset/0/false every hook is a no-op.
+Adds packages/opencode/src/profile/profile.ts plus hooks in
+session/prompt.ts (turn/query/tool brackets) and session/processor.ts
+(start-step / finish-step / text-end). All gated by OPENCODE_PROFILE=1;
+no-op otherwise.
 
-tool.start/end pair fires through Effect.onExit so defects (Tool.execute
-uses Effect.orDie) still produce a paired tool.end with ok:false.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+llm.duration_s captures pure LLM streaming time using first tool.start
+or last text-end of the step. llm.step_duration_s separately captures
+the whole AI SDK step bracket. turn.end emits post_overhead_s for the
+non-LLM/non-tool slice.
 ---
- packages/opencode/src/profile/profile.ts   | 340 +++++++++++++++++++++
- packages/opencode/src/session/processor.ts |   3 +
- packages/opencode/src/session/prompt.ts    | 234 ++++++++------
- 3 files changed, 490 insertions(+), 87 deletions(-)
+ packages/opencode/src/profile/profile.ts   | 395 +++++++++++++++++++++
+ packages/opencode/src/session/processor.ts |   4 +
+ packages/opencode/src/session/prompt.ts    | 234 +++++++-----
+ 3 files changed, 546 insertions(+), 87 deletions(-)
  create mode 100644 packages/opencode/src/profile/profile.ts
 
 diff --git a/packages/opencode/src/profile/profile.ts b/packages/opencode/src/profile/profile.ts
 new file mode 100644
-index 000000000..b469f0407
+index 000000000..a141b1880
 --- /dev/null
 +++ b/packages/opencode/src/profile/profile.ts
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,395 @@
 +// Lightweight, ENV-gated profiling for the agent loop.
 +//
 +// Turn it on with `OPENCODE_PROFILE=1`. When unset/0/false every Profile.*
@@ -43,11 +42,20 @@ index 000000000..b469f0407
 +//   query.start  {ts, sessionID, directory}
 +//   turn.start   {ts, sessionID, step, model, system, messages}
 +//   llm.start    {ts, sessionID, step}
-+//   llm.end      {ts, sessionID, step, finish, duration_s, tokens}
++//   llm.end      {ts, sessionID, step, finish, duration_s, step_duration_s, tokens}
 +//   tool.start   {ts, sessionID, step, callID, name, kind, args_head}
 +//   tool.end     {ts, sessionID, step, callID, name, ok, duration_s, [output_chars | error]}
-+//   turn.end     {ts, sessionID, step, duration_s, llm_wall_s, tool_wall_s}
++//   turn.end     {ts, sessionID, step, duration_s, llm_wall_s, tool_wall_s, post_overhead_s}
 +//   query.end    {ts, sessionID, steps, duration_s, aborted}
++//
++// Duration semantics (see docs/opencode_step_events.md for the full lifecycle):
++//   llm.duration_s      = (first tool.start in this step | last text-end | finish-step)
++//                         - start-step. Pure LLM streaming time, NOT including tool exec.
++//   llm.step_duration_s = finish-step - start-step. Whole AI SDK step bracket.
++//   turn.duration_s     = turn.end - turn.start ≈ pre_turn + step_duration + post_turn.
++//   turn.post_overhead_s= max(0, turn.duration_s - llm_wall_s - tool_wall_s).
++//                         Lumps pre-turn setup, post-tool gap, post-step cleanup.
++//                         May be 0 when tools ran in parallel (sum > wall).
 +//
 +// `OPENCODE_PROFILE_MESSAGES` selects message-snapshot fidelity:
 +//   count  — counts/roles only
@@ -82,6 +90,13 @@ index 000000000..b469f0407
 +  step: number
 +  llmStartByStep: Map<number, number>
 +  llmDurationByStep: Map<number, number>
++  // Earliest Profile.tool.start ms per step — best proxy for "AI SDK finished
++  // parsing tool args from the stream and is invoking execute()", which is the
++  // closest moment we can observe to "LLM streaming ended for this step".
++  firstToolStartByStep: Map<number, number>
++  // Most-recent text-end ms per step — fallback for text-only steps (final
++  // answer turns) where no tool ever runs.
++  lastTextEndByStep: Map<number, number>
 +  turnStartByStep: Map<number, number>
 +  toolStart: Map<string, { ms: number; step: number; name: string }>
 +  toolWallByStep: Map<number, number>
@@ -107,6 +122,8 @@ index 000000000..b469f0407
 +      step: 0,
 +      llmStartByStep: new Map(),
 +      llmDurationByStep: new Map(),
++      firstToolStartByStep: new Map(),
++      lastTextEndByStep: new Map(),
 +      turnStartByStep: new Map(),
 +      toolStart: new Map(),
 +      toolWallByStep: new Map(),
@@ -276,14 +293,22 @@ index 000000000..b469f0407
 +      if (!s) return
 +      const start = s.turnStartByStep.get(step)
 +      if (start == null) return
++      const turnMs = nowMs() - start
++      const llmMs = s.llmDurationByStep.get(step) ?? 0
++      const toolMs = s.toolWallByStep.get(step) ?? 0
++      // turn.duration ≈ pre_turn_overhead + llm_wall + tool_wall + post_tool_gap + post_turn_overhead.
++      // Lump the three non-LLM/non-tool slices into post_overhead_s.
++      // Clamped at 0 because parallel tool steps have Σtool > wall(tool).
++      const postMs = Math.max(0, turnMs - llmMs - toolMs)
 +      emit(sessionID, {
 +        ev: "turn.end",
 +        ts: unixTs(),
 +        sessionID,
 +        step,
-+        duration_s: roundSec(nowMs() - start),
-+        llm_wall_s: roundSec(s.llmDurationByStep.get(step) ?? 0),
-+        tool_wall_s: roundSec(s.toolWallByStep.get(step) ?? 0),
++        duration_s: roundSec(turnMs),
++        llm_wall_s: roundSec(llmMs),
++        tool_wall_s: roundSec(toolMs),
++        post_overhead_s: roundSec(postMs),
 +      })
 +      s.turnStartByStep.delete(step)
 +    },
@@ -297,21 +322,42 @@ index 000000000..b469f0407
 +      s.llmStartByStep.set(s.step, nowMs())
 +      emit(sessionID, { ev: "llm.start", ts: unixTs(), sessionID, step: s.step })
 +    },
++    // Fired from processor.ts case "text-end" — marks "model finished
++    // streaming a text block". For text-only steps (final answer turns)
++    // this is the cleanest end-of-LLM marker. For text+tool steps it is
++    // overridden later by firstToolStartByStep (see llm.end).
++    streamingEnd(sessionID: string): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      s.lastTextEndByStep.set(s.step, nowMs())
++    },
 +    end(sessionID: string, info: { finish?: string; tokens: unknown }): void {
 +      if (!envEnabled) return
 +      const s = sessions.get(sessionID)
 +      if (!s) return
 +      const start = s.llmStartByStep.get(s.step)
-+      const duration = start != null ? nowMs() - start : 0
-+      s.llmDurationByStep.set(s.step, duration)
++      const stepEnd = nowMs()
++      // Priority: first tool.start (most accurate — AI SDK has fully parsed
++      // model output and is about to invoke a tool) > last text-end (text-only
++      // step) > finish-step itself (degenerate; no streaming observed).
++      const firstTool = s.firstToolStartByStep.get(s.step)
++      const lastText = s.lastTextEndByStep.get(s.step)
++      const streamEnd = firstTool ?? lastText ?? stepEnd
++      const llmMs = start != null ? streamEnd - start : 0
++      const stepMs = start != null ? stepEnd - start : 0
++      s.llmDurationByStep.set(s.step, llmMs)
 +      s.llmStartByStep.delete(s.step)
++      s.firstToolStartByStep.delete(s.step)
++      s.lastTextEndByStep.delete(s.step)
 +      emit(sessionID, {
 +        ev: "llm.end",
 +        ts: unixTs(),
 +        sessionID,
 +        step: s.step,
 +        finish: info.finish,
-+        duration_s: roundSec(duration),
++        duration_s: roundSec(llmMs),
++        step_duration_s: roundSec(stepMs),
 +        tokens: info.tokens,
 +      })
 +    },
@@ -328,7 +374,15 @@ index 000000000..b469f0407
 +      if (!envEnabled) return
 +      const s = sessions.get(sessionID)
 +      if (!s) return
-+      s.toolStart.set(callID, { ms: nowMs(), step: s.step, name })
++      const ms = nowMs()
++      s.toolStart.set(callID, { ms, step: s.step, name })
++      // First tool.start of THIS step marks the end of LLM streaming:
++      // AI SDK has fully parsed the model's tool_call from the stream and
++      // is invoking execute(). Subsequent (parallel) tool starts in the
++      // same step don't change this — keep the earliest.
++      if (!s.firstToolStartByStep.has(s.step)) {
++        s.firstToolStartByStep.set(s.step, ms)
++      }
 +      emit(sessionID, {
 +        ev: "tool.start",
 +        ts: unixTs(),
@@ -368,7 +422,7 @@ index 000000000..b469f0407
 +  },
 +}
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index f22da9292..05569c95b 100644
+index f22da9292..2645b7441 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
 @@ -24,6 +24,7 @@ import { EventV2 } from "@/v2/event"
@@ -395,6 +449,14 @@ index f22da9292..05569c95b 100644
              if (!ctx.assistantMessage.summary) {
                // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                EventV2.run(SessionEvent.Step.Ended.Sync, {
+@@ -545,6 +548,7 @@ export const layer: Layer.Layer<
+             return
+ 
+           case "text-end":
++            Profile.llm.streamingEnd(ctx.sessionID)
+             if (!ctx.currentText) return
+             // oxlint-disable-next-line no-self-assign -- reactivity trigger
+             ctx.currentText.text = ctx.currentText.text
 diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
 index fef8c4383..01415fd7c 100644
 --- a/packages/opencode/src/session/prompt.ts
