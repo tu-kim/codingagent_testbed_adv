@@ -38,28 +38,34 @@ from pathlib import Path
 from typing import Iterable
 
 
-# `request completed` line shape (one example, fields appear twice from
-# nested tracing spans -- we only grab what's unique to the metrics
-# middleware: input_tokens, output_tokens, ttft_ms, avg_itl_ms).
-_DYNAMO_TOKENS_RE = re.compile(
-    r"\binput_tokens=(?P<input_tokens>\d+)\s+"
-    r"output_tokens=(?P<output_tokens>\d+)\s+"
-    r'ttft_ms="(?P<ttft_ms>[\d.]+)"\s+'
-    r'avg_itl_ms="(?P<avg_itl_ms>[\d.]+)"'
-)
+# Token/timing fields are injected via tracing `span.record(...)` at
+# dynamo/lib/llm/src/http/service/metrics.rs:1466-1484 and only appear
+# conditionally:
+#   - input_tokens / output_tokens: only when MetricsCollector.finalize()
+#     ran (success path); error/cancel paths may omit them entirely.
+#   - ttft_ms:    only when TTFT was measured (>=1 generated token).
+#   - avg_itl_ms: only when itl_count > 0 (= output_tokens >= 2).
+# Values are sometimes quoted (the `format!("{:.2}", ...)` fields:
+# ttft_ms, avg_itl_ms) and sometimes bare (integers). Parse each field
+# independently so a missing optional field doesn't drop the whole line.
+_INPUT_TOKENS_RE = re.compile(r'\binput_tokens="?(?P<v>\d+)"?')
+_OUTPUT_TOKENS_RE = re.compile(r'\boutput_tokens="?(?P<v>\d+)"?')
+_TTFT_RE = re.compile(r'\bttft_ms="?(?P<v>[\d.]+)"?')
+_AVG_ITL_RE = re.compile(r'\bavg_itl_ms="?(?P<v>[\d.]+)"?')
 _ELAPSED_RE = re.compile(r"\belapsed_ms=(?P<elapsed_ms>\d+)\b")
 _MODEL_QUOTED_RE = re.compile(r'\bmodel="(?P<model>[^"]+)"')
+_MODEL_BARE_RE = re.compile(r"\bmodel=(?P<model>[^\s\"]+)")
 _STATUS_RE = re.compile(r"\bstatus=(?P<status>\w+)\b")
 
 
 @dataclass
 class DynamoEntry:
     line_no: int
-    input_tokens: int
-    output_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
     elapsed_ms: int
-    ttft_ms: float
-    avg_itl_ms: float
+    ttft_ms: float | None
+    avg_itl_ms: float | None
     model: str | None
     status: str | None
 
@@ -68,9 +74,13 @@ class DynamoEntry:
         return self.elapsed_ms / 1000.0
 
     @property
-    def expected_decode_s(self) -> float:
+    def expected_decode_s(self) -> float | None:
         # ITL is the gap *between* tokens — N tokens have N-1 gaps.
         # First token's latency is captured separately in ttft_ms.
+        # Dynamo only records avg_itl_ms when itl_count > 0 (i.e.
+        # output_tokens >= 2); for shorter responses we can't estimate.
+        if self.output_tokens is None or self.avg_itl_ms is None:
+            return None
         gaps = max(0, self.output_tokens - 1)
         return (gaps * self.avg_itl_ms) / 1000.0
 
@@ -86,33 +96,74 @@ class ProfileStep:
     finish: str | None
 
 
-def parse_dynamo_log(path: Path, model_filter: str | None) -> list[DynamoEntry]:
+@dataclass
+class DynamoParseStats:
+    """Diagnostic counters surfaced by parse_dynamo_log."""
+    total_completed: int = 0          # `request completed` lines seen
+    matched: int = 0                  # entries returned (passed filter)
+    filtered_by_model: int = 0
+    missing_elapsed_ms: int = 0
+    missing_input_tokens: int = 0     # error/cancel path; no token info
+    missing_output_tokens: int = 0
+    missing_ttft_ms: int = 0          # short / failed requests
+    missing_avg_itl_ms: int = 0       # output_tokens < 2
+
+
+def parse_dynamo_log(
+    path: Path,
+    model_filter: str | None,
+    stats: DynamoParseStats | None = None,
+) -> list[DynamoEntry]:
     out: list[DynamoEntry] = []
+    s = stats if stats is not None else DynamoParseStats()
     with path.open(encoding="utf-8", errors="replace") as f:
         for i, line in enumerate(f, start=1):
             if "request completed" not in line:
                 continue
-            m = _DYNAMO_TOKENS_RE.search(line)
-            if not m:
-                continue
+            s.total_completed += 1
+
             elapsed_m = _ELAPSED_RE.search(line)
-            model_m = _MODEL_QUOTED_RE.search(line)
-            status_m = _STATUS_RE.search(line)
+            if not elapsed_m:
+                s.missing_elapsed_ms += 1
+                continue
+            elapsed_ms = int(elapsed_m.group("elapsed_ms"))
+
+            # Prefer the quoted span-recorded model (set in finalize),
+            # fall back to the bare InflightGuard one.
+            model_m = _MODEL_QUOTED_RE.search(line) or _MODEL_BARE_RE.search(line)
             model = model_m.group("model") if model_m else None
             if model_filter and model != model_filter:
+                s.filtered_by_model += 1
                 continue
+
+            input_m = _INPUT_TOKENS_RE.search(line)
+            output_m = _OUTPUT_TOKENS_RE.search(line)
+            ttft_m = _TTFT_RE.search(line)
+            itl_m = _AVG_ITL_RE.search(line)
+            status_m = _STATUS_RE.search(line)
+
+            if not input_m:
+                s.missing_input_tokens += 1
+            if not output_m:
+                s.missing_output_tokens += 1
+            if not ttft_m:
+                s.missing_ttft_ms += 1
+            if not itl_m:
+                s.missing_avg_itl_ms += 1
+
             out.append(
                 DynamoEntry(
                     line_no=i,
-                    input_tokens=int(m.group("input_tokens")),
-                    output_tokens=int(m.group("output_tokens")),
-                    elapsed_ms=int(elapsed_m.group("elapsed_ms")) if elapsed_m else 0,
-                    ttft_ms=float(m.group("ttft_ms")),
-                    avg_itl_ms=float(m.group("avg_itl_ms")),
+                    input_tokens=int(input_m.group("v")) if input_m else None,
+                    output_tokens=int(output_m.group("v")) if output_m else None,
+                    elapsed_ms=elapsed_ms,
+                    ttft_ms=float(ttft_m.group("v")) if ttft_m else None,
+                    avg_itl_ms=float(itl_m.group("v")) if itl_m else None,
                     model=model,
                     status=status_m.group("status") if status_m else None,
                 )
             )
+            s.matched += 1
     return out
 
 
@@ -205,12 +256,18 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
             lines.append(" | ".join(row))
             continue
 
-        if p.prompt_tokens is not None and p.prompt_tokens != d.input_tokens:
+        if (p.prompt_tokens is not None and d.input_tokens is not None
+                and p.prompt_tokens != d.input_tokens):
             flags.append(f"PROMPT_DIFF({p.prompt_tokens}!={d.input_tokens})")
             mismatches += 1
-        if p.completion_tokens is not None and p.completion_tokens != d.output_tokens:
+        if (p.completion_tokens is not None and d.output_tokens is not None
+                and p.completion_tokens != d.output_tokens):
             flags.append(f"COMPL_DIFF({p.completion_tokens}!={d.output_tokens})")
             mismatches += 1
+        if d.input_tokens is None and d.output_tokens is None:
+            # Likely an error/cancel path where MetricsCollector.finalize()
+            # didn't run -- token comparison is impossible for this row.
+            flags.append("NO_DYNAMO_TOKENS")
         if d.status and d.status != "success":
             flags.append(f"STATUS={d.status}")
 
@@ -234,7 +291,7 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
             _fmt(p.duration_s, 8),
             _fmt(p.step_duration_s, 9),
             _fmt(d.elapsed_s, 9),
-            _fmt(d.ttft_ms / 1000.0, 9),
+            _fmt(d.ttft_ms / 1000.0 if d.ttft_ms is not None else None, 9),
             _fmt(d.expected_decode_s, 11),
             _fmt(framework_s, 12),
             " ".join(flags),
@@ -251,6 +308,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--profile", required=True, type=Path, help="Profile NDJSON for ONE session")
     ap.add_argument("--dynamo-log", required=True, type=Path, help="Dynamo frontend log path")
     ap.add_argument("--model", default=None, help="Filter Dynamo entries by model= value")
+    ap.add_argument(
+        "--skip-dynamo-leading", type=int, default=0, metavar="N",
+        help="Drop the first N matched Dynamo entries before pairing. Use when the "
+             "frontend log has leading probe/warmup requests that don't appear in the "
+             "profile NDJSON (common when opencode validates the model at startup).",
+    )
     ap.add_argument("--strict", action="store_true", help="Exit 1 if any mismatch is found")
     args = ap.parse_args(argv)
 
@@ -262,11 +325,37 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     profile = parse_profile(args.profile)
-    dynamo = parse_dynamo_log(args.dynamo_log, args.model)
+    stats = DynamoParseStats()
+    dynamo = parse_dynamo_log(args.dynamo_log, args.model, stats=stats)
+
+    if args.skip_dynamo_leading > 0:
+        dropped = dynamo[: args.skip_dynamo_leading]
+        dynamo = dynamo[args.skip_dynamo_leading :]
+        print(
+            f"--skip-dynamo-leading={args.skip_dynamo_leading}: dropped "
+            f"{len(dropped)} leading entries "
+            f"(line_nos: {[e.line_no for e in dropped]})"
+        )
 
     print(f"profile llm.end events:   {len(profile)}")
-    print(f"dynamo request completed: {len(dynamo)}")
-    if len(profile) != len(dynamo):
+    print(f"dynamo request completed: {stats.total_completed} (matched {stats.matched})")
+    if stats.filtered_by_model:
+        print(f"  filtered by --model:    {stats.filtered_by_model}")
+    if stats.missing_elapsed_ms:
+        print(f"  skipped (no elapsed_ms): {stats.missing_elapsed_ms}")
+    if stats.missing_input_tokens or stats.missing_output_tokens:
+        print(
+            f"  token fields missing on matched rows: "
+            f"input={stats.missing_input_tokens} output={stats.missing_output_tokens} "
+            f"(error/cancel paths — finalize() didn't run)"
+        )
+    if stats.missing_ttft_ms or stats.missing_avg_itl_ms:
+        print(
+            f"  timing fields missing on matched rows: "
+            f"ttft_ms={stats.missing_ttft_ms} avg_itl_ms={stats.missing_avg_itl_ms} "
+            f"(avg_itl_ms only recorded when output_tokens >= 2)"
+        )
+    if len(profile) != stats.matched:
         print(
             "  WARN: count mismatch — order-based pairing will leave excess entries unmatched.",
             file=sys.stderr,

@@ -81,6 +81,81 @@ def test_expected_decode_s_uses_n_minus_one_gaps(mod):
     assert many.expected_decode_s == pytest.approx(9 * 30.0 / 1000.0)
 
 
+def test_expected_decode_s_none_when_avg_itl_missing(mod):
+    """avg_itl_ms is None when output_tokens < 2 in the dynamo log
+    (itl_count == 0). Can't estimate decode time -- return None."""
+    e = mod.DynamoEntry(line_no=1, input_tokens=100, output_tokens=1,
+                        elapsed_ms=500, ttft_ms=500.0, avg_itl_ms=None,
+                        model="m", status="success")
+    assert e.expected_decode_s is None
+
+
+def test_parse_dynamo_log_handles_missing_optional_fields(mod, tmp_path):
+    """Real-world: short responses (output_tokens<2) omit avg_itl_ms;
+    error/cancel paths may omit ttft_ms or even token counts entirely.
+    Previously these lines were silently dropped by a strict 4-field
+    regex; now each field is optional and the line is returned with
+    None for the missing ones."""
+    # output_tokens=1 → no avg_itl_ms recorded
+    short = (
+        'INFO http-request: dynamo_llm::http::service::metrics: request completed '
+        "request_id=a model=m endpoint=chat_completions request_type=stream "
+        "status=success elapsed_ms=200 method=POST uri=/ version=HTTP/1.1 "
+        'request_id=b model="m" input_tokens=10 output_tokens=1 ttft_ms="200.00"'
+    )
+    # error path → no token / timing fields at all (only InflightGuard core)
+    err = (
+        'ERROR http-request: dynamo_llm::http::service::metrics: request completed '
+        "request_id=c model=m endpoint=chat_completions request_type=stream "
+        "status=error error_type=cancelled "
+        'error_detail="cancelled before completion" elapsed_ms=42 method=POST'
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(short + "\n" + err + "\n")
+
+    stats = mod.DynamoParseStats()
+    entries = mod.parse_dynamo_log(log, model_filter=None, stats=stats)
+    assert len(entries) == 2
+    assert stats.total_completed == 2
+    assert stats.matched == 2
+
+    short_e = entries[0]
+    assert short_e.input_tokens == 10
+    assert short_e.output_tokens == 1
+    assert short_e.ttft_ms == pytest.approx(200.0)
+    assert short_e.avg_itl_ms is None
+    assert short_e.expected_decode_s is None
+    assert stats.missing_avg_itl_ms == 1
+
+    err_e = entries[1]
+    assert err_e.input_tokens is None
+    assert err_e.output_tokens is None
+    assert err_e.ttft_ms is None
+    assert err_e.avg_itl_ms is None
+    assert err_e.elapsed_ms == 42
+    assert err_e.status == "error"
+    assert stats.missing_input_tokens == 1
+    assert stats.missing_output_tokens == 1
+    assert stats.missing_ttft_ms == 2  # both lines
+
+
+def test_parse_dynamo_log_skips_no_elapsed(mod, tmp_path):
+    """Defensive: a `request completed` without elapsed_ms shouldn't
+    happen per InflightGuard::Drop, but if it does we don't trust the
+    row -- drop it and bump the stat."""
+    log = tmp_path / "frontend.log"
+    log.write_text(
+        "INFO http-request: dynamo_llm::http::service::metrics: request completed "
+        "request_id=x model=m\n"
+    )
+    stats = mod.DynamoParseStats()
+    entries = mod.parse_dynamo_log(log, model_filter=None, stats=stats)
+    assert entries == []
+    assert stats.total_completed == 1
+    assert stats.missing_elapsed_ms == 1
+    assert stats.matched == 0
+
+
 def test_parse_dynamo_log_filters_by_model(mod, tmp_path):
     other = SAMPLE_DYNAMO_LINE.replace(
         'model="qwen3-coder-30b-a3b-instruct-fp8"', 'model="some-other-model"'
@@ -297,6 +372,44 @@ def test_main_end_to_end_clean(mod, tmp_path, capsys):
     assert rc == 0
     assert "profile llm.end events:   1" in captured.out
     assert "dynamo request completed: 1" in captured.out
+    assert "flagged rows: 0" in captured.out
+
+
+def test_main_skip_dynamo_leading(mod, tmp_path, capsys):
+    """When opencode probes the model at startup, the dynamo log has a
+    leading `request completed` line that has no profile counterpart.
+    --skip-dynamo-leading=1 should drop the head and align the rest."""
+    probe = (
+        'INFO http-request: dynamo_llm::http::service::metrics: request completed '
+        "request_id=a model=m endpoint=chat_completions request_type=stream "
+        "status=success elapsed_ms=100 method=POST uri=/ version=HTTP/1.1 "
+        'request_id=b model="m" input_tokens=1 output_tokens=1 ttft_ms="100.00"'
+    )
+    real = (
+        'INFO http-request: dynamo_llm::http::service::metrics: request completed '
+        "request_id=c model=m endpoint=chat_completions request_type=stream "
+        "status=success elapsed_ms=1500 method=POST uri=/ version=HTTP/1.1 "
+        'request_id=d model="m" input_tokens=200 output_tokens=49 '
+        'ttft_ms="500.00" avg_itl_ms="20.00"'
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(probe + "\n" + real + "\n")
+
+    ndjson = tmp_path / "ses.ndjson"
+    ndjson.write_text(json.dumps({
+        "ev": "llm.end", "step": 1, "ts": 1.0,
+        "duration_s": 1.2, "step_duration_s": 1.5,
+        "tokens": {"prompt_tokens": 200, "completion_tokens": 49},
+        "finish": "tool-calls",
+    }) + "\n")
+
+    rc = mod.main([
+        "--profile", str(ndjson), "--dynamo-log", str(log),
+        "--skip-dynamo-leading", "1", "--strict",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.out + captured.err
+    assert "dropped 1 leading entries" in captured.out
     assert "flagged rows: 0" in captured.out
 
 
