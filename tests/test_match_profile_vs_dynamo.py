@@ -52,36 +52,9 @@ def test_parse_dynamo_log_extracts_fields(mod, tmp_path):
     assert e.input_tokens == 15473
     assert e.output_tokens == 49
     assert e.elapsed_ms == 1628
-    assert e.ttft_ms == pytest.approx(1203.0)
-    assert e.avg_itl_ms == pytest.approx(30.3)
     assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
     assert e.status == "success"
     assert e.elapsed_s == pytest.approx(1.628)
-    # Wall-clock decode portion of the request, directly measured.
-    assert e.post_ttft_s == pytest.approx((1628 - 1203.0) / 1000.0)
-
-
-def test_post_ttft_s_directly_measured(mod):
-    """post_ttft_s = max(0, elapsed - ttft). Doesn't rely on avg_itl_ms,
-    which is unreliable when the first SSE chunk carries many tokens
-    (denominator excludes them, inflating per-token average)."""
-    e = mod.DynamoEntry(line_no=1, input_tokens=100, output_tokens=10,
-                        elapsed_ms=1500, ttft_ms=500.0, avg_itl_ms=999.0,
-                        model="m", status="success")
-    assert e.post_ttft_s == pytest.approx(1.0)
-
-    # Defensive: ttft > elapsed (shouldn't happen but don't go negative).
-    weird = mod.DynamoEntry(line_no=2, input_tokens=100, output_tokens=1,
-                            elapsed_ms=500, ttft_ms=700.0, avg_itl_ms=None,
-                            model="m", status="success")
-    assert weird.post_ttft_s == 0.0
-
-
-def test_post_ttft_s_none_when_ttft_missing(mod):
-    e = mod.DynamoEntry(line_no=1, input_tokens=100, output_tokens=1,
-                        elapsed_ms=500, ttft_ms=None, avg_itl_ms=None,
-                        model="m", status="success")
-    assert e.post_ttft_s is None
 
 
 def test_parse_profile_ai_sdk_v6_token_shape(mod, tmp_path):
@@ -217,21 +190,14 @@ def test_parse_dynamo_log_handles_missing_optional_fields(mod, tmp_path):
     short_e = entries[0]
     assert short_e.input_tokens == 10
     assert short_e.output_tokens == 1
-    assert short_e.ttft_ms == pytest.approx(200.0)
-    assert short_e.avg_itl_ms is None
-    assert short_e.expected_decode_s is None
-    assert stats.missing_avg_itl_ms == 1
 
     err_e = entries[1]
     assert err_e.input_tokens is None
     assert err_e.output_tokens is None
-    assert err_e.ttft_ms is None
-    assert err_e.avg_itl_ms is None
     assert err_e.elapsed_ms == 42
     assert err_e.status == "error"
     assert stats.missing_input_tokens == 1
     assert stats.missing_output_tokens == 1
-    assert stats.missing_ttft_ms == 2  # both lines
 
 
 def test_parse_dynamo_log_skips_no_elapsed(mod, tmp_path):
@@ -326,11 +292,9 @@ def test_match_in_order_pairs_by_index(mod):
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, ttft_ms=200.0, avg_itl_ms=20.0,
-                        model="m", status="success"),
+                        elapsed_ms=1500, model="m", status="success"),
         mod.DynamoEntry(line_no=2, input_tokens=20, output_tokens=30,
-                        elapsed_ms=800, ttft_ms=150.0, avg_itl_ms=15.0,
-                        model="m", status="success"),
+                        elapsed_ms=800, model="m", status="success"),
     ]
     pairs = mod.match_in_order(profile, dynamo)
     assert len(pairs) == 2
@@ -347,8 +311,7 @@ def test_match_in_order_marks_excess_profile_unmatched(mod):
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, ttft_ms=200.0, avg_itl_ms=20.0,
-                        model="m", status="success"),
+                        elapsed_ms=1500, model="m", status="success"),
     ]
     pairs = mod.match_in_order(profile, dynamo)
     assert pairs[1][1] is None
@@ -364,11 +327,9 @@ def test_match_in_order_excess_dynamo_ignored(mod):
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, ttft_ms=200.0, avg_itl_ms=20.0,
-                        model="m", status="success"),
+                        elapsed_ms=1500, model="m", status="success"),
         mod.DynamoEntry(line_no=2, input_tokens=20, output_tokens=30,
-                        elapsed_ms=800, ttft_ms=150.0, avg_itl_ms=15.0,
-                        model="m", status="success"),
+                        elapsed_ms=800, model="m", status="success"),
     ]
     pairs = mod.match_in_order(profile, dynamo)
     assert len(pairs) == 1
@@ -382,8 +343,7 @@ def test_render_table_flags_token_mismatch(mod):
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, ttft_ms=200.0, avg_itl_ms=20.0,
-                        model="m", status="success"),
+                        elapsed_ms=1500, model="m", status="success"),
     ]
     table, mismatches = mod.render_table(mod.match_in_order(profile, dynamo))
     assert "PROMPT_DIFF(99!=10)" in table
@@ -436,17 +396,32 @@ def test_parse_profile_tokens_null_and_camelcase(mod, tmp_path):
 def test_render_table_no_flags_on_clean_match(mod):
     profile = [
         mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
-                        duration_s=1.0, step_duration_s=1.7, finish=None),
+                        duration_s=1.0, step_duration_s=1.4, finish=None),
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, ttft_ms=200.0, avg_itl_ms=20.0,
-                        model="m", status="success"),
+                        elapsed_ms=1500, model="m", status="success"),
     ]
     table, mismatches = mod.render_table(mod.match_in_order(profile, dynamo))
     assert mismatches == 0
-    # framework_s = 1.7 - 1.5 = 0.2 (positive, normal)
-    assert "NEG_FRAMEWORK" not in table
+
+
+def test_render_table_flags_unphysical_p_step_over_elap(mod):
+    """d_elap_s > p_step_s is normal (different timer origins, see module
+    docstring). The reverse -- p_step_s significantly larger than d_elap_s
+    -- is unphysical and indicates misalignment (wrong dynamo entry paired
+    with this profile step). Flag rows where p_step_s > d_elap_s + 0.5s."""
+    profile = [
+        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
+                        duration_s=2.0, step_duration_s=5.0, finish=None),
+    ]
+    dynamo = [
+        mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
+                        elapsed_ms=1500, model="m", status="success"),
+    ]
+    table, mismatches = mod.render_table(mod.match_in_order(profile, dynamo))
+    assert "P_STEP_OVER_ELAP" in table
+    assert mismatches == 1
 
 
 def test_main_end_to_end_clean(mod, tmp_path, capsys):

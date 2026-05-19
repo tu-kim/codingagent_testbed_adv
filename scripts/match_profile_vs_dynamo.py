@@ -8,18 +8,18 @@ For each `llm.end` event in the profile, pair it with the corresponding
     shape from opencode session.ts getUsage) ↔ input_tokens (dynamo ISL)
   * completion = tokens.output (profile)      ↔ output_tokens (dynamo OSL)
   * step_duration_s (profile)                 ↔ elapsed_ms/1000 (dynamo)
-  * duration_s (profile, up to first tool.start)   <-- where in elapsed
-                                                       did the tool_call land
-  * post_ttft_s = elapsed_ms - ttft_ms              (directly measured,
-                                                     NOT derived from avg_itl_ms)
+  * duration_s (profile, up to first tool.start)
 
-avg_itl_ms in dynamo is `(elapsed - ttft) / itl_count` where itl_count is
-the count of tokens delivered AFTER the first SSE chunk (not output_tokens),
-so multiplying it by (N-1) overestimates decode time when the first chunk
-carries many tokens. Use post_ttft_s for honest comparison.
+Note on the two timers: `d_elap_s` measures from when dynamo frontend
+received the HTTP request (`InflightGuard.timer`, set in InflightGuard::new),
+while `p_step_s` measures from when the AI SDK emits `start-step` -- which
+fires near first-chunk receipt on the client. So `d_elap_s > p_step_s`
+is normal; the gap is the pre-`start-step` portion (request send, network
+RTT, dynamo preprocessing/queueing, prefill, KV transfer, first-chunk wire).
 
-The duration delta (step_duration_s - elapsed_ms/1000) reflects AI-SDK /
-processor.ts overhead on top of the LLM stream as seen by Dynamo.
+Dynamo's `ttft_ms` / `avg_itl_ms` are intentionally NOT consumed here:
+TTFT and decode rate are better measured from vLLM `/metrics`
+(time_per_output_token_seconds, time_to_first_token_seconds histograms).
 
 Matching is order-based: profile llm.end events sorted by ts are paired
 1:1 with `request completed` lines in the dynamo log. Assumes a single
@@ -74,8 +74,6 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHJ]")
 
 _INPUT_TOKENS_RE = _field("input_tokens", r"\d+")
 _OUTPUT_TOKENS_RE = _field("output_tokens", r"\d+")
-_TTFT_RE = _field("ttft_ms", r"[\d.]+")
-_AVG_ITL_RE = _field("avg_itl_ms", r"[\d.]+")
 _ELAPSED_RE = _field("elapsed_ms", r"\d+")
 _STATUS_RE = _field("status", r"\w+")
 # `model=` appears twice on a `request completed` line: bare from
@@ -98,22 +96,12 @@ class DynamoEntry:
     input_tokens: int | None
     output_tokens: int | None
     elapsed_ms: int
-    ttft_ms: float | None
-    avg_itl_ms: float | None
     model: str | None
     status: str | None
 
     @property
     def elapsed_s(self) -> float:
         return self.elapsed_ms / 1000.0
-
-    @property
-    def post_ttft_s(self) -> float | None:
-        """Wall time spent streaming after TTFT: elapsed - ttft. Directly
-        measured (no assumption about per-token latency)."""
-        if self.ttft_ms is None:
-            return None
-        return max(0.0, (self.elapsed_ms - self.ttft_ms) / 1000.0)
 
 
 @dataclass
@@ -136,8 +124,6 @@ class DynamoParseStats:
     missing_elapsed_ms: int = 0
     missing_input_tokens: int = 0     # error/cancel path; no token info
     missing_output_tokens: int = 0
-    missing_ttft_ms: int = 0          # short / failed requests
-    missing_avg_itl_ms: int = 0       # output_tokens < 2
     first_dropped_sample: str | None = None  # first line dropped at parse, for debugging
 
 
@@ -170,18 +156,12 @@ def parse_dynamo_log(
 
             input_m = _INPUT_TOKENS_RE.search(line)
             output_m = _OUTPUT_TOKENS_RE.search(line)
-            ttft_m = _TTFT_RE.search(line)
-            itl_m = _AVG_ITL_RE.search(line)
             status_m = _STATUS_RE.search(line)
 
             if not input_m:
                 s.missing_input_tokens += 1
             if not output_m:
                 s.missing_output_tokens += 1
-            if not ttft_m:
-                s.missing_ttft_ms += 1
-            if not itl_m:
-                s.missing_avg_itl_ms += 1
 
             out.append(
                 DynamoEntry(
@@ -189,8 +169,6 @@ def parse_dynamo_log(
                     input_tokens=int(input_m.group("v")) if input_m else None,
                     output_tokens=int(output_m.group("v")) if output_m else None,
                     elapsed_ms=elapsed_ms,
-                    ttft_ms=float(ttft_m.group("v")) if ttft_m else None,
-                    avg_itl_ms=float(itl_m.group("v")) if itl_m else None,
                     model=model,
                     status=status_m.group("v") if status_m else None,
                 )
@@ -287,9 +265,6 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
         ("p_dur_s", 8),
         ("p_step_s", 9),
         ("d_elap_s", 9),
-        ("d_ttft_s", 9),
-        ("d_post_ttft_s", 14),
-        ("framework_s", 12),
         ("flags", 0),
     ]
     head_line = " | ".join(f"{name:>{w}}" if w else name for name, w in headers)
@@ -311,9 +286,6 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
                 _fmt(p.duration_s, 8),
                 _fmt(p.step_duration_s, 9),
                 _fmt(None, 9),
-                _fmt(None, 9),
-                _fmt(None, 14),
-                _fmt(None, 12),
                 " ".join(flags),
             ]
             lines.append(" | ".join(row))
@@ -333,17 +305,15 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
             flags.append("NO_DYNAMO_TOKENS")
         if d.status and d.status != "success":
             flags.append(f"STATUS={d.status}")
-
-        framework_s: float | None = None
-        if p.step_duration_s is not None:
-            framework_s = p.step_duration_s - d.elapsed_s
-            if framework_s < -0.05:
-                # Profile bracket shorter than dynamo elapsed by >50ms means
-                # the LLM call started before start-step was hooked, or
-                # finish-step fired before stream actually closed --
-                # either way suspicious.
-                flags.append(f"NEG_FRAMEWORK({framework_s:+.2f}s)")
-                mismatches += 1
+        # d_elap_s > p_step_s is normal (different timer origins -- see
+        # module docstring). The impossible direction is p_step_s > d_elap_s
+        # by more than network RTT; flag that as suspicious matching.
+        if (p.step_duration_s is not None
+                and p.step_duration_s > d.elapsed_s + 0.5):
+            flags.append(
+                f"P_STEP_OVER_ELAP({p.step_duration_s - d.elapsed_s:+.2f}s)"
+            )
+            mismatches += 1
 
         row = [
             _fmt(p.step, 4),
@@ -354,9 +324,6 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
             _fmt(p.duration_s, 8),
             _fmt(p.step_duration_s, 9),
             _fmt(d.elapsed_s, 9),
-            _fmt(d.ttft_ms / 1000.0 if d.ttft_ms is not None else None, 9),
-            _fmt(d.post_ttft_s, 14),
-            _fmt(framework_s, 12),
             " ".join(flags),
         ]
         lines.append(" | ".join(row))
@@ -414,12 +381,6 @@ def main(argv: list[str] | None = None) -> int:
             f"input={stats.missing_input_tokens} output={stats.missing_output_tokens} "
             f"(error/cancel paths — finalize() didn't run)"
         )
-    if stats.missing_ttft_ms or stats.missing_avg_itl_ms:
-        print(
-            f"  timing fields missing on matched rows: "
-            f"ttft_ms={stats.missing_ttft_ms} avg_itl_ms={stats.missing_avg_itl_ms} "
-            f"(avg_itl_ms only recorded when output_tokens >= 2)"
-        )
     if len(profile) != stats.matched:
         print(
             "  WARN: count mismatch — order-based pairing will leave excess entries unmatched.",
@@ -431,21 +392,6 @@ def main(argv: list[str] | None = None) -> int:
     print(table)
     print()
     print(f"flagged rows: {mismatches}")
-
-    # Aggregate framework overhead (profile step_duration vs dynamo elapsed).
-    deltas = []
-    for p, d in match_in_order(profile, dynamo):
-        if d is None or p.step_duration_s is None:
-            continue
-        deltas.append(p.step_duration_s - d.elapsed_s)
-    if deltas:
-        deltas.sort()
-        n = len(deltas)
-        med = deltas[n // 2]
-        print(
-            f"framework overhead (step_duration_s - dynamo_elapsed_s): "
-            f"n={n}, median={med:+.3f}s, min={deltas[0]:+.3f}s, max={deltas[-1]:+.3f}s"
-        )
 
     return 1 if (args.strict and mismatches) else 0
 
