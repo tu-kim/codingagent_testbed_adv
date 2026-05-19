@@ -90,6 +90,61 @@ def test_expected_decode_s_none_when_avg_itl_missing(mod):
     assert e.expected_decode_s is None
 
 
+def test_parse_dynamo_log_strips_ansi_color_codes(mod, tmp_path):
+    """tracing-subscriber's pretty formatter wraps both keys and `=`
+    separators in ANSI SGR codes even when stdout is redirected to a
+    file. Parser must strip them per line before applying field regexes.
+    Pasted from a live dynamo log opened in VSCode."""
+    ansi_line = (
+        "\x1b[2m2026-05-19T11:48:13.237919Z\x1b[0m \x1b[32m INFO\x1b[0m "
+        "\x1b[1mhttp-request\x1b[0m: \x1b[2mdynamo_llm::http::service::metrics\x1b[0m\x1b[2m:\x1b[0m "
+        "request completed \x1b[3mrequest_id\x1b[0m\x1b[2m=\x1b[0m47b34438 "
+        "\x1b[3mmodel\x1b[0m\x1b[2m=\x1b[0mqwen3-coder-30b-a3b-instruct-fp8 "
+        "\x1b[3mendpoint\x1b[0m\x1b[2m=\x1b[0mchat_completions "
+        "\x1b[3mstatus\x1b[0m\x1b[2m=\x1b[0msuccess "
+        "\x1b[3melapsed_ms\x1b[0m\x1b[2m=\x1b[0m1205 "
+        "\x1b[3minput_tokens\x1b[0m\x1b[2m=\x1b[0m721 "
+        "\x1b[3moutput_tokens\x1b[0m\x1b[2m=\x1b[0m7 "
+        '\x1b[3mttft_ms\x1b[0m\x1b[2m=\x1b[0m"1162.22" '
+        '\x1b[3mavg_itl_ms\x1b[0m\x1b[2m=\x1b[0m"6.94"\x1b[0m'
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(ansi_line + "\n")
+    entries = mod.parse_dynamo_log(log, model_filter=None)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.elapsed_ms == 1205
+    assert e.input_tokens == 721
+    assert e.output_tokens == 7
+    assert e.ttft_ms == pytest.approx(1162.22)
+    assert e.avg_itl_ms == pytest.approx(6.94)
+    assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
+    assert e.status == "success"
+
+
+def test_parse_dynamo_log_accepts_json_format(mod, tmp_path):
+    """tracing-subscriber can also emit JSON when configured for log
+    aggregators. Field regex uses `[=:]` so both pretty `k=v` and JSON
+    `"k":v` match."""
+    json_line = (
+        '{"timestamp":"2026-05-19T11:48:13Z","level":"INFO","target":'
+        '"dynamo_llm::http::service::metrics","fields":{"message":'
+        '"request completed","elapsed_ms":1205,"model":'
+        '"qwen3-coder-30b-a3b-instruct-fp8","status":"success",'
+        '"input_tokens":721,"output_tokens":7,"ttft_ms":"1162.22",'
+        '"avg_itl_ms":"6.94"}}'
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(json_line + "\n")
+    entries = mod.parse_dynamo_log(log, model_filter=None)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.elapsed_ms == 1205
+    assert e.input_tokens == 721
+    assert e.output_tokens == 7
+    assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
+
+
 def test_parse_dynamo_log_handles_missing_optional_fields(mod, tmp_path):
     """Real-world: short responses (output_tokens<2) omit avg_itl_ms;
     error/cancel paths may omit ttft_ms or even token counts entirely.

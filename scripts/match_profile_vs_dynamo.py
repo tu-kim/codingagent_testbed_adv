@@ -48,14 +48,30 @@ from typing import Iterable
 # Values are sometimes quoted (the `format!("{:.2}", ...)` fields:
 # ttft_ms, avg_itl_ms) and sometimes bare (integers). Parse each field
 # independently so a missing optional field doesn't drop the whole line.
-_INPUT_TOKENS_RE = re.compile(r'\binput_tokens="?(?P<v>\d+)"?')
-_OUTPUT_TOKENS_RE = re.compile(r'\boutput_tokens="?(?P<v>\d+)"?')
-_TTFT_RE = re.compile(r'\bttft_ms="?(?P<v>[\d.]+)"?')
-_AVG_ITL_RE = re.compile(r'\bavg_itl_ms="?(?P<v>[\d.]+)"?')
-_ELAPSED_RE = re.compile(r"\belapsed_ms=(?P<elapsed_ms>\d+)\b")
-_MODEL_QUOTED_RE = re.compile(r'\bmodel="(?P<model>[^"]+)"')
-_MODEL_BARE_RE = re.compile(r"\bmodel=(?P<model>[^\s\"]+)")
-_STATUS_RE = re.compile(r"\bstatus=(?P<status>\w+)\b")
+# Field accessors tolerate both tracing's pretty format (`k=v` or `k="v"`)
+# and JSON-formatter output (`"k":v` or `"k":"v"`). Production deployments
+# often configure tracing-subscriber for JSON to feed log aggregators.
+def _field(name: str, valpat: str) -> re.Pattern[str]:
+    return re.compile(
+        rf'(?:\b|")\b{name}\b"?\s*[=:]\s*"?(?P<v>{valpat})"?'
+    )
+
+
+# Tracing-subscriber's pretty formatter writes ANSI SGR colour codes around
+# both keys and `=` separators even when stdout is not a TTY (it only checks
+# at startup). The codes break `key=value` parsing, so we strip them per
+# line before applying field regexes. Disable on the dynamo side with
+# RUST_LOG_STYLE=never or `--log-no-color`, but parsing tolerant is safer.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHJ]")
+
+
+_INPUT_TOKENS_RE = _field("input_tokens", r"\d+")
+_OUTPUT_TOKENS_RE = _field("output_tokens", r"\d+")
+_TTFT_RE = _field("ttft_ms", r"[\d.]+")
+_AVG_ITL_RE = _field("avg_itl_ms", r"[\d.]+")
+_ELAPSED_RE = _field("elapsed_ms", r"\d+")
+_STATUS_RE = _field("status", r"\w+")
+_MODEL_RE = _field("model", r"[^\s\",}]+")
 
 
 @dataclass
@@ -107,6 +123,7 @@ class DynamoParseStats:
     missing_output_tokens: int = 0
     missing_ttft_ms: int = 0          # short / failed requests
     missing_avg_itl_ms: int = 0       # output_tokens < 2
+    first_dropped_sample: str | None = None  # first line dropped at parse, for debugging
 
 
 def parse_dynamo_log(
@@ -117,7 +134,8 @@ def parse_dynamo_log(
     out: list[DynamoEntry] = []
     s = stats if stats is not None else DynamoParseStats()
     with path.open(encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f, start=1):
+        for i, raw_line in enumerate(f, start=1):
+            line = _ANSI_RE.sub("", raw_line)
             if "request completed" not in line:
                 continue
             s.total_completed += 1
@@ -125,13 +143,13 @@ def parse_dynamo_log(
             elapsed_m = _ELAPSED_RE.search(line)
             if not elapsed_m:
                 s.missing_elapsed_ms += 1
+                if s.first_dropped_sample is None:
+                    s.first_dropped_sample = line.rstrip()
                 continue
-            elapsed_ms = int(elapsed_m.group("elapsed_ms"))
+            elapsed_ms = int(elapsed_m.group("v"))
 
-            # Prefer the quoted span-recorded model (set in finalize),
-            # fall back to the bare InflightGuard one.
-            model_m = _MODEL_QUOTED_RE.search(line) or _MODEL_BARE_RE.search(line)
-            model = model_m.group("model") if model_m else None
+            model_m = _MODEL_RE.search(line)
+            model = model_m.group("v") if model_m else None
             if model_filter and model != model_filter:
                 s.filtered_by_model += 1
                 continue
@@ -160,7 +178,7 @@ def parse_dynamo_log(
                     ttft_ms=float(ttft_m.group("v")) if ttft_m else None,
                     avg_itl_ms=float(itl_m.group("v")) if itl_m else None,
                     model=model,
-                    status=status_m.group("status") if status_m else None,
+                    status=status_m.group("v") if status_m else None,
                 )
             )
             s.matched += 1
@@ -343,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  filtered by --model:    {stats.filtered_by_model}")
     if stats.missing_elapsed_ms:
         print(f"  skipped (no elapsed_ms): {stats.missing_elapsed_ms}")
+        if stats.first_dropped_sample:
+            print(f"    first dropped line: {stats.first_dropped_sample[:240]}")
     if stats.missing_input_tokens or stats.missing_output_tokens:
         print(
             f"  token fields missing on matched rows: "
