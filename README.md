@@ -43,8 +43,9 @@ install guides; see CLAUDE.md.
 # 1. Install Python deps for the testbed itself.
 uv pip install -e ".[dev]"
 
-# 2. Configure (copy and edit).
+# 2. Configure (copy and edit). Both targets are gitignored.
 cp .env.example .env
+cp deploy/testbed.yaml.example deploy/testbed.yaml
 $EDITOR deploy/testbed.yaml
 
 # 3. Bring up the dependencies first (NATS + etcd), then the stack.
@@ -76,7 +77,7 @@ Configuration overrides resolve as **CLI flag > `TESTBED__*` env var > `deploy/t
 
 ```
 src/testbed/      # python: cli, runner, config, poisson, swebench, opencode client
-deploy/           # testbed.yaml, testbed.sh, opencode.json.tmpl
+deploy/           # testbed.yaml.example (template; copy to testbed.yaml), testbed.sh, opencode.json.tmpl
 scripts/          # curl_smoke.sh
 opencode/         # vendored opencode source (submodule)
 dynamo/           # vendored dynamo source (submodule)

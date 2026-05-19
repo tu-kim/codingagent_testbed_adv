@@ -50,7 +50,8 @@ The runner pre-clones the SWE-bench repo at `base_commit` into that subfolder **
     config.py              # loads deploy/testbed.yaml + .env overrides; schema validation
 
   deploy/
-    testbed.yaml           # SINGLE source of truth: workspace, model, vLLM PD, dynamo, opencode
+    testbed.yaml.example   # committed template; copy to testbed.yaml (gitignored) and edit
+    testbed.yaml           # SINGLE source of truth: workspace, model, vLLM PD, dynamo, opencode (gitignored)
     testbed.sh             # self-contained: spawn/kill/log/status all inline (no _lib.sh)
     opencode.json.tmpl     # rendered to opencode/opencode.json on launch
 

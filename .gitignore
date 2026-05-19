@@ -5,6 +5,9 @@ results/
 # Rendered from deploy/opencode.json.tmpl at launch
 opencode/opencode.json
 
+# Local config (copy from deploy/testbed.yaml.example and edit)
+deploy/testbed.yaml
+
 # Local secrets / overrides
 .env
 .env.local
