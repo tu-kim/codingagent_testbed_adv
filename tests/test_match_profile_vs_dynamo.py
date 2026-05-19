@@ -3,6 +3,11 @@
 Lives in tests/ even though the script is in scripts/ (not part of the
 installed `testbed` package) -- imported via importlib to keep the
 script self-contained and runnable directly.
+
+Token-count cross-check only -- all timing/duration comparisons were
+removed because dynamo's elapsed_ms and the AI SDK's step_duration_s
+measure intervals with different start origins (HTTP request received
+vs first-chunk receipt at start-step), so direct delta is unphysical.
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ SAMPLE_DYNAMO_LINE = (
 )
 
 
-def test_parse_dynamo_log_extracts_fields(mod, tmp_path):
+def test_parse_dynamo_log_extracts_token_fields(mod, tmp_path):
     log = tmp_path / "frontend.log"
     log.write_text(SAMPLE_DYNAMO_LINE + "\n")
 
@@ -51,10 +56,142 @@ def test_parse_dynamo_log_extracts_fields(mod, tmp_path):
     assert e.line_no == 1
     assert e.input_tokens == 15473
     assert e.output_tokens == 49
-    assert e.elapsed_ms == 1628
     assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
     assert e.status == "success"
-    assert e.elapsed_s == pytest.approx(1.628)
+
+
+def test_parse_dynamo_log_filters_by_model(mod, tmp_path):
+    other = SAMPLE_DYNAMO_LINE.replace(
+        'model="qwen3-coder-30b-a3b-instruct-fp8"', 'model="some-other-model"'
+    ).replace(
+        "model=qwen3-coder-30b-a3b-instruct-fp8 ", "model=some-other-model "
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(SAMPLE_DYNAMO_LINE + "\n" + other + "\n")
+
+    entries = mod.parse_dynamo_log(log, model_filter="qwen3-coder-30b-a3b-instruct-fp8")
+    assert len(entries) == 1
+    assert entries[0].model == "qwen3-coder-30b-a3b-instruct-fp8"
+
+
+def test_parse_dynamo_log_skips_unrelated_lines(mod, tmp_path):
+    log = tmp_path / "frontend.log"
+    log.write_text(
+        "INFO startup: dynamo_llm starting\n"
+        + SAMPLE_DYNAMO_LINE + "\n"
+        + "DEBUG http-request: forwarded chunk\n"
+    )
+    entries = mod.parse_dynamo_log(log, model_filter=None)
+    assert len(entries) == 1
+
+
+def test_parse_dynamo_log_strips_ansi_color_codes(mod, tmp_path):
+    """tracing-subscriber's pretty formatter wraps both keys and `=`
+    separators in ANSI SGR codes even when stdout is redirected to a
+    file. Parser must strip them per line before applying field regexes.
+    Pasted from a live dynamo log opened in VSCode."""
+    ansi_line = (
+        "\x1b[2m2026-05-19T11:48:13.237919Z\x1b[0m \x1b[32m INFO\x1b[0m "
+        "\x1b[1mhttp-request\x1b[0m: \x1b[2mdynamo_llm::http::service::metrics\x1b[0m\x1b[2m:\x1b[0m "
+        "request completed \x1b[3mrequest_id\x1b[0m\x1b[2m=\x1b[0m47b34438 "
+        "\x1b[3mmodel\x1b[0m\x1b[2m=\x1b[0mqwen3-coder-30b-a3b-instruct-fp8 "
+        "\x1b[3mendpoint\x1b[0m\x1b[2m=\x1b[0mchat_completions "
+        "\x1b[3mstatus\x1b[0m\x1b[2m=\x1b[0msuccess "
+        "\x1b[3melapsed_ms\x1b[0m\x1b[2m=\x1b[0m1205 "
+        "\x1b[3minput_tokens\x1b[0m\x1b[2m=\x1b[0m721 "
+        "\x1b[3moutput_tokens\x1b[0m\x1b[2m=\x1b[0m7\x1b[0m"
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(ansi_line + "\n")
+    entries = mod.parse_dynamo_log(log, model_filter=None)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.input_tokens == 721
+    assert e.output_tokens == 7
+    assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
+    assert e.status == "success"
+
+
+def test_parse_dynamo_log_accepts_json_format(mod, tmp_path):
+    """tracing-subscriber can also emit JSON when configured for log
+    aggregators. Field regex uses `[=:]` so both pretty `k=v` and JSON
+    `"k":v` match."""
+    json_line = (
+        '{"timestamp":"2026-05-19T11:48:13Z","level":"INFO","target":'
+        '"dynamo_llm::http::service::metrics","fields":{"message":'
+        '"request completed","model":'
+        '"qwen3-coder-30b-a3b-instruct-fp8","status":"success",'
+        '"input_tokens":721,"output_tokens":7}}'
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(json_line + "\n")
+    entries = mod.parse_dynamo_log(log, model_filter=None)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.input_tokens == 721
+    assert e.output_tokens == 7
+    assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
+
+
+def test_parse_dynamo_log_handles_missing_tokens(mod, tmp_path):
+    """Error/cancel paths may omit token fields entirely. Entry is still
+    returned but with None tokens and a bumped stat counter."""
+    err = (
+        'ERROR http-request: dynamo_llm::http::service::metrics: request completed '
+        "request_id=c model=m endpoint=chat_completions request_type=stream "
+        "status=error error_type=cancelled "
+        'error_detail="cancelled before completion" elapsed_ms=42 method=POST'
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(err + "\n")
+
+    stats = mod.DynamoParseStats()
+    entries = mod.parse_dynamo_log(log, model_filter=None, stats=stats)
+    assert len(entries) == 1
+    assert entries[0].input_tokens is None
+    assert entries[0].output_tokens is None
+    assert entries[0].status == "error"
+    assert stats.missing_input_tokens == 1
+    assert stats.missing_output_tokens == 1
+
+
+def test_parse_profile_picks_llm_end_only(mod, tmp_path):
+    ndjson = tmp_path / "ses.ndjson"
+    ndjson.write_text("\n".join([
+        json.dumps({"ev": "query.start", "ts": 1.0}),
+        json.dumps({"ev": "turn.start", "step": 1, "ts": 2.0}),
+        json.dumps({"ev": "llm.start", "step": 1, "ts": 3.0}),
+        json.dumps({
+            "ev": "llm.end", "step": 1, "ts": 5.0,
+            "tokens": {"prompt_tokens": 100, "completion_tokens": 49},
+        }),
+        json.dumps({"ev": "tool.start", "step": 1, "ts": 4.0}),
+        json.dumps({
+            "ev": "llm.end", "step": 2, "ts": 10.0,
+            "tokens": {"prompt_tokens": 200, "completion_tokens": 30},
+        }),
+        "",
+        "{not valid json}",
+    ]))
+    steps = mod.parse_profile(ndjson)
+    assert [s.step for s in steps] == [1, 2]
+    assert steps[0].prompt_tokens == 100
+    assert steps[0].completion_tokens == 49
+    assert steps[1].prompt_tokens == 200
+    assert steps[1].completion_tokens == 30
+
+
+def test_parse_profile_sorts_by_ts(mod, tmp_path):
+    """ts ordering wins even if events appear out of order in the file."""
+    ndjson = tmp_path / "ses.ndjson"
+    ndjson.write_text("\n".join([
+        json.dumps({"ev": "llm.end", "step": 2, "ts": 10.0,
+                    "tokens": {"completion_tokens": 30}}),
+        json.dumps({"ev": "llm.end", "step": 1, "ts": 5.0,
+                    "tokens": {"completion_tokens": 49}}),
+    ]))
+    steps = mod.parse_profile(ndjson)
+    assert [s.step for s in steps] == [1, 2]
 
 
 def test_parse_profile_ai_sdk_v6_token_shape(mod, tmp_path):
@@ -63,22 +200,13 @@ def test_parse_profile_ai_sdk_v6_token_shape(mod, tmp_path):
     To compare with dynamo ISL we must add cache.read back."""
     ndjson = tmp_path / "ses.ndjson"
     ndjson.write_text("\n".join([
-        json.dumps({
-            "ev": "llm.end", "step": 1, "ts": 1.0,
-            "duration_s": 1.0, "step_duration_s": 1.5,
-            "tokens": {
-                "total": 1100, "input": 200, "output": 49,
-                "reasoning": 0, "cache": {"read": 800, "write": 100},
-            },
-        }),
-        json.dumps({
-            "ev": "llm.end", "step": 2, "ts": 2.0,
-            "duration_s": 1.0, "step_duration_s": 1.5,
-            "tokens": {
-                "total": 50, "input": 30, "output": 20,
-                "cache": {"read": 0, "write": 0},
-            },
-        }),
+        json.dumps({"ev": "llm.end", "step": 1, "ts": 1.0,
+                    "tokens": {"total": 1100, "input": 200, "output": 49,
+                               "reasoning": 0,
+                               "cache": {"read": 800, "write": 100}}}),
+        json.dumps({"ev": "llm.end", "step": 2, "ts": 2.0,
+                    "tokens": {"total": 50, "input": 30, "output": 20,
+                               "cache": {"read": 0, "write": 0}}}),
     ]))
     steps = mod.parse_profile(ndjson)
     assert len(steps) == 2
@@ -103,198 +231,30 @@ def test_parse_profile_classic_openai_shape_still_works(mod, tmp_path):
     assert steps[0].completion_tokens == 30
 
 
-def test_parse_dynamo_log_strips_ansi_color_codes(mod, tmp_path):
-    """tracing-subscriber's pretty formatter wraps both keys and `=`
-    separators in ANSI SGR codes even when stdout is redirected to a
-    file. Parser must strip them per line before applying field regexes.
-    Pasted from a live dynamo log opened in VSCode."""
-    ansi_line = (
-        "\x1b[2m2026-05-19T11:48:13.237919Z\x1b[0m \x1b[32m INFO\x1b[0m "
-        "\x1b[1mhttp-request\x1b[0m: \x1b[2mdynamo_llm::http::service::metrics\x1b[0m\x1b[2m:\x1b[0m "
-        "request completed \x1b[3mrequest_id\x1b[0m\x1b[2m=\x1b[0m47b34438 "
-        "\x1b[3mmodel\x1b[0m\x1b[2m=\x1b[0mqwen3-coder-30b-a3b-instruct-fp8 "
-        "\x1b[3mendpoint\x1b[0m\x1b[2m=\x1b[0mchat_completions "
-        "\x1b[3mstatus\x1b[0m\x1b[2m=\x1b[0msuccess "
-        "\x1b[3melapsed_ms\x1b[0m\x1b[2m=\x1b[0m1205 "
-        "\x1b[3minput_tokens\x1b[0m\x1b[2m=\x1b[0m721 "
-        "\x1b[3moutput_tokens\x1b[0m\x1b[2m=\x1b[0m7 "
-        '\x1b[3mttft_ms\x1b[0m\x1b[2m=\x1b[0m"1162.22" '
-        '\x1b[3mavg_itl_ms\x1b[0m\x1b[2m=\x1b[0m"6.94"\x1b[0m'
-    )
-    log = tmp_path / "frontend.log"
-    log.write_text(ansi_line + "\n")
-    entries = mod.parse_dynamo_log(log, model_filter=None)
-    assert len(entries) == 1
-    e = entries[0]
-    assert e.elapsed_ms == 1205
-    assert e.input_tokens == 721
-    assert e.output_tokens == 7
-    assert e.ttft_ms == pytest.approx(1162.22)
-    assert e.avg_itl_ms == pytest.approx(6.94)
-    assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
-    assert e.status == "success"
-
-
-def test_parse_dynamo_log_accepts_json_format(mod, tmp_path):
-    """tracing-subscriber can also emit JSON when configured for log
-    aggregators. Field regex uses `[=:]` so both pretty `k=v` and JSON
-    `"k":v` match."""
-    json_line = (
-        '{"timestamp":"2026-05-19T11:48:13Z","level":"INFO","target":'
-        '"dynamo_llm::http::service::metrics","fields":{"message":'
-        '"request completed","elapsed_ms":1205,"model":'
-        '"qwen3-coder-30b-a3b-instruct-fp8","status":"success",'
-        '"input_tokens":721,"output_tokens":7,"ttft_ms":"1162.22",'
-        '"avg_itl_ms":"6.94"}}'
-    )
-    log = tmp_path / "frontend.log"
-    log.write_text(json_line + "\n")
-    entries = mod.parse_dynamo_log(log, model_filter=None)
-    assert len(entries) == 1
-    e = entries[0]
-    assert e.elapsed_ms == 1205
-    assert e.input_tokens == 721
-    assert e.output_tokens == 7
-    assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
-
-
-def test_parse_dynamo_log_handles_missing_optional_fields(mod, tmp_path):
-    """Real-world: short responses (output_tokens<2) omit avg_itl_ms;
-    error/cancel paths may omit ttft_ms or even token counts entirely.
-    Previously these lines were silently dropped by a strict 4-field
-    regex; now each field is optional and the line is returned with
-    None for the missing ones."""
-    # output_tokens=1 → no avg_itl_ms recorded
-    short = (
-        'INFO http-request: dynamo_llm::http::service::metrics: request completed '
-        "request_id=a model=m endpoint=chat_completions request_type=stream "
-        "status=success elapsed_ms=200 method=POST uri=/ version=HTTP/1.1 "
-        'request_id=b model="m" input_tokens=10 output_tokens=1 ttft_ms="200.00"'
-    )
-    # error path → no token / timing fields at all (only InflightGuard core)
-    err = (
-        'ERROR http-request: dynamo_llm::http::service::metrics: request completed '
-        "request_id=c model=m endpoint=chat_completions request_type=stream "
-        "status=error error_type=cancelled "
-        'error_detail="cancelled before completion" elapsed_ms=42 method=POST'
-    )
-    log = tmp_path / "frontend.log"
-    log.write_text(short + "\n" + err + "\n")
-
-    stats = mod.DynamoParseStats()
-    entries = mod.parse_dynamo_log(log, model_filter=None, stats=stats)
-    assert len(entries) == 2
-    assert stats.total_completed == 2
-    assert stats.matched == 2
-
-    short_e = entries[0]
-    assert short_e.input_tokens == 10
-    assert short_e.output_tokens == 1
-
-    err_e = entries[1]
-    assert err_e.input_tokens is None
-    assert err_e.output_tokens is None
-    assert err_e.elapsed_ms == 42
-    assert err_e.status == "error"
-    assert stats.missing_input_tokens == 1
-    assert stats.missing_output_tokens == 1
-
-
-def test_parse_dynamo_log_skips_no_elapsed(mod, tmp_path):
-    """Defensive: a `request completed` without elapsed_ms shouldn't
-    happen per InflightGuard::Drop, but if it does we don't trust the
-    row -- drop it and bump the stat."""
-    log = tmp_path / "frontend.log"
-    log.write_text(
-        "INFO http-request: dynamo_llm::http::service::metrics: request completed "
-        "request_id=x model=m\n"
-    )
-    stats = mod.DynamoParseStats()
-    entries = mod.parse_dynamo_log(log, model_filter=None, stats=stats)
-    assert entries == []
-    assert stats.total_completed == 1
-    assert stats.missing_elapsed_ms == 1
-    assert stats.matched == 0
-
-
-def test_parse_dynamo_log_filters_by_model(mod, tmp_path):
-    other = SAMPLE_DYNAMO_LINE.replace(
-        'model="qwen3-coder-30b-a3b-instruct-fp8"', 'model="some-other-model"'
-    )
-    log = tmp_path / "frontend.log"
-    log.write_text(SAMPLE_DYNAMO_LINE + "\n" + other + "\n")
-
-    entries = mod.parse_dynamo_log(log, model_filter="qwen3-coder-30b-a3b-instruct-fp8")
-    assert len(entries) == 1
-    assert entries[0].model == "qwen3-coder-30b-a3b-instruct-fp8"
-
-
-def test_parse_dynamo_log_skips_unrelated_lines(mod, tmp_path):
-    log = tmp_path / "frontend.log"
-    log.write_text(
-        "INFO startup: dynamo_llm starting\n"
-        + SAMPLE_DYNAMO_LINE + "\n"
-        + "DEBUG http-request: forwarded chunk\n"
-    )
-    entries = mod.parse_dynamo_log(log, model_filter=None)
-    assert len(entries) == 1
-
-
-def test_parse_profile_picks_llm_end_only(mod, tmp_path):
+def test_parse_profile_tokens_null_or_missing(mod, tmp_path):
+    """tokens may be null/missing (rare degenerate case)."""
     ndjson = tmp_path / "ses.ndjson"
     ndjson.write_text("\n".join([
-        json.dumps({"ev": "query.start", "ts": 1.0}),
-        json.dumps({"ev": "turn.start", "step": 1, "ts": 2.0}),
-        json.dumps({"ev": "llm.start", "step": 1, "ts": 3.0}),
-        json.dumps({
-            "ev": "llm.end", "step": 1, "ts": 5.0,
-            "duration_s": 1.3, "step_duration_s": 2.0,
-            "tokens": {"prompt_tokens": 100, "completion_tokens": 49},
-            "finish": "tool-calls",
-        }),
-        json.dumps({"ev": "tool.start", "step": 1, "ts": 4.0}),
-        json.dumps({
-            "ev": "llm.end", "step": 2, "ts": 10.0,
-            "duration_s": 0.5, "step_duration_s": 0.8,
-            "tokens": {"prompt_tokens": 200, "completion_tokens": 30},
-            "finish": "stop",
-        }),
-        "",
-        "{not valid json}",
+        json.dumps({"ev": "llm.end", "step": 1, "ts": 1.0, "tokens": None}),
+        json.dumps({"ev": "llm.end", "step": 2, "ts": 2.0}),  # no tokens key
     ]))
     steps = mod.parse_profile(ndjson)
-    assert [s.step for s in steps] == [1, 2]
-    assert steps[0].prompt_tokens == 100
-    assert steps[0].completion_tokens == 49
-    assert steps[0].step_duration_s == pytest.approx(2.0)
-    assert steps[1].completion_tokens == 30
-
-
-def test_parse_profile_sorts_by_ts(mod, tmp_path):
-    """ts ordering wins even if events are emitted out of order in the file."""
-    ndjson = tmp_path / "ses.ndjson"
-    ndjson.write_text("\n".join([
-        json.dumps({"ev": "llm.end", "step": 2, "ts": 10.0,
-                    "tokens": {"completion_tokens": 30}}),
-        json.dumps({"ev": "llm.end", "step": 1, "ts": 5.0,
-                    "tokens": {"completion_tokens": 49}}),
-    ]))
-    steps = mod.parse_profile(ndjson)
-    assert [s.step for s in steps] == [1, 2]
+    assert len(steps) == 2
+    for s in steps:
+        assert s.prompt_tokens is None
+        assert s.completion_tokens is None
 
 
 def test_match_in_order_pairs_by_index(mod):
     profile = [
-        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
-                        duration_s=1.0, step_duration_s=2.0, finish=None),
-        mod.ProfileStep(step=2, ts=2.0, prompt_tokens=20, completion_tokens=30,
-                        duration_s=0.5, step_duration_s=0.8, finish=None),
+        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49),
+        mod.ProfileStep(step=2, ts=2.0, prompt_tokens=20, completion_tokens=30),
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, model="m", status="success"),
+                        model="m", status="success"),
         mod.DynamoEntry(line_no=2, input_tokens=20, output_tokens=30,
-                        elapsed_ms=800, model="m", status="success"),
+                        model="m", status="success"),
     ]
     pairs = mod.match_in_order(profile, dynamo)
     assert len(pairs) == 2
@@ -304,32 +264,27 @@ def test_match_in_order_pairs_by_index(mod):
 
 def test_match_in_order_marks_excess_profile_unmatched(mod):
     profile = [
-        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
-                        duration_s=None, step_duration_s=None, finish=None),
-        mod.ProfileStep(step=2, ts=2.0, prompt_tokens=20, completion_tokens=30,
-                        duration_s=None, step_duration_s=None, finish=None),
+        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49),
+        mod.ProfileStep(step=2, ts=2.0, prompt_tokens=20, completion_tokens=30),
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, model="m", status="success"),
+                        model="m", status="success"),
     ]
     pairs = mod.match_in_order(profile, dynamo)
     assert pairs[1][1] is None
 
 
 def test_match_in_order_excess_dynamo_ignored(mod):
-    """Order-based pairing drops dynamo entries past the profile end -- the
-    extra requests aren't in this session's NDJSON (other client, leftover
-    log lines). Documented behavior; render_table doesn't surface them."""
+    """Order-based pairing drops dynamo entries past the profile end."""
     profile = [
-        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
-                        duration_s=None, step_duration_s=None, finish=None),
+        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49),
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, model="m", status="success"),
+                        model="m", status="success"),
         mod.DynamoEntry(line_no=2, input_tokens=20, output_tokens=30,
-                        elapsed_ms=800, model="m", status="success"),
+                        model="m", status="success"),
     ]
     pairs = mod.match_in_order(profile, dynamo)
     assert len(pairs) == 1
@@ -338,29 +293,26 @@ def test_match_in_order_excess_dynamo_ignored(mod):
 
 def test_render_table_flags_token_mismatch(mod):
     profile = [
-        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=99, completion_tokens=49,
-                        duration_s=1.0, step_duration_s=2.0, finish=None),
+        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=99, completion_tokens=49),
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, model="m", status="success"),
+                        model="m", status="success"),
     ]
     table, mismatches = mod.render_table(mod.match_in_order(profile, dynamo))
     assert "PROMPT_DIFF(99!=10)" in table
-    assert mismatches >= 1
+    assert mismatches == 1
 
 
 def test_render_table_status_not_counted_as_mismatch(mod):
     """status != "success" surfaces as a flag string but does NOT bump the
-    mismatch count (token + duration agreement is the strict check; status
-    is purely informational). Pinning this so a future change is deliberate."""
+    mismatch count (token agreement is the strict check; status is purely
+    informational)."""
     profile = [
-        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
-                        duration_s=1.0, step_duration_s=1.7, finish=None),
+        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49),
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, ttft_ms=200.0, avg_itl_ms=20.0,
                         model="m", status="error"),
     ]
     table, mismatches = mod.render_table(mod.match_in_order(profile, dynamo))
@@ -368,60 +320,16 @@ def test_render_table_status_not_counted_as_mismatch(mod):
     assert mismatches == 0
 
 
-def test_parse_profile_tokens_null_and_camelcase(mod, tmp_path):
-    """tokens may be null/missing (rare degenerate case) and the AI SDK
-    sometimes surfaces camelCase keys (promptTokens / completionTokens)
-    instead of snake_case. parse_profile must handle both."""
-    ndjson = tmp_path / "ses.ndjson"
-    ndjson.write_text("\n".join([
-        json.dumps({"ev": "llm.end", "step": 1, "ts": 1.0,
-                    "tokens": None,
-                    "duration_s": 1.0, "step_duration_s": 1.5}),
-        json.dumps({"ev": "llm.end", "step": 2, "ts": 2.0,
-                    "duration_s": 1.0, "step_duration_s": 1.5}),
-        json.dumps({"ev": "llm.end", "step": 3, "ts": 3.0,
-                    "tokens": {"promptTokens": 77, "completionTokens": 42},
-                    "duration_s": 1.0, "step_duration_s": 1.5}),
-    ]))
-    steps = mod.parse_profile(ndjson)
-    assert [s.step for s in steps] == [1, 2, 3]
-    assert steps[0].prompt_tokens is None
-    assert steps[0].completion_tokens is None
-    assert steps[1].prompt_tokens is None
-    assert steps[1].completion_tokens is None
-    assert steps[2].prompt_tokens == 77
-    assert steps[2].completion_tokens == 42
-
-
 def test_render_table_no_flags_on_clean_match(mod):
     profile = [
-        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
-                        duration_s=1.0, step_duration_s=1.4, finish=None),
+        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49),
     ]
     dynamo = [
         mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, model="m", status="success"),
+                        model="m", status="success"),
     ]
     table, mismatches = mod.render_table(mod.match_in_order(profile, dynamo))
     assert mismatches == 0
-
-
-def test_render_table_flags_unphysical_p_step_over_elap(mod):
-    """d_elap_s > p_step_s is normal (different timer origins, see module
-    docstring). The reverse -- p_step_s significantly larger than d_elap_s
-    -- is unphysical and indicates misalignment (wrong dynamo entry paired
-    with this profile step). Flag rows where p_step_s > d_elap_s + 0.5s."""
-    profile = [
-        mod.ProfileStep(step=1, ts=1.0, prompt_tokens=10, completion_tokens=49,
-                        duration_s=2.0, step_duration_s=5.0, finish=None),
-    ]
-    dynamo = [
-        mod.DynamoEntry(line_no=1, input_tokens=10, output_tokens=49,
-                        elapsed_ms=1500, model="m", status="success"),
-    ]
-    table, mismatches = mod.render_table(mod.match_in_order(profile, dynamo))
-    assert "P_STEP_OVER_ELAP" in table
-    assert mismatches == 1
 
 
 def test_main_end_to_end_clean(mod, tmp_path, capsys):
@@ -431,9 +339,7 @@ def test_main_end_to_end_clean(mod, tmp_path, capsys):
     ndjson = tmp_path / "ses.ndjson"
     ndjson.write_text(json.dumps({
         "ev": "llm.end", "step": 1, "ts": 1.0,
-        "duration_s": 1.2, "step_duration_s": 1.7,
         "tokens": {"prompt_tokens": 15473, "completion_tokens": 49},
-        "finish": "tool-calls",
     }) + "\n")
 
     rc = mod.main(["--profile", str(ndjson), "--dynamo-log", str(log),
@@ -453,14 +359,13 @@ def test_main_skip_dynamo_leading(mod, tmp_path, capsys):
         'INFO http-request: dynamo_llm::http::service::metrics: request completed '
         "request_id=a model=m endpoint=chat_completions request_type=stream "
         "status=success elapsed_ms=100 method=POST uri=/ version=HTTP/1.1 "
-        'request_id=b model="m" input_tokens=1 output_tokens=1 ttft_ms="100.00"'
+        'request_id=b model="m" input_tokens=1 output_tokens=1'
     )
     real = (
         'INFO http-request: dynamo_llm::http::service::metrics: request completed '
         "request_id=c model=m endpoint=chat_completions request_type=stream "
         "status=success elapsed_ms=1500 method=POST uri=/ version=HTTP/1.1 "
-        'request_id=d model="m" input_tokens=200 output_tokens=49 '
-        'ttft_ms="500.00" avg_itl_ms="20.00"'
+        'request_id=d model="m" input_tokens=200 output_tokens=49'
     )
     log = tmp_path / "frontend.log"
     log.write_text(probe + "\n" + real + "\n")
@@ -468,9 +373,7 @@ def test_main_skip_dynamo_leading(mod, tmp_path, capsys):
     ndjson = tmp_path / "ses.ndjson"
     ndjson.write_text(json.dumps({
         "ev": "llm.end", "step": 1, "ts": 1.0,
-        "duration_s": 1.2, "step_duration_s": 1.5,
         "tokens": {"prompt_tokens": 200, "completion_tokens": 49},
-        "finish": "tool-calls",
     }) + "\n")
 
     rc = mod.main([
@@ -490,9 +393,7 @@ def test_main_strict_exits_nonzero_on_mismatch(mod, tmp_path, capsys):
     ndjson = tmp_path / "ses.ndjson"
     ndjson.write_text(json.dumps({
         "ev": "llm.end", "step": 1, "ts": 1.0,
-        "duration_s": 1.2, "step_duration_s": 1.7,
-        "tokens": {"prompt_tokens": 99999, "completion_tokens": 49},  # prompt mismatch
-        "finish": "tool-calls",
+        "tokens": {"prompt_tokens": 99999, "completion_tokens": 49},  # mismatch
     }) + "\n")
 
     rc = mod.main(["--profile", str(ndjson), "--dynamo-log", str(log), "--strict"])
