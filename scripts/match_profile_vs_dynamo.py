@@ -4,12 +4,19 @@
 For each `llm.end` event in the profile, pair it with the corresponding
 `request completed` line from the Dynamo log and compare:
 
-  * prompt_tokens (profile)      ↔ input_tokens  (dynamo)
-  * completion_tokens (profile)  ↔ output_tokens (dynamo)
-  * step_duration_s (profile)    ↔ elapsed_ms/1000 (dynamo)
+  * prompt = tokens.input + tokens.cache.read (profile, normalized AI SDK
+    shape from opencode session.ts getUsage) ↔ input_tokens (dynamo ISL)
+  * completion = tokens.output (profile)      ↔ output_tokens (dynamo OSL)
+  * step_duration_s (profile)                 ↔ elapsed_ms/1000 (dynamo)
   * duration_s (profile, up to first tool.start)   <-- where in elapsed
                                                        did the tool_call land
-  * expected_decode_s = output_tokens * avg_itl_ms / 1000
+  * post_ttft_s = elapsed_ms - ttft_ms              (directly measured,
+                                                     NOT derived from avg_itl_ms)
+
+avg_itl_ms in dynamo is `(elapsed - ttft) / itl_count` where itl_count is
+the count of tokens delivered AFTER the first SSE chunk (not output_tokens),
+so multiplying it by (N-1) overestimates decode time when the first chunk
+carries many tokens. Use post_ttft_s for honest comparison.
 
 The duration delta (step_duration_s - elapsed_ms/1000) reflects AI-SDK /
 processor.ts overhead on top of the LLM stream as seen by Dynamo.
@@ -71,7 +78,18 @@ _TTFT_RE = _field("ttft_ms", r"[\d.]+")
 _AVG_ITL_RE = _field("avg_itl_ms", r"[\d.]+")
 _ELAPSED_RE = _field("elapsed_ms", r"\d+")
 _STATUS_RE = _field("status", r"\w+")
+# `model=` appears twice on a `request completed` line: bare from
+# InflightGuard::Drop's `tracing::info!`, then quoted from the span-
+# recorded MetricsCollector::finalize. Take the LAST occurrence so we
+# get the authoritative span-recorded value -- they should be equal in
+# practice but the span-recorded one is set by finalize() right next
+# to the token counts we care about.
 _MODEL_RE = _field("model", r"[^\s\",}]+")
+
+
+def _last_model(line: str) -> str | None:
+    matches = _MODEL_RE.findall(line)
+    return matches[-1] if matches else None
 
 
 @dataclass
@@ -90,15 +108,12 @@ class DynamoEntry:
         return self.elapsed_ms / 1000.0
 
     @property
-    def expected_decode_s(self) -> float | None:
-        # ITL is the gap *between* tokens — N tokens have N-1 gaps.
-        # First token's latency is captured separately in ttft_ms.
-        # Dynamo only records avg_itl_ms when itl_count > 0 (i.e.
-        # output_tokens >= 2); for shorter responses we can't estimate.
-        if self.output_tokens is None or self.avg_itl_ms is None:
+    def post_ttft_s(self) -> float | None:
+        """Wall time spent streaming after TTFT: elapsed - ttft. Directly
+        measured (no assumption about per-token latency)."""
+        if self.ttft_ms is None:
             return None
-        gaps = max(0, self.output_tokens - 1)
-        return (gaps * self.avg_itl_ms) / 1000.0
+        return max(0.0, (self.elapsed_ms - self.ttft_ms) / 1000.0)
 
 
 @dataclass
@@ -148,8 +163,7 @@ def parse_dynamo_log(
                 continue
             elapsed_ms = int(elapsed_m.group("v"))
 
-            model_m = _MODEL_RE.search(line)
-            model = model_m.group("v") if model_m else None
+            model = _last_model(line)
             if model_filter and model != model_filter:
                 s.filtered_by_model += 1
                 continue
@@ -185,6 +199,37 @@ def parse_dynamo_log(
     return out
 
 
+def _extract_profile_tokens(tokens: dict) -> tuple[int | None, int | None]:
+    """Pull (prompt, completion) from the AI SDK v5/v6 normalized shape
+    that opencode emits (session.ts getUsage):
+        { total, input, output, reasoning, cache: {read, write} }
+    where `input` is already adjusted (cache tokens subtracted). To compare
+    against dynamo's ISL we must add cache.read back. Falls back to the
+    classic OpenAI shape (prompt_tokens / completion_tokens) and camelCase
+    so older NDJSON files still parse.
+    """
+    if not tokens:
+        return None, None
+
+    # Classic OpenAI shape -> use directly.
+    p = tokens.get("prompt_tokens") or tokens.get("promptTokens")
+    c = tokens.get("completion_tokens") or tokens.get("completionTokens")
+    if p is not None or c is not None:
+        return p, c
+
+    # AI SDK v5/v6 normalized shape used by opencode.
+    inp = tokens.get("input")
+    out = tokens.get("output")
+    cache = tokens.get("cache") or {}
+    cache_read = cache.get("read") if isinstance(cache, dict) else None
+
+    prompt = None
+    if inp is not None:
+        prompt = inp + (cache_read or 0)
+
+    return prompt, out
+
+
 def parse_profile(path: Path) -> list[ProfileStep]:
     out: list[ProfileStep] = []
     with path.open(encoding="utf-8", errors="replace") as f:
@@ -198,13 +243,13 @@ def parse_profile(path: Path) -> list[ProfileStep]:
                 continue
             if ev.get("ev") != "llm.end":
                 continue
-            tokens = ev.get("tokens") or {}
+            prompt_tok, compl_tok = _extract_profile_tokens(ev.get("tokens") or {})
             out.append(
                 ProfileStep(
                     step=ev.get("step", -1),
                     ts=float(ev.get("ts", 0.0)),
-                    prompt_tokens=tokens.get("prompt_tokens") or tokens.get("promptTokens"),
-                    completion_tokens=tokens.get("completion_tokens") or tokens.get("completionTokens"),
+                    prompt_tokens=prompt_tok,
+                    completion_tokens=compl_tok,
                     duration_s=ev.get("duration_s"),
                     step_duration_s=ev.get("step_duration_s"),
                     finish=ev.get("finish"),
@@ -243,7 +288,7 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
         ("p_step_s", 9),
         ("d_elap_s", 9),
         ("d_ttft_s", 9),
-        ("d_decode_s", 11),
+        ("d_post_ttft_s", 14),
         ("framework_s", 12),
         ("flags", 0),
     ]
@@ -267,7 +312,7 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
                 _fmt(p.step_duration_s, 9),
                 _fmt(None, 9),
                 _fmt(None, 9),
-                _fmt(None, 11),
+                _fmt(None, 14),
                 _fmt(None, 12),
                 " ".join(flags),
             ]
@@ -310,7 +355,7 @@ def render_table(pairs: Iterable[tuple[ProfileStep, DynamoEntry | None]]) -> tup
             _fmt(p.step_duration_s, 9),
             _fmt(d.elapsed_s, 9),
             _fmt(d.ttft_ms / 1000.0 if d.ttft_ms is not None else None, 9),
-            _fmt(d.expected_decode_s, 11),
+            _fmt(d.post_ttft_s, 14),
             _fmt(framework_s, 12),
             " ".join(flags),
         ]

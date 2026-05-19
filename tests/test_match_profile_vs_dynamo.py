@@ -57,37 +57,77 @@ def test_parse_dynamo_log_extracts_fields(mod, tmp_path):
     assert e.model == "qwen3-coder-30b-a3b-instruct-fp8"
     assert e.status == "success"
     assert e.elapsed_s == pytest.approx(1.628)
-    # ITL is the inter-token gap; 49 tokens → 48 gaps.
-    assert e.expected_decode_s == pytest.approx(48 * 30.3 / 1000.0)
+    # Wall-clock decode portion of the request, directly measured.
+    assert e.post_ttft_s == pytest.approx((1628 - 1203.0) / 1000.0)
 
 
-def test_expected_decode_s_uses_n_minus_one_gaps(mod):
-    """ITL counts *gaps* between tokens. 1 or 0 tokens → 0s (no gap).
-    First-token latency belongs to ttft_ms, not decode."""
-    one = mod.DynamoEntry(line_no=1, input_tokens=100, output_tokens=1,
-                          elapsed_ms=500, ttft_ms=500.0, avg_itl_ms=30.0,
-                          model="m", status="success")
-    assert one.expected_decode_s == 0.0
-
-    zero = mod.DynamoEntry(line_no=2, input_tokens=100, output_tokens=0,
-                           elapsed_ms=500, ttft_ms=500.0, avg_itl_ms=30.0,
-                           model="m", status="success")
-    assert zero.expected_decode_s == 0.0
-
-    many = mod.DynamoEntry(line_no=3, input_tokens=100, output_tokens=10,
-                           elapsed_ms=900, ttft_ms=600.0, avg_itl_ms=30.0,
-                           model="m", status="success")
-    # 10 tokens → 9 gaps × 30ms = 270ms
-    assert many.expected_decode_s == pytest.approx(9 * 30.0 / 1000.0)
-
-
-def test_expected_decode_s_none_when_avg_itl_missing(mod):
-    """avg_itl_ms is None when output_tokens < 2 in the dynamo log
-    (itl_count == 0). Can't estimate decode time -- return None."""
-    e = mod.DynamoEntry(line_no=1, input_tokens=100, output_tokens=1,
-                        elapsed_ms=500, ttft_ms=500.0, avg_itl_ms=None,
+def test_post_ttft_s_directly_measured(mod):
+    """post_ttft_s = max(0, elapsed - ttft). Doesn't rely on avg_itl_ms,
+    which is unreliable when the first SSE chunk carries many tokens
+    (denominator excludes them, inflating per-token average)."""
+    e = mod.DynamoEntry(line_no=1, input_tokens=100, output_tokens=10,
+                        elapsed_ms=1500, ttft_ms=500.0, avg_itl_ms=999.0,
                         model="m", status="success")
-    assert e.expected_decode_s is None
+    assert e.post_ttft_s == pytest.approx(1.0)
+
+    # Defensive: ttft > elapsed (shouldn't happen but don't go negative).
+    weird = mod.DynamoEntry(line_no=2, input_tokens=100, output_tokens=1,
+                            elapsed_ms=500, ttft_ms=700.0, avg_itl_ms=None,
+                            model="m", status="success")
+    assert weird.post_ttft_s == 0.0
+
+
+def test_post_ttft_s_none_when_ttft_missing(mod):
+    e = mod.DynamoEntry(line_no=1, input_tokens=100, output_tokens=1,
+                        elapsed_ms=500, ttft_ms=None, avg_itl_ms=None,
+                        model="m", status="success")
+    assert e.post_ttft_s is None
+
+
+def test_parse_profile_ai_sdk_v6_token_shape(mod, tmp_path):
+    """opencode session.ts:getUsage emits {input, output, reasoning,
+    cache:{read,write}, total}, where `input` already has cache subtracted.
+    To compare with dynamo ISL we must add cache.read back."""
+    ndjson = tmp_path / "ses.ndjson"
+    ndjson.write_text("\n".join([
+        json.dumps({
+            "ev": "llm.end", "step": 1, "ts": 1.0,
+            "duration_s": 1.0, "step_duration_s": 1.5,
+            "tokens": {
+                "total": 1100, "input": 200, "output": 49,
+                "reasoning": 0, "cache": {"read": 800, "write": 100},
+            },
+        }),
+        json.dumps({
+            "ev": "llm.end", "step": 2, "ts": 2.0,
+            "duration_s": 1.0, "step_duration_s": 1.5,
+            "tokens": {
+                "total": 50, "input": 30, "output": 20,
+                "cache": {"read": 0, "write": 0},
+            },
+        }),
+    ]))
+    steps = mod.parse_profile(ndjson)
+    assert len(steps) == 2
+    # input(200) + cache.read(800) = 1000  -- matches dynamo ISL
+    assert steps[0].prompt_tokens == 1000
+    assert steps[0].completion_tokens == 49
+    # no cache hits
+    assert steps[1].prompt_tokens == 30
+    assert steps[1].completion_tokens == 20
+
+
+def test_parse_profile_classic_openai_shape_still_works(mod, tmp_path):
+    """Older NDJSON files (prior to the v5 normalization) carry the
+    classic OpenAI usage shape directly. Backward compatibility."""
+    ndjson = tmp_path / "ses.ndjson"
+    ndjson.write_text(json.dumps({
+        "ev": "llm.end", "step": 1, "ts": 1.0,
+        "tokens": {"prompt_tokens": 500, "completion_tokens": 30},
+    }) + "\n")
+    steps = mod.parse_profile(ndjson)
+    assert steps[0].prompt_tokens == 500
+    assert steps[0].completion_tokens == 30
 
 
 def test_parse_dynamo_log_strips_ansi_color_codes(mod, tmp_path):
