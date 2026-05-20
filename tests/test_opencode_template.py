@@ -73,6 +73,22 @@ def test_rendered_template_has_provider_block_with_required_fields():
     assert block["models"]["local"]["name"] == "qwen3-coder-30b-a3b"
 
 
+def test_testbed_sh_uses_yq_fallback_for_sampling():
+    """yq returns the literal string 'null' for missing keys, so without
+    a `// <default>` fallback the rendered opencode.json gets
+    "temperature": null and the override is silently lost (opencode falls
+    back to ProviderTransform default 0.55 for qwen). This regression is
+    invisible in normal smoke testing; pin the fallback explicitly."""
+    sh = (_REPO_ROOT / "deploy" / "testbed.sh").read_text()
+    assert ".model.temperature // 0" in sh, (
+        "deploy/testbed.sh dropped the yq fallback for "
+        ".model.temperature -- if user's local testbed.yaml predates "
+        "the sampling fields, rendered opencode.json will have "
+        '"temperature": null and override is silently lost.'
+    )
+    assert ".model.top_p // 1" in sh, "same applies to .model.top_p fallback"
+
+
 def test_rendered_template_overrides_sampling_on_all_primary_agents():
     """Without an explicit per-agent override, opencode falls back to
     ProviderTransform.temperature(model) which returns 0.55 for qwen --

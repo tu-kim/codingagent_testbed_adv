@@ -234,8 +234,12 @@ render_opencode_config() {
   name=$(cfg_get .model.name)
   # Sampling overrides applied to every primary agent so reproducible
   # runs don't get the provider-transform default (qwen → 0.55).
-  temperature=$(cfg_get_env MODEL__TEMPERATURE .model.temperature)
-  top_p=$(cfg_get_env MODEL__TOP_P .model.top_p)
+  # `// 0.0` / `// 1.0` fallbacks mirror the `// ""` pattern at
+  # lines 133/149: if the user's local testbed.yaml predates these
+  # fields, yq would otherwise emit literal "null" and the rendered
+  # opencode.json becomes invalid (`"temperature": null`).
+  temperature=$(cfg_get_env MODEL__TEMPERATURE '.model.temperature // 0.0')
+  top_p=$(cfg_get_env MODEL__TOP_P '.model.top_p // 1.0')
   provider_id=dynamo
 
   sed \
