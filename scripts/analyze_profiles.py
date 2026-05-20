@@ -495,92 +495,36 @@ def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
 
 def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
     stats = per_tool_duration_stats(sessions)
+    fig, ax = plt.subplots(figsize=(3.4, 2.4))
     if not stats:
-        fig, ax = plt.subplots(figsize=(3.4, 2.4))
         ax.text(0.5, 0.5, "no successful tool calls",
                 ha="center", va="center", transform=ax.transAxes)
-        fig.tight_layout()
-        path = out / "fig2_tool_exec_time.pdf"
-        fig.savefig(path)
-        plt.close(fig)
-        return path
-
-    names = list(stats.keys())
-    means = np.array([stats[n][0] for n in names])
-    stds = np.array([stats[n][1] for n in names])
-    ns = [stats[n][2] for n in names]
-    outlier = _detect_outlier_index(means, threshold=3.0)
-
-    # Companion CSV: per-tool aggregated stats.
-    _write_csv_with_stats(
-        out / "fig2_tool_exec_time.csv",
-        header=["tool", "n_calls", "mean_s", "std_s"],
-        rows=[
-            (n, ns[i], f"{means[i]:.4f}", f"{stds[i]:.4f}")
-            for i, n in enumerate(names)
-        ],
-        stats_values=None,
-    )
-
-    def _draw_bars(ax):
+    else:
+        names = list(stats.keys())
+        means = np.array([stats[n][0] for n in names])
+        stds = np.array([stats[n][1] for n in names])
+        ns = [stats[n][2] for n in names]
+        # Companion CSV carries the exact values; the plot stays
+        # visual-only (no inline labels, no axis break) so it reads
+        # cleanly even when one tool like `task` dominates.
+        _write_csv_with_stats(
+            out / "fig2_tool_exec_time.csv",
+            header=["tool", "n_calls", "mean_s", "std_s"],
+            rows=[
+                (n, ns[i], f"{means[i]:.4f}", f"{stds[i]:.4f}")
+                for i, n in enumerate(names)
+            ],
+            stats_values=None,
+        )
         y = np.arange(len(names))
         ax.barh(y, means, xerr=stds, color="0.4", edgecolor="black",
                 linewidth=0.5, error_kw={"linewidth": 0.6, "capsize": 1.5})
         ax.set_yticks(y)
         ax.set_yticklabels(names)
         ax.invert_yaxis()
-
-    if outlier is None:
-        # No dominant outlier -- single linear axis.
-        fig, ax = plt.subplots(figsize=(3.7, 2.5))
-        _draw_bars(ax)
         ax.set_xlabel("Execution time (s)")
         ax.set_xlim(left=0)
-        for i, (m, s, c) in enumerate(zip(means, stds, ns)):
-            ax.text(m + s + 0.05 * max(means + stds),
-                    i, f"{m:.2f}±{s:.2f} (n={c})",
-                    va="center", ha="left", fontsize=6.0, color="0.2")
-        fig.tight_layout()
-    else:
-        # Broken x-axis: linear scales on both halves with diagonal break marks.
-        # lo_max = ~120% of the second-largest (mean + std), so non-outlier
-        # bars stay visible with comfortable headroom.
-        non_outlier_extents = np.delete(means + stds, outlier)
-        lo_max = float(non_outlier_extents.max()) * 1.25 if non_outlier_extents.size else 1.0
-        hi_lo = float(max(0.0, means[outlier] - stds[outlier] - 0.1 * means[outlier]))
-        hi_hi = float(means[outlier] + stds[outlier]) * 1.10
-        if hi_lo <= lo_max:  # outlier overlaps lo region; no break needed
-            outlier = None
-            fig, ax = plt.subplots(figsize=(3.7, 2.5))
-            _draw_bars(ax)
-            ax.set_xlabel("Execution time (s)")
-            ax.set_xlim(left=0)
-            fig.tight_layout()
-        else:
-            fig, (ax_lo, ax_hi) = plt.subplots(
-                1, 2, figsize=(4.0, 2.6), sharey=True,
-                gridspec_kw={"width_ratios": [3, 1]},
-            )
-            _draw_bars(ax_lo)
-            _draw_bars(ax_hi)
-            ax_lo.set_xlim(0, lo_max)
-            ax_hi.set_xlim(hi_lo, hi_hi)
-            _draw_break_marks(ax_lo, ax_hi, orient="x")
-            # Inline value labels: bar that fits in lo gets its label in lo,
-            # the outlier bar gets its label in hi.
-            for i, (m, s, c) in enumerate(zip(means, stds, ns)):
-                label = f"{m:.2f}±{s:.2f} (n={c})"
-                if i == outlier:
-                    ax_hi.text(m + s + 0.04 * (hi_hi - hi_lo),
-                               i, label, va="center", ha="left",
-                               fontsize=6.0, color="0.2")
-                else:
-                    ax_lo.text(m + s + 0.04 * lo_max,
-                               i, label, va="center", ha="left",
-                               fontsize=6.0, color="0.2")
-            # Shared x-label centered across the two axes.
-            fig.text(0.5, 0.02, "Execution time (s)", ha="center", fontsize=9)
-            fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.tight_layout()
     path = out / "fig2_tool_exec_time.pdf"
     fig.savefig(path)
     plt.close(fig)
