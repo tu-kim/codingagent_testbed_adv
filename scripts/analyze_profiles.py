@@ -247,12 +247,32 @@ def per_tool_duration_stats(sessions: dict[str, Session]):
 
 def turn_ratio_distribution(sessions: dict[str, Session]) -> list[float]:
     """tool_wall_s / llm_wall_s per turn; skip turns missing either."""
-    out: list[float] = []
-    for s in sessions.values():
-        for t in s.turns.values():
+    return [r for _, _, _, _, r in turn_ratio_rows(sessions)]
+
+
+def turn_ratio_rows(sessions: dict[str, Session]):
+    """Per-turn rows for CSV: (session_id, step, tool_wall_s, llm_wall_s, ratio)."""
+    out = []
+    for sid, s in sorted(sessions.items()):
+        for step, t in sorted(s.turns.items()):
             if t.tool_wall_s is None or t.llm_wall_s is None or t.llm_wall_s <= 0:
                 continue
-            out.append(t.tool_wall_s / t.llm_wall_s)
+            out.append((sid, step, t.tool_wall_s, t.llm_wall_s,
+                        t.tool_wall_s / t.llm_wall_s))
+    return out
+
+
+def per_tool_ratio_rows(sessions: dict[str, Session]):
+    """Per-tool-call rows for fig4 CSV: (session_id, step, tool, ratio)."""
+    out = []
+    for sid, s in sorted(sessions.items()):
+        for step, t in sorted(s.turns.items()):
+            llm = t.llm_stream_end_s or t.llm_wall_s
+            if llm is None or llm <= 0:
+                continue
+            for tc in t.tools:
+                if tc.ok:
+                    out.append((sid, step, tc.name, tc.duration_s / llm))
     return out
 
 
@@ -301,6 +321,45 @@ def tool_token_pairs(sessions: dict[str, Session]):
 
 
 # ---------- plotting ----------
+
+
+def _summary_stats(values) -> dict[str, float]:
+    """Return mean / median / p90 / p99 for a numeric sequence."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return {}
+    return {
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "p90": float(np.percentile(arr, 90)),
+        "p99": float(np.percentile(arr, 99)),
+    }
+
+
+def _write_csv_with_stats(
+    path: Path,
+    header: list[str],
+    rows: list[tuple],
+    *,
+    stats_values: list[float] | None = None,
+    stats_label: str = "value",
+) -> None:
+    """Write `rows` under `header`, then append a `# stats:` section with
+    mean / median / p90 / p99 of `stats_values` (defaults to None = skip)."""
+    import csv
+
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for row in rows:
+            w.writerow(row)
+        if stats_values is not None and len(stats_values) > 0:
+            stats = _summary_stats(stats_values)
+            f.write("\n# summary stats for " + stats_label + "\n")
+            sw = csv.writer(f)
+            sw.writerow(["stat", stats_label])
+            for name in ("mean", "median", "p90", "p99"):
+                sw.writerow([name, f"{stats[name]:.4f}"])
 
 
 def _detect_outlier_index(values, threshold: float = 3.0) -> int | None:
@@ -413,12 +472,24 @@ def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
         ax.set_xlabel("Session (sorted by latency)")
         ax.set_ylabel("E2E latency (s)")
         _stat_lines(ax, durs, orient="h",
-                    stats=("mean", "p90", "p99"), fmt=".1f", unit="s")
+                    stats=("median", "p90", "p99"), fmt=".1f", unit="s")
         ax.set_xlim(-0.5, len(durs) - 0.5)
     fig.tight_layout()
     path = out / "fig1_session_e2e_latency.pdf"
     fig.savefig(path)
     plt.close(fig)
+    # Companion CSV: per-session values + summary stats.
+    _write_csv_with_stats(
+        out / "fig1_session_e2e_latency.csv",
+        header=["session_id", "e2e_duration_s"],
+        rows=[
+            (sid, f"{s.e2e_duration_s:.3f}")
+            for sid, s in sorted(sessions.items())
+            if s.e2e_duration_s is not None
+        ],
+        stats_values=durs,
+        stats_label="e2e_duration_s",
+    )
     return path
 
 
@@ -439,6 +510,17 @@ def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
     stds = np.array([stats[n][1] for n in names])
     ns = [stats[n][2] for n in names]
     outlier = _detect_outlier_index(means, threshold=3.0)
+
+    # Companion CSV: per-tool aggregated stats.
+    _write_csv_with_stats(
+        out / "fig2_tool_exec_time.csv",
+        header=["tool", "n_calls", "mean_s", "std_s"],
+        rows=[
+            (n, ns[i], f"{means[i]:.4f}", f"{stds[i]:.4f}")
+            for i, n in enumerate(names)
+        ],
+        stats_values=None,
+    )
 
     def _draw_bars(ax):
         y = np.arange(len(names))
@@ -582,6 +664,16 @@ def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
     path = out / "fig3_tool_llm_ratio_turn.pdf"
     fig.savefig(path)
     plt.close(fig)
+    # Companion CSV: per-turn values + summary stats.
+    rows = turn_ratio_rows(sessions)
+    _write_csv_with_stats(
+        out / "fig3_tool_llm_ratio_turn.csv",
+        header=["session_id", "step", "tool_wall_s", "llm_wall_s", "ratio"],
+        rows=[(sid, step, f"{tw:.4f}", f"{lw:.4f}", f"{r:.6f}")
+              for sid, step, tw, lw, r in rows],
+        stats_values=[r for *_, r in rows],
+        stats_label="ratio",
+    )
     return path
 
 
@@ -670,6 +762,16 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
     path = out / "fig4_tool_llm_ratio_tool.pdf"
     fig.savefig(path)
     plt.close(fig)
+    # Companion CSV: per-tool-call ratios (no aggregated stats here --
+    # the boxplot already shows per-tool distribution shape).
+    rows = per_tool_ratio_rows(sessions)
+    _write_csv_with_stats(
+        out / "fig4_tool_llm_ratio_tool.csv",
+        header=["session_id", "step", "tool", "ratio"],
+        rows=[(sid, step, name, f"{r:.6f}")
+              for sid, step, name, r in rows],
+        stats_values=None,
+    )
     return path
 
 
