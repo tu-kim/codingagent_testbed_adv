@@ -7,6 +7,21 @@ Consumes either a single aggregated NDJSON file (output of
 in academic papers (NeurIPS/ICML-style: serif, single-column width,
 300 DPI, tight bounding box, spines on left/bottom only).
 
+Failure / abort policy (intentional, do not "clean up" silently):
+  * Failed tool calls (tool.end.ok == false) are EXCLUDED from per-tool
+    stats (fig2 / fig4 / fig5) so a tool's mean isn't poisoned by
+    error-path durations.
+  * Aborted sessions (query.end.aborted == true) are INCLUDED in
+    session-level metrics (fig1) -- this is real-world latency the
+    system produced.
+  * Errored LLM steps (llm.end.finish == "error" etc.) are INCLUDED in
+    turn-level stats (fig3 / fig6) -- same rationale.
+  * Tasks the runner never started (clone / session-create failure
+    before opencode is reached) leave no NDJSON, so they're naturally
+    absent.
+Tweak per-call by editing the `if tc.ok` filters and adding an
+`s.aborted` skip if a different policy is needed.
+
 Figures emitted:
   fig1_session_e2e_latency.pdf   — per-session E2E wall (query.end.duration_s),
                                    sorted bar chart.
