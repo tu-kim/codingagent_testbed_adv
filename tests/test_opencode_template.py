@@ -27,6 +27,8 @@ def _render(
     served_name: str = "local",
     model_name: str = "qwen3-coder-30b-a3b",
     provider_id: str = "dynamo",
+    temperature: str = "0.0",
+    top_p: str = "1.0",
 ) -> dict:
     """Mirror testbed.sh's sed substitution and parse the result."""
     text = _TMPL.read_text()
@@ -34,6 +36,8 @@ def _render(
     text = text.replace("{{MODEL_SERVED_NAME}}", served_name)
     text = text.replace("{{MODEL_NAME}}", model_name)
     text = text.replace("{{PROVIDER_ID}}", provider_id)
+    text = text.replace("{{TEMPERATURE}}", temperature)
+    text = text.replace("{{TOP_P}}", top_p)
     return json.loads(text)
 
 
@@ -67,6 +71,29 @@ def test_rendered_template_has_provider_block_with_required_fields():
     # upstream to Dynamo) and `name` as a display label.
     assert "local" in block["models"]
     assert block["models"]["local"]["name"] == "qwen3-coder-30b-a3b"
+
+
+def test_rendered_template_overrides_sampling_on_all_primary_agents():
+    """Without an explicit per-agent override, opencode falls back to
+    ProviderTransform.temperature(model) which returns 0.55 for qwen --
+    making runs non-reproducible. We pin temperature=0 / top_p=1.0 on
+    every primary agent so experiment runs are greedy-decoded."""
+    cfg = _render(temperature="0.0", top_p="1.0")
+    assert "agent" in cfg
+    expected_agents = ("build", "plan", "general", "title", "summary", "compaction")
+    for name in expected_agents:
+        assert name in cfg["agent"], f"agent.{name} missing from rendered template"
+        a = cfg["agent"][name]
+        assert a["temperature"] == 0.0, f"agent.{name}.temperature != 0"
+        assert a["top_p"] == 1.0, f"agent.{name}.top_p != 1"
+
+
+def test_rendered_template_accepts_nonzero_sampling():
+    """Substitution must accept arbitrary numeric values; opencode's
+    schema validates floats. Pin the render path, not a specific value."""
+    cfg = _render(temperature="0.5", top_p="0.9")
+    assert cfg["agent"]["build"]["temperature"] == 0.5
+    assert cfg["agent"]["build"]["top_p"] == 0.9
 
 
 def test_rendered_template_pins_model_to_provider_slash_served_name():
@@ -146,6 +173,8 @@ def test_substitution_is_idempotent_across_runs(tmp_path: Path):
             "-e", "s|{{MODEL_SERVED_NAME}}|local|g",
             "-e", "s|{{MODEL_NAME}}|qwen3-coder-30b-a3b|g",
             "-e", "s|{{PROVIDER_ID}}|dynamo|g",
+            "-e", "s|{{TEMPERATURE}}|0.0|g",
+            "-e", "s|{{TOP_P}}|1.0|g",
             str(_TMPL),
         ],
         check=True, capture_output=True, text=True,
@@ -157,6 +186,8 @@ def test_substitution_is_idempotent_across_runs(tmp_path: Path):
             "-e", "s|{{MODEL_SERVED_NAME}}|local|g",
             "-e", "s|{{MODEL_NAME}}|qwen3-coder-30b-a3b|g",
             "-e", "s|{{PROVIDER_ID}}|dynamo|g",
+            "-e", "s|{{TEMPERATURE}}|0.0|g",
+            "-e", "s|{{TOP_P}}|1.0|g",
             str(_TMPL),
         ],
         check=True, capture_output=True, text=True,

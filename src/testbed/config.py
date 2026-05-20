@@ -63,6 +63,13 @@ class _Strict(BaseModel):
 class ModelCfg(_Strict):
     name: str
     served_name: str
+    # Sampling overrides applied to every primary opencode agent (build /
+    # plan / general / title / summary / compaction). Default temperature=0
+    # + top_p=1.0 = greedy decoding, the reproducible baseline. Without
+    # these, opencode falls back to ProviderTransform.temperature(model)
+    # which is 0.55 for any qwen model -- making runs non-reproducible.
+    temperature: float = 0.0
+    top_p: float = 1.0
 
 
 class WorkerCfg(_Strict):

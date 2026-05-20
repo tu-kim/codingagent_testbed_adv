@@ -125,6 +125,8 @@ workspace_root: /tmp/testbed-workspaces
 model:
   name: qwen3-coder-30b-a3b      # HF id or local path; default
   served_name: local              # OpenCode provider id used in opencode.json
+  temperature: 0.0                # forwarded into opencode.json.tmpl's agent.* blocks
+  top_p: 1.0                      # see Reproducibility note below
 
 vllm:
   kv_connector: NixlConnector     # vLLM kv-transfer connector class name (matches what vLLM expects)
@@ -365,6 +367,7 @@ Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > buil
 
 ## Conventions / gotchas
 
+- **Reproducible sampling: temperature is overridden on every primary agent.** Without an explicit `agent.<name>.temperature`, `llm.ts:171-173` falls back to `ProviderTransform.temperature(model)` (`provider/transform.ts:464-480`) which returns **0.55 for any `qwen` model** — making runs non-reproducible. `deploy/opencode.json.tmpl` therefore declares `agent.{build,plan,general,title,summary,compaction}` blocks pinned from `testbed.yaml`'s `model.temperature` / `model.top_p` (default 0.0 / 1.0 = greedy). Note that even with `temperature=0`, cross-run determinism still depends on stable vLLM batch composition + KV-cache hit pattern + worker placement (`dynamo.router_mode`, PD-disag worker count). For deeper determinism vLLM exposes a `seed` parameter in `/v1/chat/completions`; opencode does not surface it today.
 - **Vendored sources are authoritative for any implementation detail.** When in doubt about a CLI flag, an env var, or a wire-format detail of OpenCode/Dynamo/vLLM, read the vendored source (`opencode/`, `dynamo/`) — do not rely on memory or external docs that may not match the pinned version.
 - **OpenCode is headless-only**, launched as `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <h> --port <p>` from `opencode/`. No TUI, no shared global workspace. Every session/message call must include `?directory=<absolute path>` (`InstanceMiddleware` reads it). Without the env var, concurrent agents will trample each other in a single CWD. **Always send the absolute path** — `InstanceMiddleware` calls `AppFileSystem.resolve()` (Node `path.resolve()`) so a bare folder name resolves against OpenCode's CWD (= the `opencode/` repo), not against `workspace_root`.
 - **Pass `OPENCODE_CONFIG=<abs path>` when launching OpenCode.** OpenCode's per-instance config loader walks UP from the request's `?directory=` looking for `opencode.json` (`opencode/packages/opencode/src/config/paths.ts:10-21`, consumed at `config/config.ts:568-572`). Our rendered `opencode/opencode.json` is NOT on that walk path because `?directory=` lives under `/tmp/testbed-workspaces/<session>/`. Without `OPENCODE_CONFIG=<abs>` (loaded as "custom config" at `config.ts:563-566`), the rendered file is silently ignored, `cfg.provider` is empty, and `HF_TOKEN` (commonly exported for vLLM) auto-enables the `huggingface` provider via `provider.ts:160-181` (`input.env.some(item => env[item])`) — sending all inference to `https://router.huggingface.co/v1` with whatever `qwen/...` model happens to be in the `huggingface` block of `models.dev/api.json`. Belt-and-suspenders: `opencode.json.tmpl` also pins `disabled_providers: ["huggingface"]` (`provider.ts:1133` consumes this).

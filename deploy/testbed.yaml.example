@@ -8,6 +8,17 @@ workspace_root: /tmp/testbed-workspaces
 model:
   name: qwen3-coder-30b-a3b      # HF id or local path; default
   served_name: local             # OpenCode provider model id used in opencode.json
+  # Sampling overrides for ALL primary agents (build / plan / general /
+  # title / summary / compaction). Set temperature=0 + top_p=1.0 for
+  # greedy decoding -- the practical baseline for reproducible runs.
+  # Note: opencode/AI SDK forwards these to dynamo; vLLM treats temp=0
+  # as greedy. Cross-run determinism still depends on stable batch
+  # composition / KV-cache hits / worker placement (router_mode +
+  # PD-disag).  See ProviderTransform.temperature() in opencode's
+  # provider/transform.ts for the per-model defaults (qwen→0.55) that
+  # this override replaces.
+  temperature: 0.0
+  top_p: 1.0
 
 vllm:
   kv_connector: NixlConnector    # vLLM KV-transfer connector class name

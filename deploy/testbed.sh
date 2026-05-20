@@ -227,11 +227,15 @@ up_frontend() {
 render_opencode_config() {
   local oc_cfg="$OPENCODE_DIR/opencode.json"
   local tmpl="$REPO_ROOT/deploy/opencode.json.tmpl"
-  local dynamo_host dynamo_port served name provider_id
+  local dynamo_host dynamo_port served name provider_id temperature top_p
   dynamo_host=$(cfg_get_env DYNAMO__HOST .dynamo.host)
   dynamo_port=$(cfg_get_env DYNAMO__PORT .dynamo.port)
   served=$(cfg_get .model.served_name)
   name=$(cfg_get .model.name)
+  # Sampling overrides applied to every primary agent so reproducible
+  # runs don't get the provider-transform default (qwen → 0.55).
+  temperature=$(cfg_get_env MODEL__TEMPERATURE .model.temperature)
+  top_p=$(cfg_get_env MODEL__TOP_P .model.top_p)
   provider_id=dynamo
 
   sed \
@@ -239,6 +243,8 @@ render_opencode_config() {
     -e "s|{{MODEL_SERVED_NAME}}|${served}|g" \
     -e "s|{{MODEL_NAME}}|${name}|g" \
     -e "s|{{PROVIDER_ID}}|${provider_id}|g" \
+    -e "s|{{TEMPERATURE}}|${temperature}|g" \
+    -e "s|{{TOP_P}}|${top_p}|g" \
     "$tmpl" > "$oc_cfg"
   echo "rendered $oc_cfg"
 }
