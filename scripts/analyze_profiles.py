@@ -303,6 +303,50 @@ def tool_token_pairs(sessions: dict[str, Session]):
 # ---------- plotting ----------
 
 
+def _detect_outlier_index(values, threshold: float = 3.0) -> int | None:
+    """Return index of a single dominant outlier whose value exceeds
+    `threshold × the second-largest`, else None. Used to decide whether
+    to break the axis at the gap between the outlier and everyone else."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size < 2:
+        return None
+    order = np.argsort(-arr)
+    top, second = arr[order[0]], arr[order[1]]
+    if second <= 0:
+        return int(order[0]) if top > 0 else None
+    if top > threshold * second:
+        return int(order[0])
+    return None
+
+
+def _draw_break_marks(ax_lo, ax_hi, orient: str = "x") -> None:
+    """Diagonal `//` break marks at the seam between two axes.
+
+    orient="x": ax_lo is LEFT, ax_hi is RIGHT.
+    orient="y": ax_lo is BOTTOM, ax_hi is TOP.
+    """
+    d = 0.018  # half-size in axes-fraction
+    common = dict(color="k", clip_on=False, linewidth=0.7)
+    if orient == "x":
+        ax_lo.spines["right"].set_visible(False)
+        ax_hi.spines["left"].set_visible(False)
+        kw = dict(common, transform=ax_lo.transAxes)
+        ax_lo.plot([1 - d, 1 + d], [-d, +d], **kw)
+        ax_lo.plot([1 - d, 1 + d], [1 - d, 1 + d], **kw)
+        kw = dict(common, transform=ax_hi.transAxes)
+        ax_hi.plot([-d, +d], [-d, +d], **kw)
+        ax_hi.plot([-d, +d], [1 - d, 1 + d], **kw)
+    elif orient == "y":
+        ax_lo.spines["top"].set_visible(False)
+        ax_hi.spines["bottom"].set_visible(False)
+        kw = dict(common, transform=ax_lo.transAxes)
+        ax_lo.plot([-d, +d], [1 - d, 1 + d], **kw)
+        ax_lo.plot([1 - d, 1 + d], [1 - d, 1 + d], **kw)
+        kw = dict(common, transform=ax_hi.transAxes)
+        ax_hi.plot([-d, +d], [-d, +d], **kw)
+        ax_hi.plot([1 - d, 1 + d], [-d, +d], **kw)
+
+
 def _stat_lines(
     ax,
     values: list[float],
@@ -380,42 +424,81 @@ def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
 
 def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
     stats = per_tool_duration_stats(sessions)
-    fig, ax = plt.subplots(figsize=(3.7, 2.5))   # slightly wider for inline values
     if not stats:
+        fig, ax = plt.subplots(figsize=(3.4, 2.4))
         ax.text(0.5, 0.5, "no successful tool calls",
                 ha="center", va="center", transform=ax.transAxes)
-    else:
-        names = list(stats.keys())
-        means = np.array([stats[n][0] for n in names])
-        stds = np.array([stats[n][1] for n in names])
-        ns = [stats[n][2] for n in names]
+        fig.tight_layout()
+        path = out / "fig2_tool_exec_time.pdf"
+        fig.savefig(path)
+        plt.close(fig)
+        return path
+
+    names = list(stats.keys())
+    means = np.array([stats[n][0] for n in names])
+    stds = np.array([stats[n][1] for n in names])
+    ns = [stats[n][2] for n in names]
+    outlier = _detect_outlier_index(means, threshold=3.0)
+
+    def _draw_bars(ax):
         y = np.arange(len(names))
-        # Log x-axis handles wide range (e.g. `task` sub-agent ~30s
-        # vs `read` ~0.05s) so the smaller tools stay visible.
-        eps = 1e-3
-        means_plot = np.maximum(means, eps)
-        # Asymmetric error bars: clip lower end at eps so log scale
-        # doesn't hit zero or negative values (mean - std can be < 0).
-        lower = np.minimum(stds, means_plot - eps)
-        upper = stds
-        ax.barh(y, means_plot, xerr=[lower, upper], color="0.4",
-                edgecolor="black", linewidth=0.5,
-                error_kw={"linewidth": 0.6, "capsize": 1.5})
+        ax.barh(y, means, xerr=stds, color="0.4", edgecolor="black",
+                linewidth=0.5, error_kw={"linewidth": 0.6, "capsize": 1.5})
         ax.set_yticks(y)
         ax.set_yticklabels(names)
         ax.invert_yaxis()
-        ax.set_xlabel("Execution time (s, log scale)")
-        ax.set_xscale("log")
-        ax.set_xlim(left=eps)
-        # Annotate each bar with mean ± std (n) in small font next to
-        # the bar's RIGHT edge -- bypasses log-scale visual asymmetry.
+
+    if outlier is None:
+        # No dominant outlier -- single linear axis.
+        fig, ax = plt.subplots(figsize=(3.7, 2.5))
+        _draw_bars(ax)
+        ax.set_xlabel("Execution time (s)")
+        ax.set_xlim(left=0)
         for i, (m, s, c) in enumerate(zip(means, stds, ns)):
-            ax.text(
-                max(m + s, eps) * 1.4, i,
-                f"{m:.2f}±{s:.2f} (n={c})",
-                va="center", ha="left", fontsize=6.0, color="0.2",
+            ax.text(m + s + 0.05 * max(means + stds),
+                    i, f"{m:.2f}±{s:.2f} (n={c})",
+                    va="center", ha="left", fontsize=6.0, color="0.2")
+        fig.tight_layout()
+    else:
+        # Broken x-axis: linear scales on both halves with diagonal break marks.
+        # lo_max = ~120% of the second-largest (mean + std), so non-outlier
+        # bars stay visible with comfortable headroom.
+        non_outlier_extents = np.delete(means + stds, outlier)
+        lo_max = float(non_outlier_extents.max()) * 1.25 if non_outlier_extents.size else 1.0
+        hi_lo = float(max(0.0, means[outlier] - stds[outlier] - 0.1 * means[outlier]))
+        hi_hi = float(means[outlier] + stds[outlier]) * 1.10
+        if hi_lo <= lo_max:  # outlier overlaps lo region; no break needed
+            outlier = None
+            fig, ax = plt.subplots(figsize=(3.7, 2.5))
+            _draw_bars(ax)
+            ax.set_xlabel("Execution time (s)")
+            ax.set_xlim(left=0)
+            fig.tight_layout()
+        else:
+            fig, (ax_lo, ax_hi) = plt.subplots(
+                1, 2, figsize=(4.0, 2.6), sharey=True,
+                gridspec_kw={"width_ratios": [3, 1]},
             )
-    fig.tight_layout()
+            _draw_bars(ax_lo)
+            _draw_bars(ax_hi)
+            ax_lo.set_xlim(0, lo_max)
+            ax_hi.set_xlim(hi_lo, hi_hi)
+            _draw_break_marks(ax_lo, ax_hi, orient="x")
+            # Inline value labels: bar that fits in lo gets its label in lo,
+            # the outlier bar gets its label in hi.
+            for i, (m, s, c) in enumerate(zip(means, stds, ns)):
+                label = f"{m:.2f}±{s:.2f} (n={c})"
+                if i == outlier:
+                    ax_hi.text(m + s + 0.04 * (hi_hi - hi_lo),
+                               i, label, va="center", ha="left",
+                               fontsize=6.0, color="0.2")
+                else:
+                    ax_lo.text(m + s + 0.04 * lo_max,
+                               i, label, va="center", ha="left",
+                               fontsize=6.0, color="0.2")
+            # Shared x-label centered across the two axes.
+            fig.text(0.5, 0.02, "Execution time (s)", ha="center", fontsize=9)
+            fig.tight_layout(rect=(0, 0.04, 1, 1))
     path = out / "fig2_tool_exec_time.pdf"
     fig.savefig(path)
     plt.close(fig)
@@ -424,28 +507,78 @@ def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
 
 def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
     ratios = turn_ratio_distribution(sessions)
-    fig, ax = plt.subplots(figsize=(3.5, 2.4))
     if not ratios:
+        fig, ax = plt.subplots(figsize=(3.5, 2.4))
         ax.text(0.5, 0.5, "no turns with both tool and llm wall",
                 ha="center", va="center", transform=ax.transAxes)
-    else:
-        arr = np.array(ratios)
-        # Log x-axis spreads the dense 0-1 region while still
-        # showing the long tail. Clip exact zeros to a small eps for
-        # the log axis; the underlying stats are computed on raw arr.
-        eps = max(1e-3, float(arr[arr > 0].min()) if (arr > 0).any() else 1e-3)
-        arr_pos = np.where(arr <= 0, eps, arr)
-        upper = float(arr_pos.max() * 1.1)
-        bins = np.logspace(np.log10(eps), np.log10(upper), 40)
-        ax.hist(arr_pos, bins=bins, color="0.5", edgecolor="black", linewidth=0.4)
-        ax.set_xscale("log")
-        ax.set_xlabel(r"Tool wall / LLM wall per turn (log scale)")
+        fig.tight_layout()
+        path = out / "fig3_tool_llm_ratio_turn.pdf"
+        fig.savefig(path)
+        plt.close(fig)
+        return path
+
+    arr = np.array(ratios, dtype=float)
+    # Break the x-axis between p90 (or whatever cap covers the bulk)
+    # and the tail's min, when the tail is significantly far from the
+    # bulk. Otherwise plot a single linear axis.
+    p50 = float(np.median(arr))
+    p90 = float(np.percentile(arr, 90))
+    p99 = float(np.percentile(arr, 99))
+    bulk_cap = p90 * 1.10
+    tail = arr[arr > bulk_cap]
+    do_break = tail.size > 0 and (tail.min() > 2.0 * bulk_cap)
+
+    if not do_break:
+        fig, ax = plt.subplots(figsize=(3.5, 2.4))
+        nbins = 40
+        # Linear bins from 0 to max+10%
+        bins = np.linspace(0.0, max(arr.max(), 1e-6) * 1.1, nbins)
+        ax.hist(arr, bins=bins, color="0.5", edgecolor="black", linewidth=0.4)
+        ax.set_xlabel(r"Tool wall / LLM wall per turn")
         ax.set_ylabel("Turn count")
-        # Stats: median / p90 / p99 vertical lines + small inline values
         _stat_lines(ax, ratios, orient="v",
                     stats=("median", "p90", "p99"), fmt=".2f")
         ax.axvline(1.0, color="0.7", linestyle=":", linewidth=0.5)
-    fig.tight_layout()
+        fig.tight_layout()
+    else:
+        # Broken x-axis: linear scales on both halves with `//` marks.
+        fig, (ax_lo, ax_hi) = plt.subplots(
+            1, 2, figsize=(4.0, 2.5), sharey=True,
+            gridspec_kw={"width_ratios": [3, 1]},
+        )
+        bins_lo = np.linspace(0.0, bulk_cap, 35)
+        # Span hi: from tail.min to arr.max, padded a bit.
+        hi_lo = float(tail.min()) * 0.95
+        hi_hi = float(arr.max()) * 1.05
+        bins_hi = np.linspace(hi_lo, hi_hi, 12)
+        ax_lo.hist(arr, bins=bins_lo, color="0.5", edgecolor="black", linewidth=0.4)
+        ax_hi.hist(arr, bins=bins_hi, color="0.5", edgecolor="black", linewidth=0.4)
+        ax_lo.set_xlim(0.0, bulk_cap)
+        ax_hi.set_xlim(hi_lo, hi_hi)
+        ax_lo.set_ylabel("Turn count")
+        fig.text(0.5, 0.02, "Tool wall / LLM wall per turn", ha="center", fontsize=9)
+        _draw_break_marks(ax_lo, ax_hi, orient="x")
+        # Stat lines: place each in the subplot whose x-range contains it.
+        trans_lo = ax_lo.get_xaxis_transform()
+        trans_hi = ax_hi.get_xaxis_transform()
+        for label, value, color, ypos in [
+            ("median", p50, "C0", 0.97),
+            ("p90", p90, "C2", 0.85),
+            ("p99", p99, "C3", 0.73),
+        ]:
+            target = ax_lo if value <= bulk_cap else ax_hi
+            trans = trans_lo if target is ax_lo else trans_hi
+            target.axvline(value, color=color, linestyle="--",
+                           linewidth=0.7, alpha=0.85)
+            target.text(value, ypos, f"{label}={value:.2f}",
+                        transform=trans, va="top", ha="left", fontsize=6.0,
+                        color=color,
+                        bbox=dict(facecolor="white", edgecolor="none",
+                                   alpha=0.7, pad=0.5))
+        # 1.0 reference if it falls in the lo region.
+        if 1.0 <= bulk_cap:
+            ax_lo.axvline(1.0, color="0.7", linestyle=":", linewidth=0.5)
+        fig.tight_layout(rect=(0, 0.04, 1, 1))
     path = out / "fig3_tool_llm_ratio_turn.pdf"
     fig.savefig(path)
     plt.close(fig)
@@ -454,22 +587,25 @@ def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
 
 def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
     by_tool = per_tool_ratio_distribution(sessions)
-    # Wider figure + room on left for the y-axis label that was being
-    # cropped at default size.
-    fig, ax = plt.subplots(figsize=(3.8, 2.7))
     if not by_tool:
+        fig, ax = plt.subplots(figsize=(3.5, 2.5))
         ax.text(0.5, 0.5, "no tool/llm pairs",
                 ha="center", va="center", transform=ax.transAxes)
-    else:
-        items = sorted(by_tool.items(), key=lambda kv: -np.median(kv[1]))
-        names = [k for k, _ in items]
-        data = [v for _, v in items]
-        # Log y-axis: `task` ratios can be 100x larger than `read`,
-        # without log the boxes for small tools collapse to a flat line.
-        eps = 1e-3
-        data_log = [np.maximum(np.asarray(d, dtype=float), eps) for d in data]
+        fig.tight_layout()
+        path = out / "fig4_tool_llm_ratio_tool.pdf"
+        fig.savefig(path)
+        plt.close(fig)
+        return path
+
+    items = sorted(by_tool.items(), key=lambda kv: -np.median(kv[1]))
+    names = [k for k, _ in items]
+    data = [np.asarray(v, dtype=float) for _, v in items]
+    medians = np.array([float(np.median(d)) for d in data])
+    outlier = _detect_outlier_index(medians, threshold=3.0)
+
+    def _draw_boxes(ax):
         ax.boxplot(
-            data_log,
+            data,
             widths=0.55,
             showfliers=False,
             patch_artist=True,
@@ -480,12 +616,57 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
         )
         ax.set_xticks(range(1, len(names) + 1))
         ax.set_xticklabels(names, rotation=30, ha="right")
-        ax.set_ylabel("Tool duration / Turn LLM wall\n(log scale)")
-        ax.set_yscale("log")
+
+    if outlier is None:
+        fig, ax = plt.subplots(figsize=(3.8, 2.7))
+        _draw_boxes(ax)
+        ax.set_ylabel("Tool duration / Turn LLM wall")
         ax.axhline(1.0, color="0.7", linestyle=":", linewidth=0.6)
-    # Reserve extra left margin so the multi-line y-label isn't clipped.
-    fig.tight_layout()
-    fig.subplots_adjust(left=0.20)
+        ax.set_ylim(bottom=0)
+        fig.tight_layout()
+        fig.subplots_adjust(left=0.18)
+    else:
+        # Broken y-axis: linear on both halves, `//` marks at the seam.
+        # Top covers the outlier's whisker range, bottom covers everyone
+        # else (with a comfy headroom).
+        outlier_data = data[outlier]
+        q1, q3 = np.percentile(outlier_data, [25, 75])
+        iqr = q3 - q1
+        # whisker bounds (matplotlib default = 1.5*IQR, clipped to actual data)
+        whisker_lo = max(float(outlier_data.min()),
+                         float(q1 - 1.5 * iqr))
+        whisker_hi = min(float(outlier_data.max()),
+                         float(q3 + 1.5 * iqr))
+        non_outlier_data = np.concatenate(
+            [d for j, d in enumerate(data) if j != outlier]
+        ) if any(d.size for j, d in enumerate(data) if j != outlier) else np.array([0.0])
+        bot_hi = float(np.percentile(non_outlier_data, 99)) * 1.15
+        if whisker_lo <= bot_hi:
+            # outlier's lower whisker overlaps the bulk; no break needed
+            fig, ax = plt.subplots(figsize=(3.8, 2.7))
+            _draw_boxes(ax)
+            ax.set_ylabel("Tool duration / Turn LLM wall")
+            ax.axhline(1.0, color="0.7", linestyle=":", linewidth=0.6)
+            ax.set_ylim(bottom=0)
+            fig.tight_layout()
+            fig.subplots_adjust(left=0.18)
+        else:
+            fig, (ax_hi, ax_lo) = plt.subplots(
+                2, 1, figsize=(3.8, 3.1), sharex=True,
+                gridspec_kw={"height_ratios": [1, 3]},
+            )
+            _draw_boxes(ax_hi)
+            _draw_boxes(ax_lo)
+            ax_hi.set_ylim(whisker_lo * 0.95, whisker_hi * 1.05)
+            ax_lo.set_ylim(0, bot_hi)
+            ax_hi.tick_params(axis="x", bottom=False, labelbottom=False)
+            ax_lo.axhline(1.0, color="0.7", linestyle=":", linewidth=0.6)
+            _draw_break_marks(ax_lo, ax_hi, orient="y")
+            # Shared y-label centered across both subplots.
+            fig.text(0.02, 0.5, "Tool duration / Turn LLM wall",
+                     ha="center", va="center", rotation="vertical", fontsize=9)
+            fig.tight_layout(rect=(0.05, 0, 1, 1))
+            fig.subplots_adjust(hspace=0.08, left=0.18)
     path = out / "fig4_tool_llm_ratio_tool.pdf"
     fig.savefig(path)
     plt.close(fig)
