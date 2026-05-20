@@ -335,7 +335,20 @@ Knobs (set before `testbed.sh up opencode`):
 - `OPENCODE_PROFILE_DIR=<abs>` — override default (`<workspace_root>/profiles`)
 - `OPENCODE_PROFILE_MESSAGES=count|head|full` — snapshot fidelity (default `head` = first 200 chars per part)
 
-Per-session NDJSON layout: one file per `sessionID`, events `query.start, turn.start, llm.start, llm.end, tool.start, tool.end, turn.end, query.end`. `llm.duration_s` is **pure LLM streaming time** (start-step → first `tool.start` of step, or last `text-end` for text-only steps); `llm.step_duration_s` is the whole AI SDK step bracket (start-step → finish-step) for comparison. `llm.end.tokens` is the OpenAI usage object (= ISL/OSL). `turn.end` carries `duration_s = llm_wall_s + tool_wall_s + post_overhead_s` (clamped at 0 for parallel-tool steps). The `tool.*` pair is fired by `Effect.onExit` so failures + dies still produce a `tool.end` with `ok:false`. Aggregate across sessions with `scripts/aggregate_profiles.sh <workspace_root>` (auto-prepends the `/profiles` subdir). Full step-event lifecycle and decomposition rationale: `docs/opencode_step_events.md`.
+Per-session NDJSON layout: one file per `sessionID`, events `query.start, turn.start, llm.start, llm.stream-finish, llm.end, tool.start, tool.end, turn.end, query.end`.
+
+Timing fields on `llm.end`, in order of preference for "client-side LLM wall":
+- `stream_end_s` (preferred when present) — `start-step → AI-SDK "finish" event`. The "finish" event fires the instant the stream is fully consumed (finishReason + usage chunks received), set by the `Profile.llm.streamFinish` hook on `case "finish":` in `processor.ts`. This is the **true client-side LLM stream wall**.
+- `duration_s` — legacy approximation: `start-step → first tool.start` (or last `text-end` if no tool ran). Significantly under-measures when the model emits closing/finish_reason chunks AFTER its first tool_call.
+- `step_duration_s` — full AI SDK step bracket (`start-step → finish-step`). Includes post-stream framework finalization (snapshot.track + snapshot.patch + DB writes in `processor.ts:455-514`), so `step_duration_s − stream_end_s = post_stream_overhead_s` (also recorded explicitly).
+
+`llm.end.dynamo` (also surfaced on `llm.stream-finish`) carries Dynamo's in-band timing extracted from `providerMetadata.nvext.timing`:
+- `elapsed_s` = dynamo's `total_time_ms / 1000` (server-side wall from HTTP receipt to last chunk; matches the `request completed` log line's `elapsed_ms`).
+- `request_received_unix_s` = `request_received_ms / 1000` (wall-clock at Dynamo when the HTTP request landed). Comparing with `llm.start.ts` decomposes "client setup + request upstream" from "dynamo internal".
+
+Because dynamo timings now ride in-band, **no log scraping is needed** to cross-reference profile NDJSON with the dynamo frontend log.
+
+`llm.end.tokens` is the AI-SDK-normalized usage object (`{total, input, output, reasoning, cache:{read,write}}`) from `session.ts:getUsage`; `input` already has cache tokens subtracted so dynamo's ISL = `tokens.input + tokens.cache.read [+ tokens.cache.write]`. `turn.end` carries `duration_s = llm_wall_s + tool_wall_s + post_overhead_s` (clamped at 0 for parallel-tool steps). The `tool.*` pair is fired by `Effect.onExit` so failures + dies still produce a `tool.end` with `ok:false`. Aggregate across sessions with `scripts/aggregate_profiles.sh <workspace_root>` (auto-prepends the `/profiles` subdir). Full step-event lifecycle and decomposition rationale: `docs/opencode_step_events.md`.
 
 ## Configuration overrides
 
