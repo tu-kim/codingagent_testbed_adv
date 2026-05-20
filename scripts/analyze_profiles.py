@@ -303,6 +303,57 @@ def tool_token_pairs(sessions: dict[str, Session]):
 # ---------- plotting ----------
 
 
+def _stat_lines(
+    ax,
+    values: list[float],
+    *,
+    orient: str = "h",   # "h" = horizontal axhlines (for value distributions on y), "v" = axvlines
+    stats: tuple[str, ...] = ("mean", "p90", "p99"),
+    fmt: str = ".2f",
+    unit: str = "",
+) -> None:
+    """Overlay mean/p90/p99 (or median/p90/p99) reference lines with
+    inline value labels in a small font. Used by fig1 and fig3."""
+    if not values:
+        return
+    arr = np.asarray(values, dtype=float)
+    if "median" in stats and "mean" in stats:
+        # rare; if both wanted, plot both
+        pass
+    spec: list[tuple[str, float, str]] = []
+    for name in stats:
+        if name == "mean":
+            spec.append(("mean", float(np.mean(arr)), "C0"))
+        elif name == "median":
+            spec.append(("median", float(np.median(arr)), "C0"))
+        elif name == "p90":
+            spec.append(("p90", float(np.percentile(arr, 90)), "C2"))
+        elif name == "p99":
+            spec.append(("p99", float(np.percentile(arr, 99)), "C3"))
+    # stagger label y-positions when lines are dense to reduce overlap
+    label_axis_pos = [0.97, 0.85, 0.73, 0.61]
+    for i, (label, value, color) in enumerate(spec):
+        if orient == "h":
+            ax.axhline(value, color=color, linestyle="--", linewidth=0.7, alpha=0.85)
+            trans = ax.get_yaxis_transform()
+            ax.text(
+                0.99, value, f" {label}={value:{fmt}}{unit}",
+                transform=trans, va="center", ha="right", fontsize=6.0,
+                color=color,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=0.5),
+            )
+        else:  # vertical lines on a histogram-like x-axis
+            ax.axvline(value, color=color, linestyle="--", linewidth=0.7, alpha=0.85)
+            trans = ax.get_xaxis_transform()
+            y_axis_pos = label_axis_pos[i % len(label_axis_pos)]
+            ax.text(
+                value, y_axis_pos, f"{label}={value:{fmt}}{unit}",
+                transform=trans, va="top", ha="left", fontsize=6.0,
+                color=color,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=0.5),
+            )
+
+
 def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
     durs = sorted(
         (s.e2e_duration_s for s in sessions.values() if s.e2e_duration_s is not None),
@@ -317,10 +368,8 @@ def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
         ax.bar(x, durs, color="0.4", edgecolor="black", linewidth=0.5)
         ax.set_xlabel("Session (sorted by latency)")
         ax.set_ylabel("E2E latency (s)")
-        median = float(np.median(durs))
-        ax.axhline(median, color="C3", linestyle="--", linewidth=0.8,
-                   label=f"median {median:.1f}s")
-        ax.legend(loc="upper left", frameon=False)
+        _stat_lines(ax, durs, orient="h",
+                    stats=("mean", "p90", "p99"), fmt=".1f", unit="s")
         ax.set_xlim(-0.5, len(durs) - 0.5)
     fig.tight_layout()
     path = out / "fig1_session_e2e_latency.pdf"
@@ -331,23 +380,41 @@ def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
 
 def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
     stats = per_tool_duration_stats(sessions)
-    fig, ax = plt.subplots(figsize=(3.3, 2.3))
+    fig, ax = plt.subplots(figsize=(3.7, 2.5))   # slightly wider for inline values
     if not stats:
         ax.text(0.5, 0.5, "no successful tool calls",
                 ha="center", va="center", transform=ax.transAxes)
     else:
         names = list(stats.keys())
-        means = [stats[n][0] for n in names]
-        stds = [stats[n][1] for n in names]
+        means = np.array([stats[n][0] for n in names])
+        stds = np.array([stats[n][1] for n in names])
         ns = [stats[n][2] for n in names]
         y = np.arange(len(names))
-        ax.barh(y, means, xerr=stds, color="0.4", edgecolor="black",
-                linewidth=0.5, error_kw={"linewidth": 0.6, "capsize": 1.5})
+        # Log x-axis handles wide range (e.g. `task` sub-agent ~30s
+        # vs `read` ~0.05s) so the smaller tools stay visible.
+        eps = 1e-3
+        means_plot = np.maximum(means, eps)
+        # Asymmetric error bars: clip lower end at eps so log scale
+        # doesn't hit zero or negative values (mean - std can be < 0).
+        lower = np.minimum(stds, means_plot - eps)
+        upper = stds
+        ax.barh(y, means_plot, xerr=[lower, upper], color="0.4",
+                edgecolor="black", linewidth=0.5,
+                error_kw={"linewidth": 0.6, "capsize": 1.5})
         ax.set_yticks(y)
-        ax.set_yticklabels([f"{n} (n={c})" for n, c in zip(names, ns)])
+        ax.set_yticklabels(names)
         ax.invert_yaxis()
-        ax.set_xlabel("Execution time (s)")
-        ax.set_xlim(left=0)
+        ax.set_xlabel("Execution time (s, log scale)")
+        ax.set_xscale("log")
+        ax.set_xlim(left=eps)
+        # Annotate each bar with mean ± std (n) in small font next to
+        # the bar's RIGHT edge -- bypasses log-scale visual asymmetry.
+        for i, (m, s, c) in enumerate(zip(means, stds, ns)):
+            ax.text(
+                max(m + s, eps) * 1.4, i,
+                f"{m:.2f}±{s:.2f} (n={c})",
+                va="center", ha="left", fontsize=6.0, color="0.2",
+            )
     fig.tight_layout()
     path = out / "fig2_tool_exec_time.pdf"
     fig.savefig(path)
@@ -357,27 +424,27 @@ def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
 
 def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
     ratios = turn_ratio_distribution(sessions)
-    fig, ax = plt.subplots(figsize=(3.3, 2.3))
+    fig, ax = plt.subplots(figsize=(3.5, 2.4))
     if not ratios:
         ax.text(0.5, 0.5, "no turns with both tool and llm wall",
                 ha="center", va="center", transform=ax.transAxes)
     else:
-        # Cap extreme outliers for visualization, annotate clip
         arr = np.array(ratios)
-        cap = float(np.quantile(arr, 0.99))
-        clipped = np.clip(arr, 0, cap)
-        ax.hist(clipped, bins=40, color="0.5", edgecolor="black", linewidth=0.4)
-        ax.set_xlabel(r"Tool wall / LLM wall per turn")
+        # Log x-axis spreads the dense 0-1 region while still
+        # showing the long tail. Clip exact zeros to a small eps for
+        # the log axis; the underlying stats are computed on raw arr.
+        eps = max(1e-3, float(arr[arr > 0].min()) if (arr > 0).any() else 1e-3)
+        arr_pos = np.where(arr <= 0, eps, arr)
+        upper = float(arr_pos.max() * 1.1)
+        bins = np.logspace(np.log10(eps), np.log10(upper), 40)
+        ax.hist(arr_pos, bins=bins, color="0.5", edgecolor="black", linewidth=0.4)
+        ax.set_xscale("log")
+        ax.set_xlabel(r"Tool wall / LLM wall per turn (log scale)")
         ax.set_ylabel("Turn count")
-        median = float(np.median(arr))
-        ax.axvline(median, color="C3", linestyle="--", linewidth=0.8,
-                   label=f"median {median:.2f}")
-        ax.axvline(1.0, color="0.7", linestyle=":", linewidth=0.6)
-        ax.legend(loc="upper right", frameon=False)
-        if (arr > cap).any():
-            n_clipped = int((arr > cap).sum())
-            ax.text(0.97, 0.86, f"({n_clipped} clipped above p99={cap:.2f})",
-                    transform=ax.transAxes, ha="right", fontsize=7, color="0.4")
+        # Stats: median / p90 / p99 vertical lines + small inline values
+        _stat_lines(ax, ratios, orient="v",
+                    stats=("median", "p90", "p99"), fmt=".2f")
+        ax.axvline(1.0, color="0.7", linestyle=":", linewidth=0.5)
     fig.tight_layout()
     path = out / "fig3_tool_llm_ratio_turn.pdf"
     fig.savefig(path)
@@ -387,7 +454,9 @@ def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
 
 def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
     by_tool = per_tool_ratio_distribution(sessions)
-    fig, ax = plt.subplots(figsize=(3.3, 2.3))
+    # Wider figure + room on left for the y-axis label that was being
+    # cropped at default size.
+    fig, ax = plt.subplots(figsize=(3.8, 2.7))
     if not by_tool:
         ax.text(0.5, 0.5, "no tool/llm pairs",
                 ha="center", va="center", transform=ax.transAxes)
@@ -395,8 +464,12 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
         items = sorted(by_tool.items(), key=lambda kv: -np.median(kv[1]))
         names = [k for k, _ in items]
         data = [v for _, v in items]
+        # Log y-axis: `task` ratios can be 100x larger than `read`,
+        # without log the boxes for small tools collapse to a flat line.
+        eps = 1e-3
+        data_log = [np.maximum(np.asarray(d, dtype=float), eps) for d in data]
         ax.boxplot(
-            data,
+            data_log,
             widths=0.55,
             showfliers=False,
             patch_artist=True,
@@ -407,9 +480,12 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
         )
         ax.set_xticks(range(1, len(names) + 1))
         ax.set_xticklabels(names, rotation=30, ha="right")
-        ax.set_ylabel(r"Tool duration / Turn LLM wall")
+        ax.set_ylabel("Tool duration / Turn LLM wall\n(log scale)")
+        ax.set_yscale("log")
         ax.axhline(1.0, color="0.7", linestyle=":", linewidth=0.6)
+    # Reserve extra left margin so the multi-line y-label isn't clipped.
     fig.tight_layout()
+    fig.subplots_adjust(left=0.20)
     path = out / "fig4_tool_llm_ratio_tool.pdf"
     fig.savefig(path)
     plt.close(fig)
@@ -420,20 +496,18 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path) -> Path:
     pairs = tool_token_pairs(sessions)
     fig, axes = plt.subplots(1, 2, figsize=(6.6, 2.4), sharey=False)
     ax_out, ax_in = axes
+    by_tool_out: dict[str, list[int]] = defaultdict(list)
+    by_tool_in: dict[str, list[int]] = defaultdict(list)
     if not pairs:
         for ax in axes:
             ax.text(0.5, 0.5, "no tool calls with token data",
                     ha="center", va="center", transform=ax.transAxes)
     else:
-        # Group by tool name
-        by_tool_out: dict[str, list[int]] = defaultdict(list)
-        by_tool_in: dict[str, list[int]] = defaultdict(list)
         for name, out_tok, in_added in pairs:
             by_tool_out[name].append(out_tok)
             if in_added is not None:
                 by_tool_in[name].append(in_added)
 
-        # Common ordering by mean output tokens
         names = sorted(by_tool_out.keys(), key=lambda n: -float(np.mean(by_tool_out[n])))
 
         def _box(ax, bucket: dict[str, list[int]], ylabel: str):
@@ -465,7 +539,65 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path) -> Path:
     path = out / "fig5_tool_tokens.pdf"
     fig.savefig(path)
     plt.close(fig)
+
+    # ----- companion mean/std table for fig5 -----
+    _write_tool_tokens_table(by_tool_out, by_tool_in, out)
     return path
+
+
+def _write_tool_tokens_table(
+    by_tool_out: dict[str, list[int]],
+    by_tool_in: dict[str, list[int]],
+    out: Path,
+) -> Path:
+    """Write fig5's underlying mean/std numbers as a CSV + print to stdout.
+
+    Columns: tool, n_calls, turn_out_mean, turn_out_std,
+             next_in_added_mean, next_in_added_std.
+    """
+    import csv
+
+    csv_path = out / "fig5_tool_tokens_stats.csv"
+    names = sorted(
+        by_tool_out.keys(),
+        key=lambda n: -float(np.mean(by_tool_out[n])) if by_tool_out[n] else 0.0,
+    )
+
+    with csv_path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "tool", "n_calls",
+            "turn_out_mean", "turn_out_std",
+            "next_in_added_mean", "next_in_added_std",
+        ])
+        for name in names:
+            out_arr = np.asarray(by_tool_out[name], dtype=float)
+            in_arr = np.asarray(by_tool_in.get(name, []), dtype=float)
+            w.writerow([
+                name, len(out_arr),
+                f"{out_arr.mean():.1f}" if out_arr.size else "",
+                f"{out_arr.std():.1f}" if out_arr.size else "",
+                f"{in_arr.mean():.1f}" if in_arr.size else "",
+                f"{in_arr.std():.1f}" if in_arr.size else "",
+            ])
+
+    # Pretty-print to stdout as well
+    print()
+    print("fig5 mean/std table (tokens per tool call):")
+    header = f"{'tool':<12} {'n':>5} {'out_μ':>9} {'out_σ':>9} {'added_μ':>10} {'added_σ':>10}"
+    print(header)
+    print("-" * len(header))
+    for name in names:
+        out_arr = np.asarray(by_tool_out[name], dtype=float)
+        in_arr = np.asarray(by_tool_in.get(name, []), dtype=float)
+        in_m = f"{in_arr.mean():>10.1f}" if in_arr.size else f"{'-':>10}"
+        in_s = f"{in_arr.std():>10.1f}" if in_arr.size else f"{'-':>10}"
+        print(
+            f"{name:<12} {len(out_arr):>5} {out_arr.mean():>9.1f} "
+            f"{out_arr.std():>9.1f} {in_m} {in_s}"
+        )
+    print(f"  (csv: {csv_path})")
+    return csv_path
 
 
 # ---------- entry point ----------
