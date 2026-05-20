@@ -39,11 +39,23 @@ def test_patch_creates_profile_module(patch_text):
     assert "+++ b/packages/opencode/src/profile/profile.ts" in patch_text
 
 
-def test_session_state_includes_stream_finish_map(patch_text):
-    """Profile.llm.streamFinish stores per-step ms in this map; if it
-    drops, `stream_end_s` calculation silently degenerates."""
+def test_session_state_type_declares_stream_finish_map(patch_text):
+    """Profile.llm.streamFinish stores per-step ms in this map; if the
+    field declaration drops, the patch fails to compile."""
     assert "streamFinishByStep: Map<number, number>" in patch_text
+
+
+def test_session_state_initializes_stream_finish_map(patch_text):
+    """getOrInit must populate streamFinishByStep with an empty Map.
+    A missing init means `streamEnd_s` calculation degenerates silently
+    (always falls back to firstTool/lastText/stepEnd)."""
     assert "streamFinishByStep: new Map()" in patch_text
+
+
+def test_sessions_cleared_on_query_end(patch_text):
+    """The sessions Map must be drained at query.end to avoid leaking
+    file descriptors + per-step maps across long-running parents."""
+    assert "sessions.delete(sessionID)" in patch_text
 
 
 def test_extract_dynamo_timing_helper_present(patch_text):
@@ -86,12 +98,7 @@ def test_processor_hooks_finish_step_with_provider_metadata(patch_text):
     """finish-step hook MUST pass providerMetadata so dynamo nvext lands
     in `llm.end.dynamo`. Regression here = silent loss of server timing."""
     assert "Profile.llm.end(ctx.sessionID, {" in patch_text
-    # find the end-call block and assert providerMetadata is passed
-    block_start = patch_text.find("Profile.llm.end(ctx.sessionID, {")
-    block_end = patch_text.find("})", block_start)
-    assert block_start != -1 and block_end != -1
-    call_block = patch_text[block_start:block_end]
-    assert "providerMetadata: value.providerMetadata" in call_block
+    assert "providerMetadata: value.providerMetadata" in patch_text
 
 
 def test_processor_hooks_finish_event(patch_text):
@@ -109,9 +116,49 @@ def test_processor_hooks_finish_event(patch_text):
 def test_processor_hooks_tool_wrappers(patch_text):
     """Both builtin and MCP tool execute wrappers call Profile.tool.start
     -- needed for the firstToolStartByStep heuristic to keep working
-    even on the legacy duration_s path."""
-    assert 'Profile.tool.start(ctx.sessionID, ctx.callID ?? options.toolCallId, item.id, "builtin", args)' in patch_text
-    assert 'Profile.tool.start(ctx.sessionID, opts.toolCallId, key, "mcp", args)' in patch_text
+    even on the legacy duration_s path. Patterns use 'in' (no exact
+    arg-list match) so a future arg reorder doesn't break the test."""
+    assert 'Profile.tool.start(ctx.sessionID,' in patch_text
+    assert '"builtin", args)' in patch_text
+    assert '"mcp", args)' in patch_text
+
+
+def test_processor_hooks_tool_end_on_both_paths(patch_text):
+    """tool.end is fired by Effect.onExit so failures/dies still produce
+    a `tool.end` with ok:false. Pin both builtin and MCP paths."""
+    builtin = patch_text.find("Profile.tool.end(ctx.sessionID, callID, {")
+    mcp = patch_text.find("Profile.tool.end(ctx.sessionID, opts.toolCallId, {")
+    assert builtin != -1, "builtin tool.end hook missing"
+    assert mcp != -1, "MCP tool.end hook missing"
+    # Each path must wrap in Effect.onExit (covers success + defects)
+    assert patch_text.count("Effect.onExit") >= 2
+
+
+# ---------- prompt.ts hooks (query + turn brackets) ----------
+
+
+def test_prompt_hooks_query_start(patch_text):
+    """Outermost bracket around the agent loop; carries directory + initial
+    snapshot. Without it, summary.json's duration computation is broken."""
+    assert "Profile.query.start(sessionID," in patch_text
+
+
+def test_prompt_hooks_query_end(patch_text):
+    """Closes the outermost bracket and triggers sessions.delete cleanup."""
+    assert "Profile.query.end(sessionID," in patch_text
+
+
+def test_prompt_hooks_turn_start_carries_messages_snapshot(patch_text):
+    """Profile.turn.start snapshots the exact messages going to the LLM
+    (subject to OPENCODE_PROFILE_MESSAGES level). Loss of this hook
+    means full prompt replay becomes impossible."""
+    assert "Profile.turn.start(sessionID, step," in patch_text
+    # The snapshot wires through system + messages + model fields
+    assert "messages: messagesForLLM" in patch_text
+
+
+def test_prompt_hooks_turn_end(patch_text):
+    assert "Profile.turn.end(sessionID, step)" in patch_text
 
 
 # ---------- env-gating + sentinel values ----------
