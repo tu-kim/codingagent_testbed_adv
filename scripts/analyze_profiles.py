@@ -17,6 +17,10 @@ Figures emitted:
   fig5_tool_tokens.pdf           — for each tool call: (left) turn output tokens
                                    that produced the call, (right) input-token
                                    delta added to the next turn by tool results.
+  fig6_turn_decomposition.pdf    — mean turn duration broken into LLM /
+                                   tool / post-overhead segments. Companion
+                                   stats CSV (mean/median/p90/p99 per
+                                   component + average per-turn ratio).
 
 Usage:
   scripts/analyze_profiles.py \\
@@ -90,6 +94,7 @@ class Turn:
     turn_duration_s: float | None = None
     llm_wall_s: float | None = None           # from turn.end
     tool_wall_s: float | None = None           # from turn.end
+    post_overhead_s: float | None = None       # from turn.end (= duration - llm - tool, clamped)
     llm_input_tokens: int | None = None        # from llm.end.tokens
     llm_output_tokens: int | None = None
     llm_cache_read: int = 0
@@ -183,6 +188,7 @@ def load_sessions(path: Path) -> dict[str, Session]:
                     t.turn_duration_s = ev.get("duration_s")
                     t.llm_wall_s = ev.get("llm_wall_s")
                     t.tool_wall_s = ev.get("tool_wall_s")
+                    t.post_overhead_s = ev.get("post_overhead_s")
 
                 elif ev_type == "llm.end":
                     step = ev.get("step")
@@ -772,6 +778,117 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path) -> Path:
     return path
 
 
+def _collect_turn_decomposition(sessions: dict[str, Session]):
+    """Per-turn (session_id, step, duration_s, llm_wall_s, tool_wall_s,
+    post_overhead_s). Skips turns where the three component fields aren't
+    all present (post_overhead_s is reconstructed from the others when
+    only it is missing -- older patches didn't emit it on turn.end)."""
+    rows = []
+    for sid, s in sorted(sessions.items()):
+        for step, t in sorted(s.turns.items()):
+            d, lw, tw = t.turn_duration_s, t.llm_wall_s, t.tool_wall_s
+            if d is None or lw is None or tw is None:
+                continue
+            po = t.post_overhead_s
+            if po is None:
+                po = max(0.0, d - lw - tw)
+            rows.append((sid, step, d, lw, tw, po))
+    return rows
+
+
+def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | None:
+    """Mean/median/p90/p99 stats for turn.end's duration / llm_wall /
+    tool_wall / post_overhead, plus the average per-turn share of duration
+    each component occupies. Emits a small horizontal stacked bar figure
+    + companion CSV + stdout table."""
+    rows = _collect_turn_decomposition(sessions)
+    if not rows:
+        print("\nturn decomposition: no turns with full timing data")
+        return None
+
+    arr = np.array([(d, lw, tw, po) for *_, d, lw, tw, po in rows], dtype=float)
+    dur, llm, tool, post = arr.T
+
+    components = [
+        ("duration_s", dur),
+        ("llm_wall_s", llm),
+        ("tool_wall_s", tool),
+        ("post_overhead_s", post),
+    ]
+    stats = {name: _summary_stats(vals) for name, vals in components}
+
+    # Average per-turn share (NOT total ratio -- that would weight long
+    # turns more). Skip turns with zero duration to avoid div-by-zero.
+    safe = dur > 0
+    if safe.any():
+        ratio_mean = {
+            "llm_wall_s": float((llm[safe] / dur[safe]).mean()),
+            "tool_wall_s": float((tool[safe] / dur[safe]).mean()),
+            "post_overhead_s": float((post[safe] / dur[safe]).mean()),
+        }
+    else:
+        ratio_mean = {"llm_wall_s": 0.0, "tool_wall_s": 0.0, "post_overhead_s": 0.0}
+
+    # ----- stdout pretty table -----
+    print()
+    print(f"Per-turn duration decomposition (n={len(rows)} turns):")
+    hdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
+    print(hdr)
+    print("-" * len(hdr))
+    for name, _ in components:
+        s = stats[name]
+        print(f"{name:<18} {s['mean']:>9.3f} {s['median']:>9.3f} "
+              f"{s['p90']:>9.3f} {s['p99']:>9.3f}")
+    print()
+    print("Average per-turn share of duration:")
+    for name in ("llm_wall_s", "tool_wall_s", "post_overhead_s"):
+        print(f"  {name:<18} {ratio_mean[name]:>7.2%}")
+
+    # ----- CSV -----
+    import csv
+    csv_path = out / "fig6_turn_decomposition_stats.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["component", "n_turns", "mean_s", "median_s", "p90_s", "p99_s"])
+        for name, _ in components:
+            s = stats[name]
+            w.writerow([
+                name, len(rows),
+                f"{s['mean']:.4f}", f"{s['median']:.4f}",
+                f"{s['p90']:.4f}", f"{s['p99']:.4f}",
+            ])
+        f.write("\n# average per-turn share of duration (mean of per-turn ratios)\n")
+        w.writerow(["component", "mean_ratio"])
+        for name in ("llm_wall_s", "tool_wall_s", "post_overhead_s"):
+            w.writerow([name, f"{ratio_mean[name]:.4f}"])
+
+    # ----- figure: horizontal stacked single bar showing mean composition -----
+    fig, ax = plt.subplots(figsize=(3.5, 1.5))
+    pieces = [
+        ("llm_wall",       float(llm.mean()),  "C0"),
+        ("tool_wall",      float(tool.mean()), "C2"),
+        ("post_overhead",  float(post.mean()), "0.6"),
+    ]
+    mean_dur = float(dur.mean()) or 1.0
+    left = 0.0
+    for label, value, color in pieces:
+        ax.barh(0, value, left=left, color=color, edgecolor="black", linewidth=0.5,
+                label=f"{label}: {value:.2f}s ({value/mean_dur:.0%})")
+        left += value
+    ax.set_yticks([])
+    ax.set_xlabel("Mean turn duration (s)")
+    ax.set_xlim(left=0)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.5),
+              ncol=3, frameon=False, fontsize=7, handlelength=1.0,
+              columnspacing=0.8, handletextpad=0.3)
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.45)
+    path = out / "fig6_turn_decomposition.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
 def _write_tool_tokens_table(
     by_tool_out: dict[str, list[int]],
     by_tool_in: dict[str, list[int]],
@@ -864,9 +981,11 @@ def main(argv: list[str] | None = None) -> int:
         plot_ratio_per_turn,
         plot_ratio_per_tool,
         plot_tool_tokens,
+        plot_turn_decomposition,
     ):
         path = fn(sessions, args.output)
-        print(f"  wrote {path}")
+        if path is not None:
+            print(f"  wrote {path}")
 
     return 0
 
