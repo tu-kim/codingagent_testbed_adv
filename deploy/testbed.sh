@@ -171,13 +171,17 @@ spawn_worker() {
   # vLLM tri-state toggles forwarded as paired CLI flags. Null/missing
   # = don't pass either; vLLM v1 default is enable_prefix_caching=True
   # (dynamo/components/src/dynamo/vllm/args.py:225-230).
+  # `// ""` matches the convention used at lines 133 (extra_args) and
+  # 149 (tool_call_parser); `null` and `""` are both unmatched by the
+  # true/false case arms so behavior is identical, but the empty-
+  # string form keeps grep "// \"\"" able to find every fallback.
   local -a prefix_flag=()
-  case "$(cfg_get '.vllm.enable_prefix_caching // null')" in
+  case "$(cfg_get '.vllm.enable_prefix_caching // ""')" in
     true)  prefix_flag=(--enable-prefix-caching) ;;
     false) prefix_flag=(--no-enable-prefix-caching) ;;
   esac
   local -a chunked_flag=()
-  case "$(cfg_get '.vllm.enable_chunked_prefill // null')" in
+  case "$(cfg_get '.vllm.enable_chunked_prefill // ""')" in
     true)  chunked_flag=(--enable-chunked-prefill) ;;
     false) chunked_flag=(--no-enable-chunked-prefill) ;;
   esac
@@ -192,13 +196,16 @@ spawn_worker() {
     sys_env=("DYN_SYSTEM_HOST=0.0.0.0" "DYN_SYSTEM_PORT=$sys_port")
   fi
 
+  # `${arr[@]+"${arr[@]}"}` guards against unbound-array errors when
+  # the array is empty under `set -u` (bash <4.4 quirk; harmless on
+  # newer bash but kept for consistency with the rest of the script).
   spawn "vllm-${name}" \
     "CUDA_VISIBLE_DEVICES=$gpus" \
     "VLLM_NIXL_SIDE_CHANNEL_HOST=$host" \
     "VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port" \
     "NATS_SERVER=$nats_url" \
     "ETCD_ENDPOINTS=$etcd_endpoints" \
-    "${sys_env[@]}" \
+    ${sys_env[@]+"${sys_env[@]}"} \
     -- \
     python -m dynamo.vllm \
       --model "$model_name" \
@@ -212,10 +219,10 @@ spawn_worker() {
       --kv-cache-dtype "$kvdtype" \
       --disaggregation-mode "$disagg_mode" \
       --kv-transfer-config "$kv_cfg" \
-      "${prefix_flag[@]}" \
-      "${chunked_flag[@]}" \
-      "${tool_parser_args[@]}" \
-      "${extra_array[@]}"
+      ${prefix_flag[@]+"${prefix_flag[@]}"} \
+      ${chunked_flag[@]+"${chunked_flag[@]}"} \
+      ${tool_parser_args[@]+"${tool_parser_args[@]}"} \
+      ${extra_array[@]+"${extra_array[@]}"}
 }
 
 # ---------- up verbs ----------
@@ -397,7 +404,7 @@ up_monitor() {
   if [[ -n "${DCGM_BINDINGS_PATH:-}" ]]; then
     dcgm_env+=("DCGM_BINDINGS_PATH=$DCGM_BINDINGS_PATH")
   fi
-  spawn monitor "${dcgm_env[@]}" -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
+  spawn monitor ${dcgm_env[@]+"${dcgm_env[@]}"} -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
     --output "$output" \
     --interval "$interval" \
     --pids-from "$pids_from"
@@ -405,8 +412,11 @@ up_monitor() {
 
 up_scrape_metrics() {
   local interval output py
-  interval=$(cfg_get_env SCRAPE__INTERVAL_S '.monitor.scrape_interval_s // 1.0')
-  output=$(cfg_get_env SCRAPE__OUTPUT '.monitor.scrape_output // "logs/vllm_metrics.ndjson"')
+  # Env names mirror the yaml path so TESTBED__MONITOR__SCRAPE_INTERVAL_S
+  # is consistent with TESTBED__MONITOR__INTERVAL_S / __OUTPUT (same
+  # section prefix, key in snake_case).
+  interval=$(cfg_get_env MONITOR__SCRAPE_INTERVAL_S '.monitor.scrape_interval_s // 1.0')
+  output=$(cfg_get_env MONITOR__SCRAPE_OUTPUT '.monitor.scrape_output // "logs/vllm_metrics.ndjson"')
   [[ "$output" = /* ]] || output="$REPO_ROOT/$output"
   py="${PYTHON:-python3}"
   if ! command -v "$py" >/dev/null 2>&1; then

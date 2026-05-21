@@ -65,6 +65,12 @@ class MonitorCfg(_Strict):
     interval_s: float = 1.0
     output: str = "logs/resource.ndjson"
     pids_from: str = "logs/"
+    # vLLM /metrics scraper (separate component from the DCGM/psutil
+    # sampler above). Keys live under `monitor:` for naming consistency
+    # so all background-sampling knobs share a section; env override
+    # uses TESTBED__MONITOR__SCRAPE_INTERVAL_S etc.
+    scrape_interval_s: float = 1.0
+    scrape_output: str = "logs/vllm_metrics.ndjson"
 
 
 class ModelCfg(_Strict):

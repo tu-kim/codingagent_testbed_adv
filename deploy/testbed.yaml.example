@@ -93,9 +93,14 @@ opencode:
 # joined on `ts`. Set enabled: false to keep it out of `up all`.
 monitor:
   enabled: true
-  interval_s: 1.0                # sampling period in seconds
+  interval_s: 1.0                # DCGM + psutil sampling period
   output: logs/resource.ndjson   # relative to repo root
   # Per-process PID tracking source. Pointed at logs/ so every
   # component spawned by testbed.sh (vllm-*, dynamo-*, opencode) is
   # auto-discovered from its <name>.pid file.
   pids_from: logs/
+  # vLLM /metrics scraper (separate component spawned by `up scrape_metrics`).
+  # Polls each worker's DYN_SYSTEM_PORT-exposed /metrics endpoint and
+  # writes NDJSON. Requires vllm.system_port_base > 0.
+  scrape_interval_s: 1.0
+  scrape_output: logs/vllm_metrics.ndjson

@@ -185,7 +185,7 @@ def _mk_response(text: str):
 
 def test_scrape_one_returns_parsed_metrics_on_200(mod):
     with patch.object(mod.urllib.request, "urlopen",
-                       return_value=_mk_response(SAMPLE_METRICS)):
+                       side_effect=lambda *a, **kw: _mk_response(SAMPLE_METRICS)):
         ok, payload = mod.scrape_one("127.0.0.1", 21000, 2.0,
                                        keep_prefixes=mod.DEFAULT_PREFIXES)
     assert ok is True
@@ -204,6 +204,36 @@ def test_scrape_one_returns_error_on_connection_failure(mod):
     assert "Connection refused" in payload
 
 
+def test_scrape_one_returns_error_on_http_5xx(mod):
+    """HTTPError is a subclass of URLError so the except clause catches
+    it; ensure we surface a meaningful error string instead of the
+    parsed-but-empty-body silent-success path."""
+    import urllib.error
+    def _raise(*a, **kw):
+        raise urllib.error.HTTPError(
+            url="http://127.0.0.1:21000/metrics", code=500,
+            msg="Internal Server Error", hdrs=None, fp=None,
+        )
+    with patch.object(mod.urllib.request, "urlopen", side_effect=_raise):
+        ok, payload = mod.scrape_one("127.0.0.1", 21000, 2.0,
+                                       keep_prefixes=mod.DEFAULT_PREFIXES)
+    assert ok is False
+    assert "HTTPError" in payload
+    assert "500" in payload
+
+
+def test_scrape_one_returns_ok_with_empty_metrics_on_blank_body(mod):
+    """A worker that's up but hasn't observed any requests yet may
+    expose /metrics returning only HELP/TYPE comments (or nothing).
+    Boundary value: ok=True with metrics={}, NOT ok=False."""
+    with patch.object(mod.urllib.request, "urlopen",
+                       side_effect=lambda *a, **kw: _mk_response("")):
+        ok, payload = mod.scrape_one("127.0.0.1", 21000, 2.0,
+                                       keep_prefixes=mod.DEFAULT_PREFIXES)
+    assert ok is True
+    assert payload == {}
+
+
 # ---------- run_scraper end-to-end ----------
 
 
@@ -218,8 +248,11 @@ def test_run_scraper_writes_one_row_per_worker_per_tick(mod, tmp_path):
         state["count"] += 1
         return state["count"] > 2  # 2 ticks
 
+    # `side_effect=lambda ...` builds a fresh FakeResp per call instead
+    # of reusing one instance across all 4 urlopen invocations -- safer
+    # for tests that touch read-once stream-like wrappers.
     with patch.object(mod.urllib.request, "urlopen",
-                       return_value=_mk_response(SAMPLE_METRICS)):
+                       side_effect=lambda *a, **kw: _mk_response(SAMPLE_METRICS)):
         n = mod.run_scraper(workers, 0.0, out_path,
                              mod.DEFAULT_PREFIXES, 2.0, stop)
     assert n == 4  # 2 workers × 2 ticks
