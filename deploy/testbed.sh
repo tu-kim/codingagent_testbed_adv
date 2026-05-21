@@ -326,10 +326,32 @@ up_etcd() {
     --data-dir "$LOG_DIR/etcd-data"
 }
 
+up_monitor() {
+  local enabled interval output pids_from py
+  enabled=$(cfg_get_env MONITOR__ENABLED '.monitor.enabled // true')
+  if [[ "$enabled" != "true" ]]; then
+    echo "monitor: disabled in testbed.yaml, skipping"
+    return 0
+  fi
+  interval=$(cfg_get_env MONITOR__INTERVAL_S '.monitor.interval_s // 1.0')
+  output=$(cfg_get_env MONITOR__OUTPUT '.monitor.output // "logs/resource.ndjson"')
+  pids_from=$(cfg_get_env MONITOR__PIDS_FROM '.monitor.pids_from // "logs/"')
+  # Resolve relative paths against REPO_ROOT so a `monitor:` field
+  # like `logs/resource.ndjson` doesn't fly off into the user's CWD.
+  [[ "$output" = /* ]] || output="$REPO_ROOT/$output"
+  [[ "$pids_from" = /* ]] || pids_from="$REPO_ROOT/$pids_from"
+  py="${PYTHON:-python3}"
+  spawn monitor -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
+    --output "$output" \
+    --interval "$interval" \
+    --pids-from "$pids_from"
+}
+
 up_all() {
   up_workers
   up_frontend
   up_opencode
+  up_monitor
 }
 
 # ---------- down verbs ----------
@@ -354,7 +376,7 @@ down_one() {
       done
       shopt -u nullglob
       ;;
-    nats|etcd)
+    nats|etcd|monitor)
       kill_pgid "$name"
       ;;
     *) echo "down: unknown component $name" >&2; return 2 ;;
@@ -362,6 +384,7 @@ down_one() {
 }
 
 down_all() {
+  down_one monitor
   down_one opencode
   down_one frontend
   down_one workers
@@ -398,8 +421,8 @@ usage() {
   cat <<USAGE
 usage: $0 <verb> [target]
 
-  up [nats|etcd|workers|frontend|opencode|all]   default: all (workers + frontend + opencode)
-  down [nats|etcd|workers|frontend|opencode|all] default: all
+  up [nats|etcd|workers|frontend|opencode|monitor|all]   default: all (workers + frontend + opencode + monitor)
+  down [nats|etcd|workers|frontend|opencode|monitor|all] default: all
   status
   logs <component>
 USAGE
@@ -415,6 +438,7 @@ case "$verb" in
       workers)  up_workers ;;
       frontend) up_frontend ;;
       opencode) up_opencode ;;
+      monitor)  up_monitor ;;
       all)      up_all ;;
       *) echo "up: unknown target $target" >&2; usage; exit 2 ;;
     esac

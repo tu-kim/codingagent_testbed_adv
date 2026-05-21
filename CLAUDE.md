@@ -173,6 +173,12 @@ opencode:
   host: 127.0.0.1
   port: 4096
   experimental_workspaces: true   # → OPENCODE_EXPERIMENTAL_WORKSPACES=true
+
+monitor:                          # DCGM GPU + psutil CPU/process sampler
+  enabled: true                   # included in `up all` when true
+  interval_s: 1.0                 # sampling period
+  output: logs/resource.ndjson    # NDJSON output (`ts` matches profile NDJSON)
+  pids_from: logs/                # per-process tracking via *.pid files
 ```
 
 There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=0.5`, `seed=42`) live in `cli.py`. CLI flag > env override > yaml default.
@@ -198,8 +204,8 @@ Both etcd and NATS are treated as **external prerequisites**. `testbed.sh up etc
 `deploy/testbed.sh` is the only thing you need to remember. It is self-contained — no `_lib.sh`, no Makefile, no docker-compose.
 
 ```
-deploy/testbed.sh up     [nats|etcd|workers|frontend|opencode|all]   # default: all (= workers + frontend + opencode)
-deploy/testbed.sh down   [nats|etcd|workers|frontend|opencode|all]   # default: all
+deploy/testbed.sh up     [nats|etcd|workers|frontend|opencode|monitor|all]   # default: all (= workers + frontend + opencode + monitor)
+deploy/testbed.sh down   [nats|etcd|workers|frontend|opencode|monitor|all]   # default: all
 deploy/testbed.sh status
 deploy/testbed.sh logs   <component>
 ```

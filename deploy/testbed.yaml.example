@@ -75,3 +75,16 @@ opencode:
   host: 127.0.0.1                # → --hostname on `opencode serve`
   port: 4096                     # → --port on `opencode serve`
   experimental_workspaces: true  # → OPENCODE_EXPERIMENTAL_WORKSPACES=true env
+
+# Optional resource monitor (DCGM GPU + psutil CPU/per-process).
+# Brought up by `testbed.sh up monitor` (and by `up all`). Output
+# NDJSON sits alongside profile NDJSON so the two timelines can be
+# joined on `ts`. Set enabled: false to keep it out of `up all`.
+monitor:
+  enabled: true
+  interval_s: 1.0                # sampling period in seconds
+  output: logs/resource.ndjson   # relative to repo root
+  # Per-process PID tracking source. Pointed at logs/ so every
+  # component spawned by testbed.sh (vllm-*, dynamo-*, opencode) is
+  # auto-discovered from its <name>.pid file.
+  pids_from: logs/

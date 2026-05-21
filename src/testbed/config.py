@@ -60,6 +60,13 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class MonitorCfg(_Strict):
+    enabled: bool = True
+    interval_s: float = 1.0
+    output: str = "logs/resource.ndjson"
+    pids_from: str = "logs/"
+
+
 class ModelCfg(_Strict):
     name: str
     served_name: str
@@ -151,6 +158,7 @@ class TestbedCfg(_Strict):
     vllm: VLLMCfg
     dynamo: DynamoCfg = Field(default_factory=DynamoCfg)
     opencode: OpenCodeCfg = Field(default_factory=OpenCodeCfg)
+    monitor: MonitorCfg = Field(default_factory=MonitorCfg)
 
 
 def _walk_set(root: dict[str, Any], path: list[str], value: Any) -> None:
