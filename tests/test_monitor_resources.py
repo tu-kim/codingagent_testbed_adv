@@ -49,6 +49,56 @@ def test_is_dcgm_blank_accepts_normal_values(mod):
         assert not mod._is_dcgm_blank(v)
 
 
+def test_extract_dcgm_value_unwraps_time_series(mod):
+    """`samples.GetLatest()` returns a DcgmFieldValueTimeSeries wrapper
+    (despite the singular name). Without unwrapping, json.dumps blows
+    up at runtime with "Object of type DcgmFieldValueTimeSeries is
+    not JSON serializable" -- pin the unwrap path."""
+
+    class FakeFieldValue:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeTimeSeries:
+        def __init__(self, values):
+            self.values = values  # list of FakeFieldValue
+
+    # Shape 1: TimeSeries with samples → last .value wins
+    ts = FakeTimeSeries([FakeFieldValue(0.85), FakeFieldValue(0.92)])
+    assert mod._extract_dcgm_value(ts) == 0.92
+
+    # Shape 2: singleton FieldValue with .value attribute
+    fv = FakeFieldValue(42)
+    assert mod._extract_dcgm_value(fv) == 42
+
+    # Shape 3: already-scalar
+    assert mod._extract_dcgm_value(3.14) == 3.14
+    assert mod._extract_dcgm_value(7) == 7
+
+    # Empty TimeSeries falls through gracefully (no sample yet)
+    empty = FakeTimeSeries([])
+    assert mod._extract_dcgm_value(empty) is None
+
+    # None propagates as None (caller should skip the field)
+    assert mod._extract_dcgm_value(None) is None
+
+
+def test_to_json_value_coerces_bytes_and_passes_scalars(mod):
+    """Driver-version / model-name fields come back as bytes; need a
+    safe coerce so the whole NDJSON line doesn't crash on str()."""
+    assert mod._to_json_value(None) is None
+    assert mod._to_json_value(42) == 42
+    assert mod._to_json_value(3.14) == 3.14
+    assert mod._to_json_value("ok") == "ok"
+    assert mod._to_json_value(True) is True
+    assert mod._to_json_value(b"driver-535.86") == "driver-535.86"
+
+    class Weird: pass
+    # Unknown types stringify rather than crash json.dumps later
+    out = mod._to_json_value(Weird())
+    assert isinstance(out, str)
+
+
 # ---------- CpuSampler PID discovery ----------
 
 

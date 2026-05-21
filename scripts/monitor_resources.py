@@ -253,15 +253,10 @@ class DcgmSampler:
                 rows.append(entry)
                 continue
             for name, fid in zip(self._field_names, self._field_ids):
-                fv = gpu_data.get(fid)
-                if fv is None:
+                value = _extract_dcgm_value(gpu_data.get(fid))
+                if value is None or _is_dcgm_blank(value):
                     continue
-                value = getattr(fv, "value", fv)
-                # DCGM uses sentinel values for "blank" / "not supported";
-                # filter those so downstream analyzers see real None.
-                if _is_dcgm_blank(value):
-                    continue
-                entry[name] = value
+                entry[name] = _to_json_value(value)
             rows.append(entry)
         return rows
 
@@ -289,6 +284,56 @@ def _is_dcgm_blank(v) -> bool:
     if isinstance(v, float) and (v != v):  # NaN
         return True
     return False
+
+
+def _extract_dcgm_value(fv):
+    """Drill into the wrapper that `samples.GetLatest(...)` returns.
+
+    Despite the name, that API returns a `DcgmFieldValueTimeSeries`
+    (a list of `DcgmFieldValue_v1` records, even when only one sample
+    is buffered) rather than a bare scalar. Touch `.value` directly and
+    json.dumps() blows up with
+        TypeError: Object of type DcgmFieldValueTimeSeries is not JSON serializable
+
+    Defensively support three shapes the DCGM Python bindings have
+    used across versions:
+      1. TimeSeries with `.values` list  → take the last `.value`
+      2. Singleton `DcgmFieldValue_v1`   → take `.value` directly
+      3. Already-unwrapped int/float/str → return as-is
+    """
+    if fv is None:
+        return None
+    # Shape 1: TimeSeries
+    items = getattr(fv, "values", None)
+    if items is not None and not isinstance(items, (int, float, str, bytes)):
+        try:
+            seq = list(items)
+        except TypeError:
+            seq = None
+        if seq:
+            last = seq[-1]
+            return getattr(last, "value", last)
+        # empty series — no sample yet
+        if hasattr(fv, "value"):
+            return fv.value
+        return None
+    # Shape 2: singleton FieldValue
+    if hasattr(fv, "value"):
+        return fv.value
+    # Shape 3: bare value
+    return fv
+
+
+def _to_json_value(v):
+    """Coerce DCGM-returned values to JSON-serializable Python types.
+    Most DCGM fields are int / float. A few (driver_version, model
+    name) come back as bytes -> decode. Unknown objects stringify so
+    one weird field can't crash the whole NDJSON line."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    return str(v)
 
 
 # ---------- CPU + per-process (psutil) ----------
