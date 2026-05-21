@@ -33,7 +33,10 @@ def mod():
 
 
 def test_is_dcgm_blank_recognises_sentinel_ints(mod):
-    for v in (-1, -2, -3, -4, -5, -6, 0x7FFFFFFFFFFFFFFF):
+    # Includes both int64 max (0x7FFFFFFFFFFFFFFF) and DCGM's "blank
+    # float" bit pattern (9223372036854775792). Both are in the
+    # _DCGM_BLANK_VALUES set and must be filtered.
+    for v in (-1, -2, -3, -4, -5, -6, 0x7FFFFFFFFFFFFFFF, 9223372036854775792):
         assert mod._is_dcgm_blank(v), f"{v} should be detected as blank"
 
 
@@ -152,6 +155,55 @@ def test_cpu_sampler_drops_pids_when_file_disappears(mod, tmp_path, monkeypatch)
     pidfile.unlink()  # testbed.sh down frontend would do this
     sample = cpu.sample()
     assert not any(p["name"] == "frontend" for p in sample["processes"])
+
+
+def test_cpu_sampler_replaces_dead_process_when_pidfile_unchanged(mod, tmp_path, monkeypatch):
+    """When a worker crashes but its .pid file still points at the same
+    PID, the sampler's refresh path must detect `is_running()==False`
+    on the existing Process reference and reconstruct a fresh
+    Process(pid) at the next tick -- pin that uncovered branch."""
+    fake_psutil = MagicMock()
+    fake_psutil.cpu_percent.return_value = 0.0
+    fake_psutil.cpu_count.return_value = 4
+    fake_psutil.NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+    fake_psutil.AccessDenied = type("AccessDenied", (Exception,), {})
+
+    constructed_pids: list[int] = []
+
+    class FakeProcess:
+        def __init__(self, pid):
+            constructed_pids.append(pid)
+            self.pid = pid
+
+        # Every existing-instance check returns False -> the refresh
+        # path must always replace the stored Process(123).
+        def is_running(self): return False
+        def cpu_percent(self, interval=None): return 0.0
+
+        def oneshot(self):
+            class _Ctx:
+                def __enter__(self_): return None
+                def __exit__(self_, *a): return False
+            return _Ctx()
+
+        def memory_info(self):
+            m = MagicMock(); m.rss = 0; return m
+
+        def num_threads(self): return 1
+
+    fake_psutil.Process.side_effect = FakeProcess
+    mem = MagicMock(); mem.total = 0; mem.used = 0; mem.available = 0
+    fake_psutil.virtual_memory.return_value = mem
+    monkeypatch.setattr(mod, "_import_psutil", lambda: fake_psutil)
+
+    (tmp_path / "worker.pid").write_text("123\n")
+    cpu = mod.CpuSampler(tmp_path)   # init's _refresh_pids constructs Process(123) #1
+    cpu.sample()                      # sample()'s _refresh_pids: is_running()==False → Process(123) #2
+    cpu.sample()                      # again → Process(123) #3
+    assert constructed_pids.count(123) >= 2, (
+        "stale dead Process should be replaced when .pid file's PID is "
+        f"unchanged but the process is dead; constructed={constructed_pids}"
+    )
 
 
 def test_cpu_sampler_handles_empty_pids_dir(mod, tmp_path, monkeypatch):

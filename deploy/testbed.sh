@@ -327,10 +327,13 @@ up_etcd() {
 }
 
 up_monitor() {
-  local enabled interval output pids_from py
+  local enabled interval output pids_from py lo
   enabled=$(cfg_get_env MONITOR__ENABLED '.monitor.enabled // true')
-  if [[ "$enabled" != "true" ]]; then
-    echo "monitor: disabled in testbed.yaml, skipping"
+  # Match the truthy convention used by OPENCODE_PROFILE elsewhere:
+  # anything except empty / "0" / "false" (case-insensitive) is truthy.
+  lo="${enabled,,}"
+  if [[ -z "$lo" || "$lo" == "0" || "$lo" == "false" ]]; then
+    echo "monitor: disabled in testbed.yaml (enabled=$enabled), skipping"
     return 0
   fi
   interval=$(cfg_get_env MONITOR__INTERVAL_S '.monitor.interval_s // 1.0')
@@ -341,6 +344,14 @@ up_monitor() {
   [[ "$output" = /* ]] || output="$REPO_ROOT/$output"
   [[ "$pids_from" = /* ]] || pids_from="$REPO_ROOT/$pids_from"
   py="${PYTHON:-python3}"
+  if ! command -v "$py" >/dev/null 2>&1; then
+    echo "up monitor: python interpreter '$py' not in PATH" >&2
+    return 1
+  fi
+  if [[ ! -f "$REPO_ROOT/scripts/monitor_resources.py" ]]; then
+    echo "up monitor: $REPO_ROOT/scripts/monitor_resources.py is missing" >&2
+    return 1
+  fi
   spawn monitor -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
     --output "$output" \
     --interval "$interval" \
