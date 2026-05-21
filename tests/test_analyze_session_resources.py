@@ -404,6 +404,63 @@ def test_main_with_testbed_yaml_emits_role_labels(mod, tmp_path, capsys):
     assert "prefill.DCGM_FI_PROF_SM_ACTIVE" in out_text
 
 
+def test_load_all_samples_returns_every_row(mod, tmp_path):
+    """Bypass window filter; pull EVERY parseable sample."""
+    p = tmp_path / "res.ndjson"
+    _write_resources(p, [
+        {"ts":  1.0, "host": {"cpu_util_pct": 10}},
+        {"ts": 50.0, "host": {"cpu_util_pct": 20}},
+        {"ts": 100.0, "host": {"cpu_util_pct": 30}},
+    ])
+    samples = mod.load_all_samples(p)
+    assert [s["host"]["cpu_util_pct"] for s in samples] == [10, 20, 30]
+
+
+def test_main_all_points_mode_when_profile_omitted(mod, tmp_path, capsys):
+    """Omitting --profile triggers all-points mode: aggregate over every
+    sample regardless of session boundaries. session_id label becomes
+    ALL_POINTS in the CSV."""
+    resource = tmp_path / "res.ndjson"
+    _write_resources(resource, [
+        {"ts":  10.0, "host": {"cpu_util_pct": 10}},
+        {"ts":  50.0, "host": {"cpu_util_pct": 20}},
+        {"ts": 100.0, "host": {"cpu_util_pct": 30}},
+        {"ts": 200.0, "host": {"cpu_util_pct": 40}},
+        {"ts": 300.0, "host": {"cpu_util_pct": 50}},
+    ])
+    out = tmp_path / "out"
+    rc = mod.main(["--resource", str(resource), "--output", str(out)])
+    assert rc == 0
+    csv_path = out / "session_resources_stats.csv"
+    text = csv_path.read_text()
+    assert "ALL_POINTS" in text
+    assert "host.cpu_util_pct" in text
+    # window covers full ts range (10 → 300)
+    captured = capsys.readouterr().out
+    assert "all-points mode: 5 samples" in captured
+    # mean of 10/20/30/40/50 = 30
+    # Find the host.cpu_util_pct row
+    for row in csv.DictReader(text.splitlines()):
+        if row["metric"] == "host.cpu_util_pct":
+            assert float(row["mean"]) == pytest.approx(30.0)
+            assert float(row["max"]) == pytest.approx(50.0)
+            assert row["n"] == "5"
+            break
+    else:
+        pytest.fail("host.cpu_util_pct row missing from CSV")
+
+
+def test_main_all_points_returns_nonzero_when_resource_empty(mod, tmp_path, capsys):
+    """All-points mode on an empty resource NDJSON should fail cleanly,
+    not crash on min()/max() of an empty list."""
+    resource = tmp_path / "res.ndjson"
+    resource.write_text("")
+    rc = mod.main(["--resource", str(resource),
+                    "--output", str(tmp_path / "out")])
+    assert rc == 1
+    assert "no resource samples found" in capsys.readouterr().err
+
+
 def test_main_with_multiple_sessions_picks_first_or_explicit(mod, tmp_path, capsys):
     profile = tmp_path / "ses.jsonl"
     # Two sessions: ses_a first, then ses_b

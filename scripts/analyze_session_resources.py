@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""Resource utilization stats for a single agent session.
+"""Resource utilization stats for a single agent session, OR globally
+across all measured samples.
 
-Joins profile NDJSON (per-session opencode events) with resource NDJSON
-(from `monitor_resources.py`) on wall-clock ts to compute mean / median /
-p90 / p99 / max for every metric DURING that session's
-`query.start` → `query.end` window.
+Two modes (selected by whether --profile is passed):
+
+  Session-window mode (--profile <session.jsonl>):
+    Joins profile NDJSON with resource NDJSON on wall-clock ts to
+    compute mean / median / p90 / p99 / max for every metric DURING
+    that session's `query.start` → `query.end` window.
+
+  All-points mode (omit --profile):
+    Aggregate stats across EVERY sample in the resource NDJSON,
+    regardless of session boundaries. Useful for "overall workload
+    average" or steady-state monitoring snapshots that span many
+    sessions / idle gaps.
 
 Optionally reads `deploy/testbed.yaml` to label each GPU as
 prefill/decode/other based on `vllm.prefill_workers[].gpus` and
@@ -12,12 +21,18 @@ prefill/decode/other based on `vllm.prefill_workers[].gpus` and
 (prefill-mean SM_ACTIVE across both GPUs, etc).
 
 Usage:
+  # Session window
   scripts/analyze_session_resources.py \\
       --profile /tmp/testbed-workspaces/profiles/ses_xxx.jsonl \\
       --resource logs/resource.ndjson \\
       --output results/run1/session_xxx_resources \\
       [--session-id ses_xxx] \\
       [--testbed-yaml deploy/testbed.yaml]
+
+  # All measured points (no profile filter)
+  scripts/analyze_session_resources.py \\
+      --resource logs/resource.ndjson \\
+      --output results/run1/global_resources
 
 Outputs:
   session_resources_stats.csv   per-metric stats (mean/median/p90/p99/max)
@@ -74,7 +89,9 @@ def load_session_windows(profile_path: Path) -> dict[str, tuple[float, float]]:
 
 def load_samples_in_window(resource_path: Path, start_ts: float, end_ts: float) -> list[dict]:
     """Stream the resource NDJSON, keeping only samples inside the
-    [start_ts, end_ts] inclusive window."""
+    [start_ts, end_ts] inclusive window. Pass start_ts=-inf, end_ts=+inf
+    to load all samples regardless of ts (used by --no-window /
+    all-points mode)."""
     out = []
     with resource_path.open(encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -91,6 +108,12 @@ def load_samples_in_window(resource_path: Path, start_ts: float, end_ts: float) 
             if start_ts <= ts <= end_ts:
                 out.append(s)
     return out
+
+
+def load_all_samples(resource_path: Path) -> list[dict]:
+    """All samples in the resource NDJSON, no window filter. Skips
+    malformed JSON lines and samples missing `ts`."""
+    return load_samples_in_window(resource_path, float("-inf"), float("inf"))
 
 
 # ---------- testbed.yaml -> GPU role mapping ----------
@@ -276,8 +299,10 @@ def print_table(stats_per_metric: dict[str, dict],
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--profile", required=True, type=Path,
-                    help="Profile NDJSON (single session jsonl)")
+    ap.add_argument("--profile", default=None, type=Path,
+                    help="Profile NDJSON to bound the window to one session's "
+                         "query.start → query.end. Omit to aggregate ALL samples "
+                         "in --resource regardless of session boundaries.")
     ap.add_argument("--resource", required=True, type=Path,
                     help="Resource NDJSON from monitor_resources.py")
     ap.add_argument("--output", required=True, type=Path,
@@ -291,35 +316,50 @@ def main(argv: list[str] | None = None) -> int:
                          "role-aggregated rows")
     args = ap.parse_args(argv)
 
-    for p in (args.profile, args.resource):
-        if not p.exists():
-            print(f"input not found: {p}", file=sys.stderr)
-            return 2
+    if not args.resource.exists():
+        print(f"input not found: {args.resource}", file=sys.stderr)
+        return 2
+    if args.profile is not None and not args.profile.exists():
+        print(f"input not found: {args.profile}", file=sys.stderr)
+        return 2
     args.output.mkdir(parents=True, exist_ok=True)
 
-    windows = load_session_windows(args.profile)
-    if not windows:
-        print("no session windows found in profile NDJSON", file=sys.stderr)
-        return 1
-    if args.session_id:
-        if args.session_id not in windows:
-            print(f"session_id {args.session_id!r} not found in profile "
-                  f"(have {list(windows)})", file=sys.stderr)
+    if args.profile is None:
+        # All-points mode: ignore session boundaries entirely.
+        samples = load_all_samples(args.resource)
+        if not samples:
+            print("no resource samples found", file=sys.stderr)
             return 1
-        session_id = args.session_id
+        ts_values = [s["ts"] for s in samples if isinstance(s.get("ts"), (int, float))]
+        window = (min(ts_values), max(ts_values)) if ts_values else (0.0, 0.0)
+        session_id = "ALL_POINTS"
+        print(f"all-points mode: {len(samples)} samples across "
+              f"{window[1] - window[0]:.2f}s")
     else:
-        session_id = next(iter(windows))
-        if len(windows) > 1:
-            print(f"profile has {len(windows)} sessions; picking {session_id!r}. "
-                  f"Pass --session-id to choose another.", file=sys.stderr)
-    window = windows[session_id]
-
-    samples = load_samples_in_window(args.resource, *window)
-    print(f"window={window[1] - window[0]:.2f}s  matched {len(samples)} resource samples")
-    if not samples:
-        print("no resource samples inside the window; check that monitor was "
-              "running during this session", file=sys.stderr)
-        return 1
+        windows = load_session_windows(args.profile)
+        if not windows:
+            print("no session windows found in profile NDJSON", file=sys.stderr)
+            return 1
+        if args.session_id:
+            if args.session_id not in windows:
+                print(f"session_id {args.session_id!r} not found in profile "
+                      f"(have {list(windows)})", file=sys.stderr)
+                return 1
+            session_id = args.session_id
+        else:
+            session_id = next(iter(windows))
+            if len(windows) > 1:
+                print(f"profile has {len(windows)} sessions; picking "
+                      f"{session_id!r}. Pass --session-id to choose another.",
+                      file=sys.stderr)
+        window = windows[session_id]
+        samples = load_samples_in_window(args.resource, *window)
+        print(f"window={window[1] - window[0]:.2f}s  matched "
+              f"{len(samples)} resource samples")
+        if not samples:
+            print("no resource samples inside the window; check that monitor was "
+                  "running during this session", file=sys.stderr)
+            return 1
 
     gpu_role = parse_gpu_role_map(args.testbed_yaml)
     if gpu_role:
