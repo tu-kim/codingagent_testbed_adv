@@ -352,7 +352,18 @@ up_monitor() {
     echo "up monitor: $REPO_ROOT/scripts/monitor_resources.py is missing" >&2
     return 1
   fi
-  spawn monitor -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
+  # DCGM profiling metrics need root + access to the bindings. Under
+  # `sudo` the user's PYTHONPATH is stripped, so pass DCGM_BINDINGS_PATH
+  # through explicitly if the caller set it (point at the dir that
+  # contains dcgm_fields.py). Common locations:
+  #   /usr/local/dcgm/bindings/python3
+  #   /usr/local/dcgm-4/bindings/python3
+  #   $(dpkg -L datacenter-gpu-manager{,-4} | grep dcgm_fields.py)
+  local dcgm_env=()
+  if [[ -n "${DCGM_BINDINGS_PATH:-}" ]]; then
+    dcgm_env+=("DCGM_BINDINGS_PATH=$DCGM_BINDINGS_PATH")
+  fi
+  spawn monitor "${dcgm_env[@]}" -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
     --output "$output" \
     --interval "$interval" \
     --pids-from "$pids_from"
