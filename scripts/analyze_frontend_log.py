@@ -169,12 +169,14 @@ def parse_frontend_log(path: Path, model_filter: str | None = None) -> list[dict
 # ---------- stats helpers ----------
 
 
-def _stats(values) -> dict[str, float]:
-    """Return mean / median / p90 / p99 of a numeric sequence."""
+def _stats(values) -> dict[str, float | None]:
+    """Return mean / median / p90 / p99 of a numeric sequence.
+    Empty input yields `None` for each stat (CSV writers turn this into
+    an empty cell; previous behavior of returning NaN silently spelled
+    the literal string "nan" into the CSV)."""
     arr = np.asarray([v for v in values if v is not None], dtype=float)
     if arr.size == 0:
-        return {"mean": float("nan"), "median": float("nan"),
-                "p90": float("nan"), "p99": float("nan"), "n": 0}
+        return {"mean": None, "median": None, "p90": None, "p99": None, "n": 0}
     return {
         "mean": float(np.mean(arr)),
         "median": float(np.median(arr)),
@@ -182,6 +184,15 @@ def _stats(values) -> dict[str, float]:
         "p99": float(np.percentile(arr, 99)),
         "n": int(arr.size),
     }
+
+
+def _fmt_stat(v) -> str:
+    """Format a stat value for CSV. Empty string for None / NaN so
+    downstream tools can distinguish 'no data' from a real 0.0."""
+    import math
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return ""
+    return f"{v:.4f}"
 
 
 def _stat_lines(ax, values, *, unit: str = "", fmt: str = ".2f") -> None:
@@ -322,8 +333,8 @@ def write_stats_csv(rows: list[dict], path: Path) -> None:
             s = _stats(vals)
             w.writerow([
                 name, s["n"],
-                f"{s['mean']:.4f}", f"{s['median']:.4f}",
-                f"{s['p90']:.4f}", f"{s['p99']:.4f}",
+                _fmt_stat(s["mean"]), _fmt_stat(s["median"]),
+                _fmt_stat(s["p90"]), _fmt_stat(s["p99"]),
             ])
 
 
@@ -342,10 +353,12 @@ def print_stats_table(rows: list[dict]) -> None:
     hdr = f"{'metric':<20} {'n':>5} {'mean':>11} {'median':>11} {'p90':>11} {'p99':>11}"
     print(hdr)
     print("-" * len(hdr))
+    def _p(v):
+        return f"{v:>11.3f}" if v is not None else f"{'-':>11}"
     for name, vals in columns:
         s = _stats(vals)
-        print(f"{name:<20} {s['n']:>5} {s['mean']:>11.3f} {s['median']:>11.3f} "
-              f"{s['p90']:>11.3f} {s['p99']:>11.3f}")
+        print(f"{name:<20} {s['n']:>5} {_p(s['mean'])} {_p(s['median'])} "
+              f"{_p(s['p90'])} {_p(s['p99'])}")
 
 
 # ---------- main ----------

@@ -1,8 +1,9 @@
 """Tests for scripts/analyze_frontend_log.py.
 
-Pure parsing logic + ANSI stripping. No matplotlib rendering exercised
-(plot functions are import-only validated; the rendering itself is
-trivial wrapping around the parsed rows).
+Parsing logic + ANSI stripping + CSV serialization. `main` is
+exercised end-to-end, which DOES render matplotlib figures to PDF
+under tmp_path -- warnings about missing Times fonts are acceptable
+on systems without a serif font installed.
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ def test_parse_ignores_non_request_lines(mod, tmp_path):
 
 def test_parse_strips_ansi_from_actual_raw_line(mod, tmp_path):
     """Round-trip the production format: with embedded SGR codes the
-    parser still recovers all fields."""
+    parser still recovers all fields, INCLUDING derived ones."""
     ansi_line = (
         "\x1b[2m2026-05-21T03:56:01Z\x1b[0m \x1b[32m INFO\x1b[0m "
         "\x1b[1mhttp-request\x1b[0m: dynamo_llm::http::service::metrics: "
@@ -109,10 +110,15 @@ def test_parse_strips_ansi_from_actual_raw_line(mod, tmp_path):
     log.write_text(ansi_line + "\n")
     rows = mod.parse_frontend_log(log)
     assert len(rows) == 1
-    assert rows[0]["elapsed_ms"] == 297.0
-    assert rows[0]["input_tokens"] == 1187
-    assert rows[0]["output_tokens"] == 13
-    assert rows[0]["ttft_ms"] == pytest.approx(187.48)
+    r = rows[0]
+    assert r["elapsed_ms"] == 297.0
+    assert r["input_tokens"] == 1187
+    assert r["output_tokens"] == 13
+    assert r["ttft_ms"] == pytest.approx(187.48)
+    # Derived fields must compute correctly through the ANSI strip path.
+    assert r["decode_ms"] == pytest.approx(109.52)
+    assert r["itl_ms_per_token"] == pytest.approx(109.52 / 13)
+    assert r["isl_osl_ratio"] == pytest.approx(1187 / 13)
 
 
 def test_parse_filters_by_model(mod, tmp_path):
@@ -126,6 +132,22 @@ def test_parse_filters_by_model(mod, tmp_path):
     rows = mod.parse_frontend_log(log, model_filter="qwen3-coder-30b-a3b-instruct-fp8")
     assert len(rows) == 1
     assert rows[0]["model"] == "qwen3-coder-30b-a3b-instruct-fp8"
+
+
+def test_parse_returns_all_models_when_filter_is_none(mod, tmp_path):
+    """No --model flag → both models survive. Guards against a
+    regression where the filter accidentally rejects None case."""
+    other = SAMPLE_LINE.replace(
+        'model="qwen3-coder-30b-a3b-instruct-fp8"', 'model="some-other-model"'
+    ).replace(
+        "model=qwen3-coder-30b-a3b-instruct-fp8 ", "model=some-other-model "
+    )
+    log = tmp_path / "frontend.log"
+    log.write_text(SAMPLE_LINE + "\n" + other + "\n")
+    rows = mod.parse_frontend_log(log, model_filter=None)
+    assert len(rows) == 2
+    models = {r["model"] for r in rows}
+    assert models == {"qwen3-coder-30b-a3b-instruct-fp8", "some-other-model"}
 
 
 def test_parse_handles_missing_ttft_gracefully(mod, tmp_path):
@@ -217,6 +239,35 @@ def test_write_requests_csv_has_expected_columns(mod, tmp_path):
     assert row["isl_osl_ratio"].startswith("91.3")
 
 
+def test_stats_returns_none_for_empty_input(mod):
+    """Empty / all-None input must NOT produce float('nan') — that
+    silently spells "nan" into the CSV. Use None as 'no data' sentinel
+    so _fmt_stat can map to an empty cell."""
+    s = mod._stats([])
+    assert s["n"] == 0
+    for k in ("mean", "median", "p90", "p99"):
+        assert s[k] is None, f"_stats('empty')[{k!r}] should be None, got {s[k]}"
+
+
+def test_write_stats_csv_empty_rows_writes_empty_cells_not_nan(mod, tmp_path):
+    """Regression guard: when no rows are present, summary_stats.csv
+    must NOT contain the literal string 'nan' (which is what
+    f"{float('nan'):.4f}" produces and which silently breaks
+    downstream tools that read the CSV as floats)."""
+    csv_path = tmp_path / "summary_stats.csv"
+    mod.write_stats_csv([], csv_path)
+    text = csv_path.read_text()
+    assert "nan" not in text.lower(), (
+        f"summary_stats.csv contains literal 'nan' on empty input:\n{text}"
+    )
+    # Every metric row should have n=0 with empty value cells.
+    lines = text.splitlines()
+    assert lines[0] == "metric,n,mean,median,p90,p99"
+    for line in lines[1:]:
+        parts = line.split(",")
+        assert parts[1] == "0", f"expected n=0, got {line!r}"
+
+
 def test_write_stats_csv_lists_all_metrics(mod, tmp_path):
     rows = [{
         "model": "m", "status": "success",
@@ -231,6 +282,18 @@ def test_write_stats_csv_lists_all_metrics(mod, tmp_path):
     for metric in ("elapsed_ms", "ttft_ms", "decode_ms", "itl_ms_per_token",
                    "input_tokens", "output_tokens", "isl_osl_ratio"):
         assert metric in text
+
+
+def test_main_returns_nonzero_on_empty_log(mod, tmp_path, capsys):
+    """Documented contract: empty / all-non-request input → rc=1 +
+    nothing-to-plot message to stderr."""
+    log = tmp_path / "frontend.log"
+    log.write_text("2026-05-21T03:50:31Z  INFO main: startup\n")  # no request_completed
+    out = tmp_path / "figs"
+    rc = mod.main(["--input", str(log), "--output", str(out)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "nothing to plot" in err
 
 
 def test_main_end_to_end(mod, tmp_path, capsys):
