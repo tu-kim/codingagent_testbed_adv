@@ -158,8 +158,39 @@ spawn_worker() {
 
   local nixl_port=$((nixl_base + rank * 100))
 
+  # DYN_SYSTEM_PORT exposes per-worker Prometheus /metrics + /health
+  # via dynamo's system status server (lib/runtime/src/system_status_server.rs).
+  # Worker rank N → port = base + N (DCGM-style; collisions if base+N
+  # overlaps another listener). Set system_port_base <= 0 to disable.
+  local sys_port_base sys_port=-1
+  sys_port_base=$(cfg_get '.vllm.system_port_base // -1')
+  if [[ "$sys_port_base" -gt 0 ]]; then
+    sys_port=$((sys_port_base + rank))
+  fi
+
+  # vLLM tri-state toggles forwarded as paired CLI flags. Null/missing
+  # = don't pass either; vLLM v1 default is enable_prefix_caching=True
+  # (dynamo/components/src/dynamo/vllm/args.py:225-230).
+  local -a prefix_flag=()
+  case "$(cfg_get '.vllm.enable_prefix_caching // null')" in
+    true)  prefix_flag=(--enable-prefix-caching) ;;
+    false) prefix_flag=(--no-enable-prefix-caching) ;;
+  esac
+  local -a chunked_flag=()
+  case "$(cfg_get '.vllm.enable_chunked_prefill // null')" in
+    true)  chunked_flag=(--enable-chunked-prefill) ;;
+    false) chunked_flag=(--no-enable-chunked-prefill) ;;
+  esac
+
   # shellcheck disable=SC2206  # word splitting is intended for extra_args
   local extra_array=($extra_args)
+
+  local -a sys_env=()
+  if [[ "$sys_port" -gt 0 ]]; then
+    # Bind to 0.0.0.0 so scrape_vllm_metrics.py can hit it from the
+    # host running the testbed driver (typically same node anyway).
+    sys_env=("DYN_SYSTEM_HOST=0.0.0.0" "DYN_SYSTEM_PORT=$sys_port")
+  fi
 
   spawn "vllm-${name}" \
     "CUDA_VISIBLE_DEVICES=$gpus" \
@@ -167,6 +198,7 @@ spawn_worker() {
     "VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port" \
     "NATS_SERVER=$nats_url" \
     "ETCD_ENDPOINTS=$etcd_endpoints" \
+    "${sys_env[@]}" \
     -- \
     python -m dynamo.vllm \
       --model "$model_name" \
@@ -180,6 +212,8 @@ spawn_worker() {
       --kv-cache-dtype "$kvdtype" \
       --disaggregation-mode "$disagg_mode" \
       --kv-transfer-config "$kv_cfg" \
+      "${prefix_flag[@]}" \
+      "${chunked_flag[@]}" \
       "${tool_parser_args[@]}" \
       "${extra_array[@]}"
 }
@@ -369,11 +403,32 @@ up_monitor() {
     --pids-from "$pids_from"
 }
 
+up_scrape_metrics() {
+  local interval output py
+  interval=$(cfg_get_env SCRAPE__INTERVAL_S '.monitor.scrape_interval_s // 1.0')
+  output=$(cfg_get_env SCRAPE__OUTPUT '.monitor.scrape_output // "logs/vllm_metrics.ndjson"')
+  [[ "$output" = /* ]] || output="$REPO_ROOT/$output"
+  py="${PYTHON:-python3}"
+  if ! command -v "$py" >/dev/null 2>&1; then
+    echo "up scrape_metrics: python interpreter '$py' not in PATH" >&2
+    return 1
+  fi
+  if [[ ! -f "$REPO_ROOT/scripts/scrape_vllm_metrics.py" ]]; then
+    echo "up scrape_metrics: $REPO_ROOT/scripts/scrape_vllm_metrics.py is missing" >&2
+    return 1
+  fi
+  spawn scrape_metrics -- "$py" "$REPO_ROOT/scripts/scrape_vllm_metrics.py" \
+    --testbed-yaml "$CFG" \
+    --output "$output" \
+    --interval "$interval"
+}
+
 up_all() {
   up_workers
   up_frontend
   up_opencode
   up_monitor
+  up_scrape_metrics
 }
 
 # ---------- down verbs ----------
@@ -398,7 +453,7 @@ down_one() {
       done
       shopt -u nullglob
       ;;
-    nats|etcd|monitor)
+    nats|etcd|monitor|scrape_metrics)
       kill_pgid "$name"
       ;;
     *) echo "down: unknown component $name" >&2; return 2 ;;
@@ -406,6 +461,7 @@ down_one() {
 }
 
 down_all() {
+  down_one scrape_metrics
   down_one monitor
   down_one opencode
   down_one frontend
@@ -443,8 +499,8 @@ usage() {
   cat <<USAGE
 usage: $0 <verb> [target]
 
-  up [nats|etcd|workers|frontend|opencode|monitor|all]   default: all (workers + frontend + opencode + monitor)
-  down [nats|etcd|workers|frontend|opencode|monitor|all] default: all
+  up [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all]   default: all (workers + frontend + opencode + monitor + scrape_metrics)
+  down [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all] default: all
   status
   logs <component>
 USAGE
@@ -461,6 +517,7 @@ case "$verb" in
       frontend) up_frontend ;;
       opencode) up_opencode ;;
       monitor)  up_monitor ;;
+      scrape_metrics) up_scrape_metrics ;;
       all)      up_all ;;
       *) echo "up: unknown target $target" >&2; usage; exit 2 ;;
     esac

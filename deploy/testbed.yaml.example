@@ -23,6 +23,17 @@ model:
 vllm:
   kv_connector: NixlConnector    # vLLM KV-transfer connector class name
   nixl_port_base: 6000           # rank N → VLLM_NIXL_SIDE_CHANNEL_PORT = base + N*100
+  # Each worker exposes Prometheus /metrics + /health when DYN_SYSTEM_PORT
+  # is positive. We give each worker rank a unique port = base + rank,
+  # so curl http://<worker.host>:21000/metrics works for rank 0, 21001 for rank 1, ...
+  # Set to -1 to keep the system server disabled.
+  system_port_base: 21000
+  # vLLM optimization toggles forwarded as --enable-X / --no-enable-X to
+  # `dynamo.vllm`. Tri-state: null/omitted → don't pass the flag (vLLM
+  # default kicks in, currently `enable_prefix_caching=True` on v1);
+  # true → --enable-X; false → --no-enable-X.
+  enable_prefix_caching: null
+  enable_chunked_prefill: null
 
   # Dynamo's Rust-side tool-call parser. Applied ONLY to decode workers via
   # `--dyn-tool-call-parser <name>` (dynamo/components/src/dynamo/vllm/main.py:647-650

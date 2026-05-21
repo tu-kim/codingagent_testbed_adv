@@ -116,11 +116,23 @@ class VLLMRoleCfg(_Strict):
 class VLLMCfg(_Strict):
     kv_connector: str = "NixlConnector"
     nixl_port_base: int = 6000
+    # Each vllm worker can expose its DCGM-style dynamo system status
+    # server (/metrics + /health) at host:port. Set positive to enable;
+    # per-worker port = system_port_base + rank. -1 disables.
+    system_port_base: int = 21000
     # Empty string => do not pass --dyn-tool-call-parser (decode worker runs
     # without server-side parsing; agent will receive raw text). Per
     # dynamo/components/src/dynamo/vllm/main.py:647-650 this is applied to
     # decode workers only; prefill workers always skip.
     tool_call_parser: ToolCallParser | Literal[""] = "qwen3_coder"
+    # Tri-state vLLM toggles forwarded as paired flags
+    # (--enable-prefix-caching / --no-enable-prefix-caching). None →
+    # don't pass either flag (vLLM v1 default = True for prefix
+    # caching). True / False → pass the corresponding flag explicitly.
+    # Matters for SWE-bench reproducibility because prefix caching
+    # leaks information between samples sharing prompt prefixes.
+    enable_prefix_caching: bool | None = None
+    enable_chunked_prefill: bool | None = None
     prefill_workers: list[WorkerCfg]
     decode_workers: list[WorkerCfg]
     prefill: VLLMRoleCfg
