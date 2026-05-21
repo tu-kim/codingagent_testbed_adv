@@ -116,17 +116,25 @@ def _dcgm_candidate_paths() -> list[str]:
         # tarball install (NVIDIA's standalone .deb extracts here)
         "/opt/dcgm/bindings/python3",
         "/opt/dcgm/bindings/python",
-        # debian/ubuntu apt layout (older)
+        # debian/ubuntu apt layout — `datacenter-gpu-manager-N` package
+        # places bindings under /usr/share/<pkgname>/bindings/python3
+        # and adds a .pth so user-mode python finds them automatically;
+        # under sudo the .pth often isn't picked up (different
+        # site-packages or different python binary), so we list the
+        # known suffixes explicitly.
         "/usr/share/datacenter-gpu-manager/bindings/python3",
+        "/usr/share/datacenter-gpu-manager-4/bindings/python3",
+        "/usr/share/datacenter-gpu-manager-3/bindings/python3",
         # pip-installed user wheel locations are already on sys.path
     ]
-    # Glob for any /usr/local/dcgm-* / /opt/dcgm-* version-suffixed dirs
-    for parent in ("/usr/local", "/opt"):
+    # Glob for any version-suffixed dirs we missed under common parents.
+    for parent in ("/usr/local", "/opt", "/usr/share"):
         try:
-            for entry in Path(parent).glob("dcgm*"):
-                p = entry / "bindings" / "python3"
-                if p.is_dir():
-                    candidates.append(str(p))
+            for pattern in ("dcgm*", "datacenter-gpu-manager*"):
+                for entry in Path(parent).glob(pattern):
+                    p = entry / "bindings" / "python3"
+                    if p.is_dir():
+                        candidates.append(str(p))
         except OSError:
             continue
     return candidates
