@@ -77,6 +77,22 @@ def test_load_session_windows_falls_back_to_last_ts_when_query_end_missing(mod, 
 # ---------- window filtering ----------
 
 
+def test_load_samples_skips_broken_json_lines(mod, tmp_path):
+    """monitor_resources writes via appendFileSync which CAN produce
+    a partial last line if the process is SIGKILL'd. The analyzer
+    must skip malformed lines rather than crash."""
+    p = tmp_path / "res.ndjson"
+    p.write_text(
+        json.dumps({"ts": 110.0, "host": {"cpu_util_pct": 25}}) + "\n"
+        + "this is not json\n"                                                 # malformed
+        + '{"ts": 120.0, "host": {"cpu_util_pct": 35}\n'                       # missing closing brace
+        + json.dumps({"ts": 130.0, "host": {"cpu_util_pct": 45}}) + "\n"
+    )
+    samples = mod.load_samples_in_window(p, 100.0, 200.0)
+    cpus = [s["host"]["cpu_util_pct"] for s in samples]
+    assert cpus == [25, 45]   # two malformed lines skipped silently
+
+
 def test_load_samples_filters_to_window(mod, tmp_path):
     p = tmp_path / "res.ndjson"
     _write_resources(p, [
@@ -116,6 +132,23 @@ def test_parse_gpu_role_map_from_yaml(mod, tmp_path):
 def test_parse_gpu_role_map_returns_empty_when_missing(mod, tmp_path):
     assert mod.parse_gpu_role_map(None) == {}
     assert mod.parse_gpu_role_map(tmp_path / "does-not-exist.yaml") == {}
+
+
+def test_parse_gpu_role_map_handles_empty_vllm_section(mod, tmp_path):
+    """testbed.yaml may exist but have no vllm.{prefill,decode}_workers
+    keys (e.g. a partial config or a model-only yaml). Must return {}
+    without KeyError."""
+    pytest.importorskip("yaml")
+    cases = [
+        "vllm: {}\n",                       # vllm exists but empty
+        "model: { name: x, served_name: y }\n",   # no vllm key at all
+        "vllm:\n  prefill_workers: []\n",   # empty list explicitly
+        "vllm:\n  decode_workers:\n",       # null value
+    ]
+    for i, content in enumerate(cases):
+        p = tmp_path / f"empty_{i}.yaml"
+        p.write_text(content)
+        assert mod.parse_gpu_role_map(p) == {}, f"case {i}: {content!r}"
 
 
 # ---------- metric extraction ----------
@@ -189,6 +222,42 @@ def test_extract_metrics_role_aggregate_when_role_map_present(mod):
     # role aggregate = mean across GPUs in that role
     assert metrics["prefill.DCGM_FI_PROF_SM_ACTIVE"] == [0.5]   # mean(0.4, 0.6)
     assert metrics["decode.DCGM_FI_PROF_SM_ACTIVE"] == [0.9]    # mean(0.8, 1.0)
+
+
+def test_extract_metrics_role_aggregate_across_multiple_samples(mod):
+    """Per-sample mean → one entry per sample in the role aggregate
+    list. p90/p99 at the role level should reflect the SAMPLE-level
+    distribution, not a flattened pool of (n_gpus × n_samples)."""
+    samples = [
+        {"ts": 1.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_SM_ACTIVE": 0.4},
+            {"index": 1, "DCGM_FI_PROF_SM_ACTIVE": 0.6},   # prefill mean = 0.5
+        ]},
+        {"ts": 2.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_SM_ACTIVE": 0.6},
+            {"index": 1, "DCGM_FI_PROF_SM_ACTIVE": 0.8},   # prefill mean = 0.7
+        ]},
+        {"ts": 3.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_SM_ACTIVE": 0.8},
+            {"index": 1, "DCGM_FI_PROF_SM_ACTIVE": 1.0},   # prefill mean = 0.9
+        ]},
+    ]
+    gpu_role = {0: ("p0", "prefill"), 1: ("p0", "prefill")}
+    metrics = mod.extract_metrics(samples, gpu_role=gpu_role)
+    assert metrics["prefill.DCGM_FI_PROF_SM_ACTIVE"] == [0.5, 0.7, 0.9]
+    # per-GPU lists still have one value per sample
+    assert metrics["gpu0[p0/prefill].DCGM_FI_PROF_SM_ACTIVE"] == [0.4, 0.6, 0.8]
+    assert metrics["gpu1[p0/prefill].DCGM_FI_PROF_SM_ACTIVE"] == [0.6, 0.8, 1.0]
+
+
+def test_extract_metrics_handles_empty_processes_list(mod):
+    """Sample without `processes` (e.g. CPU sampler off) must not emit
+    spurious `process.*` keys."""
+    samples = [{"ts": 1.0, "host": {"cpu_util_pct": 20.0}, "gpus": [], "processes": []}]
+    metrics = mod.extract_metrics(samples)
+    assert metrics["host.cpu_util_pct"] == [20.0]
+    assert not any(k.startswith("process.") for k in metrics)
+    assert not any(k.startswith("gpu") for k in metrics)
 
 
 def test_extract_metrics_skips_non_numeric_fields(mod):
@@ -284,6 +353,55 @@ def test_main_returns_nonzero_when_no_samples_in_window(mod, tmp_path, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "no resource samples inside the window" in err
+
+
+def test_main_with_testbed_yaml_emits_role_labels(mod, tmp_path, capsys):
+    """End-to-end wire-up of --testbed-yaml: per-GPU rows get the
+    [<worker>/<role>] suffix and role-aggregate rows (prefill.*,
+    decode.*) appear in the CSV + stdout table."""
+    pytest.importorskip("yaml")
+    profile = tmp_path / "ses.jsonl"
+    _write_profile(profile, session_id="ses_x", start=10.0, end=30.0)
+    resource = tmp_path / "res.ndjson"
+    _write_resources(resource, [
+        {"ts": 15.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_SM_ACTIVE": 0.4},
+            {"index": 1, "DCGM_FI_PROF_SM_ACTIVE": 0.6},
+            {"index": 2, "DCGM_FI_PROF_SM_ACTIVE": 0.8},
+            {"index": 3, "DCGM_FI_PROF_SM_ACTIVE": 1.0},
+        ]},
+        {"ts": 25.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_SM_ACTIVE": 0.5},
+            {"index": 1, "DCGM_FI_PROF_SM_ACTIVE": 0.7},
+            {"index": 2, "DCGM_FI_PROF_SM_ACTIVE": 0.9},
+            {"index": 3, "DCGM_FI_PROF_SM_ACTIVE": 0.9},
+        ]},
+    ])
+    yaml_path = tmp_path / "testbed.yaml"
+    yaml_path.write_text(
+        "vllm:\n"
+        "  prefill_workers:\n"
+        '    - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1 }\n'
+        "  decode_workers:\n"
+        '    - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1 }\n'
+    )
+    out = tmp_path / "out"
+    rc = mod.main(["--profile", str(profile),
+                    "--resource", str(resource),
+                    "--output", str(out),
+                    "--testbed-yaml", str(yaml_path)])
+    assert rc == 0
+    csv_path = out / "session_resources_stats.csv"
+    text = csv_path.read_text()
+    # role-labeled per-GPU rows
+    assert "gpu0[p0/prefill].DCGM_FI_PROF_SM_ACTIVE" in text
+    assert "gpu2[d0/decode].DCGM_FI_PROF_SM_ACTIVE" in text
+    # role-aggregate rows
+    assert "prefill.DCGM_FI_PROF_SM_ACTIVE" in text
+    assert "decode.DCGM_FI_PROF_SM_ACTIVE" in text
+    # stdout also surfaces them
+    out_text = capsys.readouterr().out
+    assert "prefill.DCGM_FI_PROF_SM_ACTIVE" in out_text
 
 
 def test_main_with_multiple_sessions_picks_first_or_explicit(mod, tmp_path, capsys):
