@@ -94,27 +94,82 @@ DEFAULT_DCGM_FIELDS = [
 ]
 
 
-def _import_dcgm():
-    """Import NVIDIA's bundled DCGM Python bindings. They ship under
-    /usr/local/dcgm/bindings/python3 on apt installs and aren't on
-    sys.path by default."""
-    candidate_paths = [
+def _dcgm_candidate_paths() -> list[str]:
+    """Where to look for NVIDIA's DCGM Python bindings.
+
+    Honors `DCGM_BINDINGS_PATH` env override first (colon-separated),
+    then walks a list of known apt / tarball install layouts. The
+    actual import (`import dcgm_fields`) does the final check; we
+    only nudge sys.path here so the bindings become findable when
+    they exist outside the default Python search path.
+    """
+    candidates: list[str] = []
+    env_override = os.environ.get("DCGM_BINDINGS_PATH", "")
+    if env_override:
+        candidates.extend(p for p in env_override.split(":") if p)
+    candidates += [
         "/usr/local/dcgm/bindings/python3",
         "/usr/local/dcgm/bindings/python",
+        # version-suffixed (datacenter-gpu-manager-4 etc)
+        "/usr/local/dcgm-4/bindings/python3",
+        "/usr/local/dcgm-3/bindings/python3",
+        # tarball install (NVIDIA's standalone .deb extracts here)
+        "/opt/dcgm/bindings/python3",
+        "/opt/dcgm/bindings/python",
+        # debian/ubuntu apt layout (older)
+        "/usr/share/datacenter-gpu-manager/bindings/python3",
+        # pip-installed user wheel locations are already on sys.path
     ]
-    for p in candidate_paths:
-        if Path(p).is_dir() and p not in sys.path:
-            sys.path.insert(0, p)
+    # Glob for any /usr/local/dcgm-* / /opt/dcgm-* version-suffixed dirs
+    for parent in ("/usr/local", "/opt"):
+        try:
+            for entry in Path(parent).glob("dcgm*"):
+                p = entry / "bindings" / "python3"
+                if p.is_dir():
+                    candidates.append(str(p))
+        except OSError:
+            continue
+    return candidates
+
+
+def _import_dcgm():
+    """Import NVIDIA's DCGM Python bindings. Tries pip-installed first
+    (no path mangling), then a list of known apt/tarball locations,
+    then `DCGM_BINDINGS_PATH` env. Raises SystemExit with diagnostic
+    info if nothing works."""
+    # 1) pip-installed path -- already on sys.path
     try:
-        import dcgm_fields
+        import dcgm_fields  # noqa: F401
         import dcgm_structs
         import pydcgm
+        return dcgm_structs, dcgm_fields, pydcgm
+    except ImportError:
+        pass
+
+    # 2) inject known apt/tarball paths
+    tried_paths: list[str] = []
+    for p in _dcgm_candidate_paths():
+        if not Path(p).is_dir():
+            continue
+        tried_paths.append(p)
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    try:
+        import dcgm_fields  # noqa: F811
+        import dcgm_structs  # noqa: F811
+        import pydcgm  # noqa: F811
     except ImportError as e:
         raise SystemExit(
             f"DCGM Python bindings not found: {e}\n"
-            "Install with `apt-get install datacenter-gpu-manager` and "
-            "ensure /usr/local/dcgm/bindings/python3 exists (or pass "
-            "--no-gpu to skip GPU sampling)."
+            f"Searched the following directories (existed but didn't yield "
+            f"importable bindings):\n  "
+            + ("\n  ".join(tried_paths) if tried_paths else "(none)")
+            + "\n\nInstall DCGM with `sudo apt install datacenter-gpu-manager` "
+            "(or `-4` for newer). If DCGM is installed in a non-standard "
+            "location, set DCGM_BINDINGS_PATH=<dir containing dcgm_fields.py>. "
+            "Locate manually:\n"
+            "  dpkg -L datacenter-gpu-manager | grep python\n"
+            "  sudo find /usr /opt -name 'dcgm_fields.py'\n"
         )
     return dcgm_structs, dcgm_fields, pydcgm
 
