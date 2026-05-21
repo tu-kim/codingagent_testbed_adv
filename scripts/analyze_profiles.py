@@ -40,7 +40,8 @@ Figures emitted:
 Usage:
   scripts/analyze_profiles.py \\
       --input results/run1/profiles.jsonl \\
-      --output results/run1/figures
+      --output results/run1/figures \\
+      [--exclude-tools task]   # drop tools from per-tool plots (fig2/4/5)
 """
 
 from __future__ import annotations
@@ -252,13 +253,15 @@ def load_sessions(path: Path) -> dict[str, Session]:
 # ---------- metric helpers ----------
 
 
-def per_tool_duration_stats(sessions: dict[str, Session]):
+def per_tool_duration_stats(sessions: dict[str, Session],
+                             exclude: set[str] | None = None):
     """{tool_name: (mean_s, std_s, n)}"""
+    excl = exclude or set()
     bucket: dict[str, list[float]] = defaultdict(list)
     for s in sessions.values():
         for t in s.turns.values():
             for tc in t.tools:
-                if tc.ok:
+                if tc.ok and tc.name not in excl:
                     bucket[tc.name].append(tc.duration_s)
     return {
         name: (float(np.mean(v)), float(np.std(v)), len(v))
@@ -283,8 +286,10 @@ def turn_ratio_rows(sessions: dict[str, Session]):
     return out
 
 
-def per_tool_ratio_rows(sessions: dict[str, Session]):
+def per_tool_ratio_rows(sessions: dict[str, Session],
+                          exclude: set[str] | None = None):
     """Per-tool-call rows for fig4 CSV: (session_id, step, tool, ratio)."""
+    excl = exclude or set()
     out = []
     for sid, s in sorted(sessions.items()):
         for step, t in sorted(s.turns.items()):
@@ -292,14 +297,16 @@ def per_tool_ratio_rows(sessions: dict[str, Session]):
             if llm is None or llm <= 0:
                 continue
             for tc in t.tools:
-                if tc.ok:
+                if tc.ok and tc.name not in excl:
                     out.append((sid, step, tc.name, tc.duration_s / llm))
     return out
 
 
-def per_tool_ratio_distribution(sessions: dict[str, Session]) -> dict[str, list[float]]:
+def per_tool_ratio_distribution(sessions: dict[str, Session],
+                                 exclude: set[str] | None = None) -> dict[str, list[float]]:
     """For each tool call: tool.duration_s / corresponding turn's llm wall.
     Grouped by tool name."""
+    excl = exclude or set()
     bucket: dict[str, list[float]] = defaultdict(list)
     for s in sessions.values():
         for t in s.turns.values():
@@ -307,12 +314,13 @@ def per_tool_ratio_distribution(sessions: dict[str, Session]) -> dict[str, list[
             if llm is None or llm <= 0:
                 continue
             for tc in t.tools:
-                if tc.ok:
+                if tc.ok and tc.name not in excl:
                     bucket[tc.name].append(tc.duration_s / llm)
     return bucket
 
 
-def tool_token_pairs(sessions: dict[str, Session]):
+def tool_token_pairs(sessions: dict[str, Session],
+                       exclude: set[str] | None = None):
     """Yields (tool_name, turn_output_tokens, next_turn_input_added).
 
     `next_turn_input_added` = next_turn's effective input − this_turn's
@@ -321,6 +329,7 @@ def tool_token_pairs(sessions: dict[str, Session]):
     multiple tool calls we attribute the SAME delta to each (caller
     decides how to handle).
     """
+    excl = exclude or set()
     out = []
     for s in sessions.values():
         sorted_steps = sorted(s.turns.keys())
@@ -336,12 +345,26 @@ def tool_token_pairs(sessions: dict[str, Session]):
                 added = next_t.llm_effective_input - t.llm_effective_input - t.llm_output_tokens
                 added = max(0, added)  # clamp (next turn may have compacted)
             for tc in t.tools:
-                if tc.ok:
+                if tc.ok and tc.name not in excl:
                     out.append((tc.name, t.llm_output_tokens, added))
     return out
 
 
 # ---------- plotting ----------
+
+
+def _annotate_exclusion(ax, exclude_tools) -> None:
+    """Print a tiny `(excl: <names>)` note in the upper-right corner of
+    a plot when the underlying data filtered some tools out. Keeps the
+    reader from mistaking a reduced bar set for missing data."""
+    if not exclude_tools:
+        return
+    label = "(excl: " + ", ".join(sorted(exclude_tools)) + ")"
+    ax.text(
+        0.99, 0.99, label,
+        transform=ax.transAxes, ha="right", va="top", fontsize=6.0,
+        color="0.35",
+    )
 
 
 def _summary_stats(values) -> dict[str, float]:
@@ -514,8 +537,9 @@ def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
     return path
 
 
-def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
-    stats = per_tool_duration_stats(sessions)
+def plot_tool_exec_time(sessions: dict[str, Session], out: Path,
+                          exclude_tools: set[str] | None = None) -> Path:
+    stats = per_tool_duration_stats(sessions, exclude=exclude_tools)
     fig, ax = plt.subplots(figsize=(3.4, 2.4))
     if not stats:
         ax.text(0.5, 0.5, "no successful tool calls",
@@ -545,6 +569,7 @@ def plot_tool_exec_time(sessions: dict[str, Session], out: Path) -> Path:
         ax.invert_yaxis()
         ax.set_xlabel("Execution time (s)")
         ax.set_xlim(left=0)
+        _annotate_exclusion(ax, exclude_tools)
     fig.tight_layout()
     path = out / "fig2_tool_exec_time.pdf"
     fig.savefig(path)
@@ -642,8 +667,9 @@ def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
     return path
 
 
-def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
-    by_tool = per_tool_ratio_distribution(sessions)
+def plot_ratio_per_tool(sessions: dict[str, Session], out: Path,
+                          exclude_tools: set[str] | None = None) -> Path:
+    by_tool = per_tool_ratio_distribution(sessions, exclude=exclude_tools)
     if not by_tool:
         fig, ax = plt.subplots(figsize=(3.5, 2.5))
         ax.text(0.5, 0.5, "no tool/llm pairs",
@@ -680,6 +706,7 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
         ax.set_ylabel("Tool duration / Turn LLM wall")
         ax.axhline(1.0, color="0.7", linestyle=":", linewidth=0.6)
         ax.set_ylim(bottom=0)
+        _annotate_exclusion(ax, exclude_tools)
         fig.tight_layout()
         fig.subplots_adjust(left=0.18)
     else:
@@ -705,6 +732,7 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
             ax.set_ylabel("Tool duration / Turn LLM wall")
             ax.axhline(1.0, color="0.7", linestyle=":", linewidth=0.6)
             ax.set_ylim(bottom=0)
+            _annotate_exclusion(ax, exclude_tools)
             fig.tight_layout()
             fig.subplots_adjust(left=0.18)
         else:
@@ -719,6 +747,7 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
             ax_hi.tick_params(axis="x", bottom=False, labelbottom=False)
             ax_lo.axhline(1.0, color="0.7", linestyle=":", linewidth=0.6)
             _draw_break_marks(ax_lo, ax_hi, orient="y")
+            _annotate_exclusion(ax_hi, exclude_tools)
             # Shared y-label centered across both subplots.
             fig.text(0.02, 0.5, "Tool duration / Turn LLM wall",
                      ha="center", va="center", rotation="vertical", fontsize=9)
@@ -729,7 +758,7 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
     plt.close(fig)
     # Companion CSV: per-tool-call ratios (no aggregated stats here --
     # the boxplot already shows per-tool distribution shape).
-    rows = per_tool_ratio_rows(sessions)
+    rows = per_tool_ratio_rows(sessions, exclude=exclude_tools)
     _write_csv_with_stats(
         out / "fig4_tool_llm_ratio_tool.csv",
         header=["session_id", "step", "tool", "ratio"],
@@ -740,8 +769,9 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path) -> Path:
     return path
 
 
-def plot_tool_tokens(sessions: dict[str, Session], out: Path) -> Path:
-    pairs = tool_token_pairs(sessions)
+def plot_tool_tokens(sessions: dict[str, Session], out: Path,
+                       exclude_tools: set[str] | None = None) -> Path:
+    pairs = tool_token_pairs(sessions, exclude=exclude_tools)
     fig, axes = plt.subplots(1, 2, figsize=(6.6, 2.4), sharey=False)
     ax_out, ax_in = axes
     by_tool_out: dict[str, list[int]] = defaultdict(list)
@@ -782,6 +812,7 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path) -> Path:
         _box(ax_in, by_tool_in, "Next-turn input added (tokens)")
         ax_out.set_title("(a) Generating turn", fontsize=9)
         ax_in.set_title("(b) Tool-result payload", fontsize=9)
+        _annotate_exclusion(ax_out, exclude_tools)
 
     fig.tight_layout()
     path = out / "fig5_tool_tokens.pdf"
@@ -970,9 +1001,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--output", required=True, type=Path,
-        help="Directory to write fig{1..5}_*.pdf into (created if missing)",
+        help="Directory to write fig{1..6}_*.pdf into (created if missing)",
+    )
+    ap.add_argument(
+        "--exclude-tools", nargs="*", default=[], metavar="NAME",
+        help="Exclude these tool names from per-tool analyses (fig2 / fig4 / fig5). "
+             "Common use: `--exclude-tools task` to drop the sub-agent tool whose "
+             "duration is a full nested agent loop, not a leaf-tool call. Note: "
+             "fig3 / fig6 use turn.end's pre-aggregated tool_wall_s so they are "
+             "unaffected by this flag.",
     )
     args = ap.parse_args(argv)
+    exclude_tools = set(args.exclude_tools)
 
     if not args.input.exists():
         print(f"input not found: {args.input}", file=sys.stderr)
@@ -990,15 +1030,14 @@ def main(argv: list[str] | None = None) -> int:
 
     plt.rcParams.update(PAPER_STYLE)
 
-    for fn in (
-        plot_session_e2e,
-        plot_tool_exec_time,
-        plot_ratio_per_turn,
-        plot_ratio_per_tool,
-        plot_tool_tokens,
-        plot_turn_decomposition,
-    ):
-        path = fn(sessions, args.output)
+    # Plots that accept the per-tool exclusion vs those that don't.
+    per_tool_plots = (plot_tool_exec_time, plot_ratio_per_tool, plot_tool_tokens)
+    other_plots = (plot_session_e2e, plot_ratio_per_turn, plot_turn_decomposition)
+    for fn in (*other_plots, *per_tool_plots):
+        if fn in per_tool_plots:
+            path = fn(sessions, args.output, exclude_tools=exclude_tools)
+        else:
+            path = fn(sessions, args.output)
         if path is not None:
             print(f"  wrote {path}")
 
