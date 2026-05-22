@@ -18,11 +18,11 @@
   },
   "model": "{{PROVIDER_ID}}/{{MODEL_SERVED_NAME}}",
   "agent": {
-    "build":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}} },
-    "plan":       { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}} },
-    "general":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}} },
-    "title":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}} },
-    "summary":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}} },
-    "compaction": { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}} }
+    "build":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "{{PROVIDER_ID}}": { "seed": {{SEED}} } } },
+    "plan":       { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "{{PROVIDER_ID}}": { "seed": {{SEED}} } } },
+    "general":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "{{PROVIDER_ID}}": { "seed": {{SEED}} } } },
+    "title":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "{{PROVIDER_ID}}": { "seed": {{SEED}} } } },
+    "summary":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "{{PROVIDER_ID}}": { "seed": {{SEED}} } } },
+    "compaction": { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "{{PROVIDER_ID}}": { "seed": {{SEED}} } } }
   }
 }

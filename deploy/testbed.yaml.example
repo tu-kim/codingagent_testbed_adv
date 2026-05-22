@@ -9,16 +9,16 @@ model:
   name: qwen3-coder-30b-a3b      # HF id or local path; default
   served_name: local             # OpenCode provider model id used in opencode.json
   # Sampling overrides for ALL primary agents (build / plan / general /
-  # title / summary / compaction). Set temperature=0 + top_p=1.0 for
-  # greedy decoding -- the practical baseline for reproducible runs.
-  # Note: opencode/AI SDK forwards these to dynamo; vLLM treats temp=0
-  # as greedy. Cross-run determinism still depends on stable batch
-  # composition / KV-cache hits / worker placement (router_mode +
-  # PD-disag).  See ProviderTransform.temperature() in opencode's
-  # provider/transform.ts for the per-model defaults (qwen→0.55) that
-  # this override replaces.
+  # title / summary / compaction). temperature=0 + top_p=1.0 = greedy.
+  # `seed` is added to the OpenAI-compat request body via opencode's
+  # providerOptions, ending up in vLLM's SamplingParams.seed
+  # (dynamo/components/src/dynamo/vllm/handlers.py:411 maps it). With
+  # temp=0, greedy ignores seed for token selection, but it still
+  # pins any tie-breaking RNG draws in the sampler. See `vllm.seed`
+  # below for the ENGINE-level seed (scheduler tie-breaking etc).
   temperature: 0.0
   top_p: 1.0
+  seed: 42
 
 vllm:
   kv_connector: NixlConnector    # vLLM KV-transfer connector class name
@@ -30,10 +30,28 @@ vllm:
   system_port_base: 21000
   # vLLM optimization toggles forwarded as --enable-X / --no-enable-X to
   # `dynamo.vllm`. Tri-state: null/omitted → don't pass the flag (vLLM
-  # default kicks in, currently `enable_prefix_caching=True` on v1);
+  # default kicks in, currently enable_prefix_caching=True on v1);
   # true → --enable-X; false → --no-enable-X.
+  #
+  # Defaults stay null so vLLM throughput optimizations remain on.
+  # In practice, prefix caching / chunked prefill / continuous batching
+  # introduce only epsilon-level floating-point variance which almost
+  # never flips greedy argmax for typical SWE-bench text. If you
+  # observe output divergence with seed pinned, flip these to false
+  # one at a time and bisect.
   enable_prefix_caching: null
   enable_chunked_prefill: null
+  # Engine-level vLLM seed (--seed N). Pinning this ensures the
+  # scheduler / sampler RNG starts identically across runs so any
+  # tie-break draws (rare with temp=0 greedy but they exist) land the
+  # same. Cheap determinism with zero throughput cost.
+  seed: 42
+  # The two flags below default to null = keep vLLM defaults. Flip to
+  # true ONLY if seed alone doesn't give stable argmax:
+  #   enforce_eager: true disables CUDA graph capture (~5-15% slower).
+  #   disable_custom_all_reduce: true on TP>1 forces NCCL reductions.
+  enforce_eager: null
+  disable_custom_all_reduce: null
 
   # Dynamo's Rust-side tool-call parser. Applied ONLY to decode workers via
   # `--dyn-tool-call-parser <name>` (dynamo/components/src/dynamo/vllm/main.py:647-650

@@ -29,6 +29,7 @@ def _render(
     provider_id: str = "dynamo",
     temperature: str = "0.0",
     top_p: str = "1.0",
+    seed: str = "42",
 ) -> dict:
     """Mirror testbed.sh's sed substitution and parse the result."""
     text = _TMPL.read_text()
@@ -38,6 +39,7 @@ def _render(
     text = text.replace("{{PROVIDER_ID}}", provider_id)
     text = text.replace("{{TEMPERATURE}}", temperature)
     text = text.replace("{{TOP_P}}", top_p)
+    text = text.replace("{{SEED}}", seed)
     return json.loads(text)
 
 
@@ -102,6 +104,28 @@ def test_rendered_template_overrides_sampling_on_all_primary_agents():
         a = cfg["agent"][name]
         assert a["temperature"] == 0.0, f"agent.{name}.temperature != 0"
         assert a["top_p"] == 1.0, f"agent.{name}.top_p != 1"
+
+
+def test_rendered_template_pins_seed_under_provider_options():
+    """Per-request sampling seed must land under
+    options.<provider_id> so the openai-compatible AI SDK adapter
+    forwards it as the OpenAI `seed` field. opencode's
+    ProviderTransform.providerOptions splits providerID on '.' to
+    derive the key, so providerID 'dynamo' maps to options.dynamo.
+    Without this, the seed is silently dropped and runs differ."""
+    cfg = _render(provider_id="dynamo", seed="42")
+    for name in ("build", "plan", "general", "title", "summary", "compaction"):
+        opts = cfg["agent"][name].get("options", {})
+        assert "dynamo" in opts, f"agent.{name}.options.dynamo missing"
+        assert opts["dynamo"]["seed"] == 42
+
+
+def test_rendered_template_seed_substitutes_per_provider():
+    """{{PROVIDER_ID}} appears INSIDE the agent.options block as the
+    nested key, so changing the provider id must move the seed to
+    the matching namespace."""
+    cfg = _render(provider_id="someprov", seed="7")
+    assert cfg["agent"]["build"]["options"]["someprov"]["seed"] == 7
 
 
 def test_rendered_template_accepts_nonzero_sampling():
@@ -191,6 +215,7 @@ def test_substitution_is_idempotent_across_runs(tmp_path: Path):
             "-e", "s|{{PROVIDER_ID}}|dynamo|g",
             "-e", "s|{{TEMPERATURE}}|0.0|g",
             "-e", "s|{{TOP_P}}|1.0|g",
+            "-e", "s|{{SEED}}|42|g",
             str(_TMPL),
         ],
         check=True, capture_output=True, text=True,
@@ -204,6 +229,7 @@ def test_substitution_is_idempotent_across_runs(tmp_path: Path):
             "-e", "s|{{PROVIDER_ID}}|dynamo|g",
             "-e", "s|{{TEMPERATURE}}|0.0|g",
             "-e", "s|{{TOP_P}}|1.0|g",
+            "-e", "s|{{SEED}}|42|g",
             str(_TMPL),
         ],
         check=True, capture_output=True, text=True,

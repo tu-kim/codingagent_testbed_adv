@@ -83,6 +83,10 @@ class ModelCfg(_Strict):
     # which is 0.55 for any qwen model -- making runs non-reproducible.
     temperature: float = 0.0
     top_p: float = 1.0
+    # Per-request seed (OpenAI-compat body "seed" field). With temp=0
+    # greedy decoding the seed only affects tie-breaks in the sampler,
+    # but it's free determinism so we pin it.
+    seed: int = 42
 
 
 class WorkerCfg(_Strict):
@@ -137,8 +141,19 @@ class VLLMCfg(_Strict):
     # caching). True / False → pass the corresponding flag explicitly.
     # Matters for SWE-bench reproducibility because prefix caching
     # leaks information between samples sharing prompt prefixes.
+    # Defaults stay None so vLLM throughput optimizations remain on.
+    # Prefix caching / chunked prefill / continuous batching introduce
+    # only epsilon-level FP variance which seldom flips greedy argmax;
+    # flip to False explicitly if output reproducibility breaks.
     enable_prefix_caching: bool | None = None
     enable_chunked_prefill: bool | None = None
+    # Engine-level vLLM seed (--seed N) is the cheap-determinism win
+    # that pins scheduler/sampler RNG across runs. enforce_eager and
+    # disable_custom_all_reduce default to None (vLLM defaults) because
+    # they hurt throughput; flip to True if seed alone doesn't suffice.
+    seed: int = 42
+    enforce_eager: bool | None = None
+    disable_custom_all_reduce: bool | None = None
     prefill_workers: list[WorkerCfg]
     decode_workers: list[WorkerCfg]
     prefill: VLLMRoleCfg

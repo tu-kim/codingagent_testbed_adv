@@ -185,6 +185,22 @@ spawn_worker() {
     true)  chunked_flag=(--enable-chunked-prefill) ;;
     false) chunked_flag=(--no-enable-chunked-prefill) ;;
   esac
+  # Reproducibility knobs forwarded to AsyncEngineArgs.add_cli_args
+  # (dynamo/components/src/dynamo/vllm/args.py:93).
+  local seed
+  seed=$(cfg_get_env VLLM__SEED '.vllm.seed // 42')
+  local -a eager_flag=()
+  case "$(cfg_get '.vllm.enforce_eager // ""')" in
+    true)  eager_flag=(--enforce-eager) ;;
+    false) eager_flag=(--no-enforce-eager) ;;
+  esac
+  local -a dcar_flag=()
+  case "$(cfg_get '.vllm.disable_custom_all_reduce // ""')" in
+    true)  dcar_flag=(--disable-custom-all-reduce) ;;
+    # vLLM's flag is `--disable-custom-all-reduce` (boolean store_true);
+    # there's no `--no-` partner. Skip the flag to keep custom all-reduce
+    # enabled (vLLM default).
+  esac
 
   # shellcheck disable=SC2206  # word splitting is intended for extra_args
   local extra_array=($extra_args)
@@ -219,8 +235,11 @@ spawn_worker() {
       --kv-cache-dtype "$kvdtype" \
       --disaggregation-mode "$disagg_mode" \
       --kv-transfer-config "$kv_cfg" \
+      --seed "$seed" \
       ${prefix_flag[@]+"${prefix_flag[@]}"} \
       ${chunked_flag[@]+"${chunked_flag[@]}"} \
+      ${eager_flag[@]+"${eager_flag[@]}"} \
+      ${dcar_flag[@]+"${dcar_flag[@]}"} \
       ${tool_parser_args[@]+"${tool_parser_args[@]}"} \
       ${extra_array[@]+"${extra_array[@]}"}
 }
@@ -281,6 +300,8 @@ render_opencode_config() {
   # opencode.json becomes invalid (`"temperature": null`).
   temperature=$(cfg_get_env MODEL__TEMPERATURE '.model.temperature // 0.0')
   top_p=$(cfg_get_env MODEL__TOP_P '.model.top_p // 1.0')
+  local model_seed
+  model_seed=$(cfg_get_env MODEL__SEED '.model.seed // 42')
   provider_id=dynamo
 
   sed \
@@ -290,6 +311,7 @@ render_opencode_config() {
     -e "s|{{PROVIDER_ID}}|${provider_id}|g" \
     -e "s|{{TEMPERATURE}}|${temperature}|g" \
     -e "s|{{TOP_P}}|${top_p}|g" \
+    -e "s|{{SEED}}|${model_seed}|g" \
     "$tmpl" > "$oc_cfg"
   echo "rendered $oc_cfg"
 }
@@ -434,11 +456,13 @@ up_scrape_metrics() {
 }
 
 up_all() {
+  # Core inference stack only. `monitor` (DCGM/psutil sampler) and
+  # `scrape_metrics` (vLLM /metrics poller) are opt-in -- bring them
+  # up explicitly with `testbed.sh up monitor` / `up scrape_metrics`
+  # before a run you want resource data for.
   up_workers
   up_frontend
   up_opencode
-  up_monitor
-  up_scrape_metrics
 }
 
 # ---------- down verbs ----------
@@ -509,8 +533,8 @@ usage() {
   cat <<USAGE
 usage: $0 <verb> [target]
 
-  up [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all]   default: all (workers + frontend + opencode + monitor + scrape_metrics)
-  down [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all] default: all
+  up [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all]   default: all (= workers + frontend + opencode; monitor/scrape_metrics are opt-in)
+  down [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all] default: all (stops EVERY component including monitor/scrape_metrics)
   status
   logs <component>
 USAGE
