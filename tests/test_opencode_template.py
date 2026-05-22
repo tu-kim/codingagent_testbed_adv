@@ -106,26 +106,27 @@ def test_rendered_template_overrides_sampling_on_all_primary_agents():
         assert a["top_p"] == 1.0, f"agent.{name}.top_p != 1"
 
 
-def test_rendered_template_pins_seed_under_provider_options():
-    """Per-request sampling seed must land under
-    options.<provider_id> so the openai-compatible AI SDK adapter
-    forwards it as the OpenAI `seed` field. opencode's
-    ProviderTransform.providerOptions splits providerID on '.' to
-    derive the key, so providerID 'dynamo' maps to options.dynamo.
-    Without this, the seed is silently dropped and runs differ."""
-    cfg = _render(provider_id="dynamo", seed="42")
+def test_rendered_template_pins_seed_as_flat_option():
+    """Agent options must be FLAT (just `{seed: N}`). opencode's
+    ProviderTransform.providerOptions(model, options) wraps the dict
+    under the provider key automatically (`{ [providerID]: options }`,
+    see provider/transform.ts:1186), so pre-nesting under the
+    provider name produces a double-wrap that makes vLLM reject the
+    request body with 400 (seen in live testing 2026-05-22)."""
+    cfg = _render(seed="42")
     for name in ("build", "plan", "general", "title", "summary", "compaction"):
         opts = cfg["agent"][name].get("options", {})
-        assert "dynamo" in opts, f"agent.{name}.options.dynamo missing"
-        assert opts["dynamo"]["seed"] == 42
+        assert opts == {"seed": 42}, (
+            f"agent.{name}.options must be flat {{seed: 42}} (no provider "
+            f"key wrap; ProviderTransform handles wrapping), got {opts!r}"
+        )
 
 
-def test_rendered_template_seed_substitutes_per_provider():
-    """{{PROVIDER_ID}} appears INSIDE the agent.options block as the
-    nested key, so changing the provider id must move the seed to
-    the matching namespace."""
-    cfg = _render(provider_id="someprov", seed="7")
-    assert cfg["agent"]["build"]["options"]["someprov"]["seed"] == 7
+def test_rendered_template_seed_value_substitutes():
+    cfg = _render(seed="7")
+    assert cfg["agent"]["build"]["options"]["seed"] == 7
+    cfg = _render(seed="12345")
+    assert cfg["agent"]["title"]["options"]["seed"] == 12345
 
 
 def test_rendered_template_accepts_nonzero_sampling():
