@@ -44,28 +44,47 @@ def _env_truthy(v: str | None) -> bool:
     return v.lower() not in ("0", "false")
 
 
-async def _pre_clone(repo: str, base_commit: str, dest: Path) -> None:
-    """git clone <repo> <dest> && git -C <dest> checkout <base_commit>. Fail-fast."""
+async def _run_git(args: list[str]) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)} failed: {stderr.decode().strip()}")
+
+
+async def _pre_clone(repo: str, base_commit: str, dest: Path,
+                     *, reset: bool = False) -> None:
+    """git clone <repo> <dest> && checkout <base_commit>. Fail-fast.
+
+    With reset=True, an existing valid checkout is wiped back to
+    base_commit (git reset --hard + git clean -fdx) instead of being
+    reused as-is. Required for reproducible-workspace mode where the
+    same instance_id maps to the same dir across runs -- otherwise
+    artifacts from the previous agent loop (modified files, .opencode/
+    state, etc.) leak into the next run and divergence cascades.
+
+    With reset=False (legacy), an existing dest is reused untouched."""
     if dest.exists():
-        # Reuse pre-existing dir if a previous run left it. The OpenCode workspace
-        # mode tolerates an existing directory under the configured workspace root.
-        return
+        if not reset:
+            return
+        if (dest / ".git").is_dir():
+            # Fast reset path: keep the .git pack, just rewind working tree.
+            await _run_git(["git", "-C", str(dest), "reset", "--hard", "--quiet", base_commit])
+            # -fdx removes untracked + ignored (e.g. .opencode/ working files,
+            # test runner caches). Same final state as a fresh clone+checkout
+            # of base_commit, without the network round trip.
+            await _run_git(["git", "-C", str(dest), "clean", "-fdxq"])
+            return
+        # Existed but not a usable git repo (interrupted clone, leftover
+        # junk). Nuke and re-clone -- the alternative (silently using a
+        # garbage dir) would just bury the failure deeper in the agent loop.
+        import shutil
+        shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     url = f"https://github.com/{repo}.git"
-    proc = await asyncio.create_subprocess_exec(
-        "git", "clone", "--quiet", url, str(dest),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"git clone {url} -> {dest} failed: {stderr.decode().strip()}")
-    proc = await asyncio.create_subprocess_exec(
-        "git", "-C", str(dest), "checkout", "--quiet", base_commit,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"git checkout {base_commit} in {dest} failed: {stderr.decode().strip()}")
+    await _run_git(["git", "clone", "--quiet", url, str(dest)])
+    await _run_git(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
 
 
 async def _run_one(
@@ -75,9 +94,18 @@ async def _run_one(
     workspace_root: Path,
     sem: asyncio.Semaphore,
     task_timeout_s: float | None = None,
+    reset_workspace: bool = False,
 ) -> TaskRecord:
     instance_id = sample["instance_id"]
-    directory = f"session-{instance_id}-{uuid.uuid4().hex[:8]}"
+    # reset_workspace=True: drop the uuid suffix so the same instance_id
+    # always lands at the same absolute path. Combined with _pre_clone's
+    # reset, this makes opencode's system prompt -- which embeds the
+    # working directory -- byte-identical across reruns of the same
+    # sample (key prerequisite for agent-loop reproducibility).
+    if reset_workspace:
+        directory = f"session-{instance_id}"
+    else:
+        directory = f"session-{instance_id}-{uuid.uuid4().hex[:8]}"
     dest = workspace_root / directory
     # OpenCode's InstanceMiddleware resolves `?directory=` via `path.resolve()`
     # against its own CWD (opencode/packages/opencode/src/server/routes/instance/middleware.ts).
@@ -88,7 +116,8 @@ async def _run_one(
     async with sem:
         # Stage 1: clone.
         try:
-            await _pre_clone(sample["repo"], sample["base_commit"], dest)
+            await _pre_clone(sample["repo"], sample["base_commit"], dest,
+                             reset=reset_workspace)
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,
@@ -216,6 +245,7 @@ async def run(
     out_dir: Path,
     router_label: str,
     task_timeout_s: float | None = None,
+    reset_workspace: bool = False,
 ) -> None:
     """Drive `num_samples` SWE-bench tasks at `qps` Poisson rate."""
     samples = swebench.load_samples(split, seed, num_samples)
@@ -244,6 +274,7 @@ async def run(
         "seed": seed,
         "max_in_flight": max_in_flight,
         "task_timeout_s": task_timeout_s,
+        "reset_workspace": reset_workspace,
         "router": router_label,
         "model": cfg.model.model_dump(mode="json"),
         "config": resolved_snapshot(cfg),
@@ -271,6 +302,7 @@ async def run(
                             workspace_root,
                             sem,
                             task_timeout_s=task_timeout_s,
+                            reset_workspace=reset_workspace,
                         )
                     )
                 )

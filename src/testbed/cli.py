@@ -39,6 +39,21 @@ def main() -> None:
     ),
 )
 @click.option("--router", default="", show_default=True, help="Recorded into config.json only.")
+@click.option(
+    "--reset-workspace",
+    is_flag=True,
+    default=False,
+    help=(
+        "Use a deterministic per-instance_id workspace dir "
+        "(session-<instance_id>, no uuid suffix) and wipe it back to "
+        "base_commit (git reset --hard + git clean -fdx) before each "
+        "task. Makes the absolute workspace path stable across reruns "
+        "of the same sample -- required for reproducible system prompts "
+        "in opencode (which embeds the cwd). Default off preserves the "
+        "legacy UUID-suffix + accumulate behavior. For full agent-loop "
+        "reproducibility pair with --max-in-flight 1."
+    ),
+)
 @click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
 def run_cmd(
@@ -49,6 +64,7 @@ def run_cmd(
     max_in_flight: int,
     task_timeout_s: float,
     router: str,
+    reset_workspace: bool,
     out: Path,
     config_path: Path | None,
 ) -> None:
@@ -65,6 +81,7 @@ def run_cmd(
             out_dir=out,
             router_label=router,
             task_timeout_s=task_timeout_s if task_timeout_s > 0 else None,
+            reset_workspace=reset_workspace,
         )
     )
 
@@ -74,8 +91,12 @@ def run_cmd(
 @click.option("--seed", default=42, show_default=True, type=int)
 @click.option("--task-timeout-s", default=600.0, show_default=True, type=float,
               help="Per-task wall-clock cap; <=0 disables.")
+@click.option("--reset-workspace", is_flag=True, default=False,
+              help="Same semantics as `run --reset-workspace` -- deterministic "
+                   "dir name + reset to base_commit before the task.")
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
-def smoke_cmd(split: str, seed: int, task_timeout_s: float, config_path: Path | None) -> None:
+def smoke_cmd(split: str, seed: int, task_timeout_s: float,
+              reset_workspace: bool, config_path: Path | None) -> None:
     """Run a single end-to-end task and print the resulting TaskRecord."""
     cfg = config_mod.load(config_path)
     sample = swebench.load_samples(split, seed, 1)[0]
@@ -90,6 +111,7 @@ def smoke_cmd(split: str, seed: int, task_timeout_s: float, config_path: Path | 
             rec = await runner_mod._run_one(
                 client, sample, 0.0, workspace_root, sem,
                 task_timeout_s=timeout,
+                reset_workspace=reset_workspace,
             )
             click.echo(json.dumps(asdict(rec), indent=2))
 

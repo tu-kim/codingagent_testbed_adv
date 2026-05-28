@@ -62,7 +62,7 @@ _SAMPLE = {
 
 @pytest.fixture(autouse=True)
 def _stub_pre_clone(monkeypatch):
-    async def _ok(repo: str, base_commit: str, dest: Path) -> None:
+    async def _ok(repo: str, base_commit: str, dest: Path, *, reset: bool = False) -> None:
         return None
 
     monkeypatch.setattr(runner, "_pre_clone", _ok)
@@ -91,8 +91,54 @@ async def test_happy_path_records_success_and_messages(tmp_path: Path):
     assert client.list_calls[0][1] == sent
 
 
+async def test_reset_workspace_strips_uuid_suffix_from_directory(tmp_path: Path):
+    """With reset_workspace=True, the workspace dir name is
+    `session-<instance_id>` (no uuid). Same sample run twice produces
+    the SAME absolute path -- the load-bearing property for
+    reproducible system prompts (opencode embeds cwd into the prompt
+    so a different path -> different first token -> divergent agent
+    loop)."""
+    client = _FakeClient()
+    sem = asyncio.Semaphore(1)
+    rec1 = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, reset_workspace=True)
+    rec2 = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, reset_workspace=True)
+    # No uuid8 suffix appended:
+    assert rec1.directory == "session-django__django-1"
+    # And it's stable across two invocations (the whole point).
+    assert rec1.directory == rec2.directory
+
+
+async def test_reset_workspace_default_keeps_uuid_suffix(tmp_path: Path):
+    """Backward compat: reset_workspace defaults to False, dir name
+    keeps the uuid8 suffix so concurrent runs of the same instance_id
+    don't collide on disk."""
+    client = _FakeClient()
+    sem = asyncio.Semaphore(1)
+    rec1 = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem)
+    rec2 = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem)
+    assert rec1.directory != rec2.directory
+    # Each has the legacy `session-<id>-<8hex>` shape.
+    assert rec1.directory.startswith("session-django__django-1-")
+    assert rec1.directory.split("-")[-1] != rec2.directory.split("-")[-1]
+
+
+async def test_reset_workspace_forwards_reset_kwarg_to_pre_clone(monkeypatch, tmp_path: Path):
+    """The flag has to actually flow to _pre_clone(reset=True) -- otherwise
+    the dir name is stable but the workspace state from the prior agent
+    run isn't cleaned, defeating the reproducibility purpose."""
+    seen: list[bool] = []
+    async def _spy(repo, base, dest, *, reset=False):
+        seen.append(reset)
+    monkeypatch.setattr(runner, "_pre_clone", _spy)
+    client = _FakeClient()
+    sem = asyncio.Semaphore(1)
+    await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, reset_workspace=True)
+    await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, reset_workspace=False)
+    assert seen == [True, False]
+
+
 async def test_clone_failure_marks_clone_stage(monkeypatch, tmp_path: Path):
-    async def _boom(repo, base, dest):
+    async def _boom(repo, base, dest, *, reset=False):
         raise RuntimeError("git clone failed: network")
 
     monkeypatch.setattr(runner, "_pre_clone", _boom)
