@@ -237,11 +237,103 @@ def test_extract_metrics_unwraps_window_aggregate_dicts(mod):
     assert sm["max"] == [0.95, 0.99]
     assert sm["n"] == [10.0, 10.0]
     assert metrics["gpu0.DCGM_FI_DEV_FB_USED"]["mean"] == [40500.0, 41500.0]
-    # Counter stays scalar; mean/min/max all == value, n == 1.
-    rx = metrics["gpu0.DCGM_FI_PROF_PCIE_RX_BYTES"]
-    assert rx["mean"] == [12345678.0, 23456789.0]
-    assert rx["min"] == rx["max"] == rx["mean"]
-    assert rx["n"] == [1.0, 1.0]
+    # Counter: converted to per-window delta. The raw cumulative name
+    # is dropped (it's not statistically meaningful); a `_delta` series
+    # appears with one fewer entry than samples (first sample seeds
+    # the baseline).
+    assert "gpu0.DCGM_FI_PROF_PCIE_RX_BYTES" not in metrics
+    rx_delta = metrics["gpu0.DCGM_FI_PROF_PCIE_RX_BYTES_delta"]
+    # delta = 23456789 - 12345678 = 11111111
+    assert rx_delta["mean"] == [11111111.0]
+    assert rx_delta["min"] == rx_delta["max"] == [11111111.0]
+    assert rx_delta["n"] == [1.0]
+
+
+def test_extract_metrics_counter_delta_across_many_samples(mod):
+    """Counter delta is per-window throughput. With 4 samples we get 3
+    deltas (first sample seeds the baseline). max(delta) is the peak
+    window's throughput -- not the cumulative."""
+    samples = [
+        {"ts": 1.0, "gpus": [{"index": 0, "DCGM_FI_PROF_PCIE_TX_BYTES": 1000}]},
+        {"ts": 2.0, "gpus": [{"index": 0, "DCGM_FI_PROF_PCIE_TX_BYTES": 3000}]},
+        {"ts": 3.0, "gpus": [{"index": 0, "DCGM_FI_PROF_PCIE_TX_BYTES": 6500}]},
+        {"ts": 4.0, "gpus": [{"index": 0, "DCGM_FI_PROF_PCIE_TX_BYTES": 7000}]},
+    ]
+    metrics = mod.extract_metrics(samples)
+    assert "gpu0.DCGM_FI_PROF_PCIE_TX_BYTES" not in metrics   # cumulative dropped
+    tx = metrics["gpu0.DCGM_FI_PROF_PCIE_TX_BYTES_delta"]
+    # Deltas: 3000-1000=2000, 6500-3000=3500, 7000-6500=500
+    assert tx["mean"] == [2000.0, 3500.0, 500.0]
+
+
+def test_extract_metrics_counter_delta_clips_negative_on_reset(mod):
+    """If the counter drops (process restart / GPU reset / wraparound),
+    the delta would be negative -- clip to 0 rather than emitting
+    bogus negative throughput. The baseline cursor still updates so
+    subsequent deltas pick up from the new floor."""
+    samples = [
+        {"ts": 1.0, "gpus": [{"index": 0, "DCGM_FI_PROF_NVLINK_RX_BYTES": 10000}]},
+        {"ts": 2.0, "gpus": [{"index": 0, "DCGM_FI_PROF_NVLINK_RX_BYTES":   500}]},  # reset
+        {"ts": 3.0, "gpus": [{"index": 0, "DCGM_FI_PROF_NVLINK_RX_BYTES":  3000}]},
+    ]
+    metrics = mod.extract_metrics(samples)
+    rx = metrics["gpu0.DCGM_FI_PROF_NVLINK_RX_BYTES_delta"]
+    # First sample seeded; second is a reset (500 - 10000 < 0 -> 0);
+    # third resumes from the new baseline (3000 - 500 = 2500).
+    assert rx["mean"] == [0.0, 2500.0]
+
+
+def test_extract_metrics_counter_delta_role_aggregate_sums_across_gpus(mod):
+    """Role aggregate for counter deltas is SUM (total bytes across all
+    role GPUs in that window), not mean. A 2-GPU prefill role with
+    both GPUs sending 5000 bytes in a window should report 10000 at
+    the role level -- averaging would under-report by 1/N."""
+    samples = [
+        # baseline
+        {"ts": 1.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_NVLINK_TX_BYTES": 0},
+            {"index": 1, "DCGM_FI_PROF_NVLINK_TX_BYTES": 0},
+        ]},
+        # window with both GPUs sending 5000 bytes
+        {"ts": 2.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_NVLINK_TX_BYTES": 5000},
+            {"index": 1, "DCGM_FI_PROF_NVLINK_TX_BYTES": 5000},
+        ]},
+    ]
+    gpu_role = {0: ("p0", "prefill"), 1: ("p0", "prefill")}
+    metrics = mod.extract_metrics(samples, gpu_role=gpu_role)
+    # per-GPU rows each show their own 5000 delta
+    assert metrics["gpu0[p0/prefill].DCGM_FI_PROF_NVLINK_TX_BYTES_delta"]["mean"] == [5000.0]
+    assert metrics["gpu1[p0/prefill].DCGM_FI_PROF_NVLINK_TX_BYTES_delta"]["mean"] == [5000.0]
+    # role row sums: 5000 + 5000 = 10000 (total role throughput in this window)
+    pref_delta = metrics["prefill.DCGM_FI_PROF_NVLINK_TX_BYTES_delta"]
+    assert pref_delta["mean"] == [10000.0]
+    assert pref_delta["n"] == [2.0]   # 2 GPU contributions
+
+
+def test_extract_metrics_counter_delta_independent_per_gpu_baseline(mod):
+    """Each (gpu, counter_field) tracks its own previous-value cursor.
+    Adding a new GPU mid-stream doesn't poison existing baselines, and
+    the new GPU's first sample seeds its own baseline (no spurious
+    delta into the first window for that GPU)."""
+    samples = [
+        {"ts": 1.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_PCIE_RX_BYTES": 100},
+        ]},
+        {"ts": 2.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_PCIE_RX_BYTES": 200},
+            {"index": 1, "DCGM_FI_PROF_PCIE_RX_BYTES": 5000},   # first sighting
+        ]},
+        {"ts": 3.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_PCIE_RX_BYTES": 350},
+            {"index": 1, "DCGM_FI_PROF_PCIE_RX_BYTES": 5800},
+        ]},
+    ]
+    metrics = mod.extract_metrics(samples)
+    # gpu0: deltas at ts=2 (100) and ts=3 (150)
+    assert metrics["gpu0.DCGM_FI_PROF_PCIE_RX_BYTES_delta"]["mean"] == [100.0, 150.0]
+    # gpu1: baseline seeded at ts=2 (no delta), delta at ts=3 (800)
+    assert metrics["gpu1.DCGM_FI_PROF_PCIE_RX_BYTES_delta"]["mean"] == [800.0]
 
 
 def test_extract_metrics_skips_malformed_aggregate_dict(mod):

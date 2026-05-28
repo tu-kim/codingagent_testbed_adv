@@ -26,9 +26,20 @@ This analyzer unpacks all four series so:
     NOT the misleading max-of-window-means the old flat code emitted)
   - `n_windows` = drain windows contributing
   - `n_samples` = total DCGM internal samples (= sum of per-window n)
-Plain-scalar values (counter fields, host/process metrics, legacy
-data) collapse to min=max=mean=value with n=1 so the same code path
-works on both shapes.
+Plain-scalar values (host/process metrics, legacy data) collapse to
+min=max=mean=value with n=1 so the same code path works on both shapes.
+
+Counter handling: cumulative DCGM byte counters (PROF_PCIE_*_BYTES /
+PROF_NVLINK_*_BYTES) are NOT statistically meaningful as-is -- the
+"mean" of a monotonically-rising value is whatever happens to be in
+the middle of the window. extract_metrics converts each counter to a
+per-window DELTA (current - previous, clipped at 0 on resets) and
+renames the metric with a `_delta` suffix. So you'll see e.g.
+`gpu0.DCGM_FI_PROF_PCIE_RX_BYTES_delta` with `mean` = average bytes
+per drain window, `max` = peak window. The first sample for each
+(gpu, counter) seeds the baseline and is dropped from the output
+(no prior cumulative to subtract). Role aggregate for counters SUMS
+across role GPUs (total throughput) rather than averaging.
 
 Optionally reads `deploy/testbed.yaml` to label each GPU as
 prefill/decode/other based on `vllm.prefill_workers[].gpus` and
@@ -173,6 +184,21 @@ def parse_gpu_role_map(testbed_yaml: Path | None) -> dict[int, tuple[str, str]]:
 # ---------- metric extraction ----------
 
 
+# Cumulative DCGM byte counters -- monitor_resources keeps the LAST
+# observed value rather than a window aggregate. The analyzer converts
+# them to per-window deltas (current - previous, clipped at 0 on resets)
+# so mean/min/max become "bytes per window" rather than meaningless
+# cumulative-value stats. Output metric name gets a `_delta` suffix to
+# make the semantics explicit. MUST stay in sync with COUNTER_FIELDS in
+# scripts/monitor_resources.py.
+DCGM_COUNTER_FIELDS = frozenset({
+    "DCGM_FI_PROF_PCIE_RX_BYTES",
+    "DCGM_FI_PROF_PCIE_TX_BYTES",
+    "DCGM_FI_PROF_NVLINK_RX_BYTES",
+    "DCGM_FI_PROF_NVLINK_TX_BYTES",
+})
+
+
 def _empty_record() -> dict[str, list[float]]:
     return {"mean": [], "min": [], "max": [], "n": []}
 
@@ -235,6 +261,12 @@ def extract_metrics(samples: list[dict],
     """
     gpu_role = gpu_role or {}
     metrics: dict[str, dict[str, list[float]]] = defaultdict(_empty_record)
+    # Last cumulative value per (gpu_idx, counter_field). Persists across
+    # the full sample loop so we can derive per-window deltas. The first
+    # observation for any given (gpu, field) seeds the baseline and is
+    # NOT pushed -- without a prior cumulative we'd be reporting "bytes
+    # since process start" as if it were a window value.
+    prev_counter: dict[tuple[int, str], float] = {}
     for s in samples:
         # host
         h = s.get("host") or {}
@@ -264,13 +296,40 @@ def extract_metrics(samples: list[dict],
                 base = f"gpu{idx}"
                 if worker_role:
                     base = f"gpu{idx}[{worker_role[0]}/{worker_role[1]}]"
+
+                if k in DCGM_COUNTER_FIELDS:
+                    # Cumulative byte counter -> per-window delta.
+                    # `mean` here is the LAST cumulative value in the
+                    # window (monitor_resources doesn't aggregate counters,
+                    # so mean==min==max already).
+                    key = (idx, k)
+                    prev = prev_counter.get(key)
+                    prev_counter[key] = mean
+                    if prev is None:
+                        continue
+                    delta = mean - prev
+                    if delta < 0:
+                        delta = 0.0  # counter reset / GPU reset
+                    out_field = f"{k}_delta"
+                    _push(metrics, f"{base}.{out_field}", delta, delta, delta, 1.0)
+                    if worker_role:
+                        role_field_vals[worker_role[1]][out_field].append(
+                            (delta, delta, delta, 1.0)
+                        )
+                    continue
+
+                # Gauge: per-window {mean,min,max,n} stats.
                 _push(metrics, f"{base}.{k}", mean, mn, mx, n)
                 if worker_role:
                     role_field_vals[worker_role[1]][k].append((mean, mn, mx, n))
-        # role aggregate: arithmetic mean of per-GPU means (matches the
-        # legacy behavior so p90/p99 at the role level still reflects
-        # cross-sample variation), min of per-GPU mins, max of per-GPU
-        # maxs, sum of per-GPU ns.
+        # Role aggregate:
+        #   Gauges: arithmetic mean of per-GPU means (so p90/p99 at the
+        #     role level reflects cross-sample variation), min of per-GPU
+        #     mins, max of per-GPU maxs, sum of per-GPU ns.
+        #   Counter deltas (`*_delta`): SUM of per-GPU deltas (total bytes
+        #     across all role GPUs in this window) -- summing matches the
+        #     "total throughput" intuition, whereas averaging would
+        #     under-report by 1/N_gpus.
         for role, field_vals in role_field_vals.items():
             for field, tuples in field_vals.items():
                 if not tuples:
@@ -279,8 +338,14 @@ def extract_metrics(samples: list[dict],
                 mns = [t[1] for t in tuples]
                 mxs = [t[2] for t in tuples]
                 ns = [t[3] for t in tuples]
-                _push(metrics, f"{role}.{field}",
-                      float(np.mean(ms)), float(min(mns)), float(max(mxs)), float(sum(ns)))
+                if field.endswith("_delta"):
+                    total = float(sum(ms))
+                    _push(metrics, f"{role}.{field}",
+                          total, total, total, float(sum(ns)))
+                else:
+                    _push(metrics, f"{role}.{field}",
+                          float(np.mean(ms)), float(min(mns)),
+                          float(max(mxs)), float(sum(ns)))
 
         # processes
         for p in s.get("processes") or []:
