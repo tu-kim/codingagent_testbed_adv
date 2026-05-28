@@ -113,12 +113,31 @@ def test_prof_sampled_fields_constant_matches_required_set(mod):
 # ---------- DcgmSampler watch routing ----------
 
 
-def _build_fake_dcgm():
+def _build_fake_dcgm(gpu_ids=(0, 1)):
     """Construct fake (ds, df, pd) triple emulating pydcgm enough for
-    DcgmSampler.__init__ to wire up watches. Returns (triple, recorder)
-    where recorder.calls tracks every WatchFields invocation as
-    (api, field_group_name, update_freq_us)."""
-    recorder = type("R", (), {"calls": []})()
+    DcgmSampler.__init__ + sample() to run. Returns (triple, recorder)
+    where:
+      recorder.calls          [(api, fg_name, update_freq_us, fids), ...]
+      recorder.drain_responses queue of dicts that the next
+                              GetAllSinceLastCall returns. Each entry is
+                              {gpu_id: {fid: [FakeFieldValueRecord, ...]}}.
+                              Pop one per sample() call. When empty,
+                              GetAllSinceLastCall returns an empty
+                              collection (no buffered samples).
+      recorder.drain_calls    number of GetAllSinceLastCall invocations
+      recorder.last_dfvc_args [(dfvc_arg, fieldGroup_name), ...] -- pinned
+                              so we can assert the SAME dfvc instance is
+                              reused across calls (cursor preservation).
+    """
+    recorder = type("R", (), {})()
+    recorder.calls = []
+    recorder.drain_responses = []
+    recorder.drain_calls = 0
+    recorder.last_dfvc_args = []
+    # FakeFieldValueCollection instances we've returned, in order. Tests
+    # cross-check against `last_dfvc_args` to pin "the sampler reused the
+    # collection we handed back" semantics (cursor preservation).
+    recorder.returned_collections = []
 
     fake_df = MagicMock()
     # Auto-resolve any DCGM_FI_* name to a stable fake int id.
@@ -147,11 +166,30 @@ def _build_fake_dcgm():
             self.name = name
             self.fieldIds = list(fieldIds)
 
+    class FakeFieldValueCollection:
+        def __init__(self, payload):
+            # payload: {gpu_id: {fid: FakeTimeSeries}}
+            self.values = payload
+
     class FakeWatcher:
         def __init__(self, api_label):
             self.api_label = api_label
         def WatchFields(self, fg, updateFreq, maxKeepAge, maxKeepSamples):
             recorder.calls.append((self.api_label, fg.name, updateFreq, tuple(fg.fieldIds)))
+        def GetAllSinceLastCall(self, dfvc, fg):
+            recorder.drain_calls += 1
+            recorder.last_dfvc_args.append((dfvc, fg.name))
+            payload_raw = (
+                recorder.drain_responses.pop(0)
+                if recorder.drain_responses else {}
+            )
+            payload = {
+                gpu: {fid: FakeTimeSeries(records) for fid, records in by_field.items()}
+                for gpu, by_field in payload_raw.items()
+            }
+            collection = FakeFieldValueCollection(payload)
+            recorder.returned_collections.append(collection)
+            return collection
 
     class FakeGroup:
         def __init__(self, *a, **kw):
@@ -163,7 +201,7 @@ def _build_fake_dcgm():
             pass
         def GetSystem(self):
             sys_obj = MagicMock()
-            sys_obj.discovery.GetAllSupportedGpuIds.return_value = [0, 1]
+            sys_obj.discovery.GetAllSupportedGpuIds.return_value = list(gpu_ids)
             return sys_obj
         def Shutdown(self):
             pass
@@ -173,6 +211,20 @@ def _build_fake_dcgm():
     fake_pd.DcgmGroup.side_effect = FakeGroup
     fake_pd.DcgmFieldGroup.side_effect = FakeFieldGroup
     return (fake_ds, fake_df, fake_pd), recorder
+
+
+class FakeFieldValueRecord:
+    """Mirrors DcgmFieldValue_v1: exposes `.value`, `.ts`, `.isBlank`."""
+    def __init__(self, value, ts=0, is_blank=False):
+        self.value = value
+        self.ts = ts
+        self.isBlank = is_blank
+
+
+class FakeTimeSeries:
+    """Mirrors DcgmFieldValueTimeSeries -- `.values` list of records."""
+    def __init__(self, records):
+        self.values = list(records)
 
 
 def test_dcgm_sampler_splits_prof_sampled_into_dedicated_field_group(mod, monkeypatch):
@@ -254,6 +306,194 @@ def test_dcgm_sampler_skips_prof_group_when_no_prof_sampled_requested(mod, monke
     )
     fg_name = samples_calls[0][1]
     assert fg_name == "testbed_monitor_regular_fg"
+
+
+def test_dcgm_sampler_default_update_freq_is_100ms(mod, monkeypatch):
+    """Default DCGM internal sampling period is 100ms (10Hz). The
+    output drain cadence (--interval) is decoupled and defaults to 1s
+    in the CLI -- so each row aggregates ~10 samples per field."""
+    triple, recorder = _build_fake_dcgm()
+    monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
+    mod.DcgmSampler(["DCGM_FI_DEV_GPU_UTIL"])
+    samples_calls = [c for c in recorder.calls if c[0] == "samples"]
+    assert len(samples_calls) == 1
+    _, _, freq, _ = samples_calls[0]
+    assert freq == 100_000, f"default update freq should be 100_000us, got {freq}"
+
+
+def test_counter_fields_constant_matches_required_set(mod):
+    """COUNTER_FIELDS is the contract that decides which fields keep
+    LAST-value semantics (vs gauge → mean/min/max aggregation).
+    Cumulative byte counters MUST stay last-value or downstream
+    (last_curr - last_prev) / interval bandwidth math goes negative
+    when window-averaging."""
+    assert mod.COUNTER_FIELDS == frozenset({
+        "DCGM_FI_PROF_PCIE_RX_BYTES",
+        "DCGM_FI_PROF_PCIE_TX_BYTES",
+        "DCGM_FI_PROF_NVLINK_RX_BYTES",
+        "DCGM_FI_PROF_NVLINK_TX_BYTES",
+    })
+    # Gauges (point-in-time) must NOT be in COUNTER_FIELDS or we'd
+    # lose the variance information the user explicitly asked for.
+    gauges = {
+        "DCGM_FI_PROF_SM_ACTIVE", "DCGM_FI_DEV_FB_USED",
+        "DCGM_FI_DEV_POWER_USAGE", "DCGM_FI_DEV_GPU_TEMP",
+        "DCGM_FI_DEV_SM_CLOCK", "DCGM_FI_DEV_GPU_UTIL",
+    }
+    assert not (gauges & mod.COUNTER_FIELDS)
+
+
+def test_iter_buffered_values_skips_blanks_and_handles_shapes(mod):
+    """`_iter_buffered_values` drives the gauge aggregation; pin the
+    shapes it accepts so a DCGM-binding upgrade can't silently make
+    the entire window aggregate empty."""
+    # Records with .isBlank flag → skipped.
+    ts = FakeTimeSeries([
+        FakeFieldValueRecord(0.10),
+        FakeFieldValueRecord(0.20, is_blank=True),  # skip
+        FakeFieldValueRecord(0.30),
+    ])
+    assert list(mod._iter_buffered_values(ts)) == [0.10, 0.30]
+
+    # Records with sentinel int values (older bindings without isBlank).
+    ts = FakeTimeSeries([
+        FakeFieldValueRecord(42),
+        FakeFieldValueRecord(-1),                    # sentinel → skip
+        FakeFieldValueRecord(0x7FFFFFFFFFFFFFFF),    # sentinel → skip
+        FakeFieldValueRecord(99),
+    ])
+    assert list(mod._iter_buffered_values(ts)) == [42, 99]
+
+    # None series → empty.
+    assert list(mod._iter_buffered_values(None)) == []
+
+    # Empty TimeSeries.
+    assert list(mod._iter_buffered_values(FakeTimeSeries([]))) == []
+
+    # Bare iterable of records (fallback for bindings that don't wrap).
+    bare = [FakeFieldValueRecord(1.0), FakeFieldValueRecord(2.0)]
+    assert list(mod._iter_buffered_values(bare)) == [1.0, 2.0]
+
+
+def test_dcgm_sampler_aggregates_gauges_to_mean_min_max_n(mod, monkeypatch):
+    """The headline change: gauge fields drain ALL buffered samples per
+    window and emit {mean, min, max, n} -- not just GetLatest's
+    point-in-time scalar. Without this you can't tell whether SM was
+    flat at 0.4 or oscillating between 0.1 and 0.8 inside the second."""
+    triple, recorder = _build_fake_dcgm(gpu_ids=(0,))
+    monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
+    sampler = mod.DcgmSampler(["DCGM_FI_PROF_SM_ACTIVE"])
+
+    fid = triple[1].DCGM_FI_PROF_SM_ACTIVE
+    recorder.drain_responses.append({
+        0: {fid: [
+            FakeFieldValueRecord(0.10), FakeFieldValueRecord(0.30),
+            FakeFieldValueRecord(0.50), FakeFieldValueRecord(0.70),
+            FakeFieldValueRecord(0.90),
+        ]},
+    })
+    rows = sampler.sample()
+    gpu0 = next(r for r in rows if r["index"] == 0)
+    sm = gpu0["DCGM_FI_PROF_SM_ACTIVE"]
+    assert isinstance(sm, dict), f"gauge field must aggregate to a dict, got {type(sm)}"
+    assert sm["n"] == 5
+    assert sm["mean"] == pytest.approx(0.50)
+    assert sm["min"] == pytest.approx(0.10)
+    assert sm["max"] == pytest.approx(0.90)
+
+
+def test_dcgm_sampler_keeps_counter_fields_as_last_value(mod, monkeypatch):
+    """Cumulative counters must NOT aggregate -- downstream computes
+    bandwidth as (last_curr - last_prev) / interval, which only works
+    if every sample preserves the latest cumulative reading."""
+    triple, recorder = _build_fake_dcgm(gpu_ids=(0,))
+    monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
+    sampler = mod.DcgmSampler(["DCGM_FI_PROF_PCIE_RX_BYTES"])
+
+    fid = triple[1].DCGM_FI_PROF_PCIE_RX_BYTES
+    recorder.drain_responses.append({
+        0: {fid: [
+            FakeFieldValueRecord(1_000_000),
+            FakeFieldValueRecord(2_500_000),
+            FakeFieldValueRecord(4_750_000),   # last wins
+        ]},
+    })
+    rows = sampler.sample()
+    gpu0 = next(r for r in rows if r["index"] == 0)
+    assert gpu0["DCGM_FI_PROF_PCIE_RX_BYTES"] == 4_750_000, (
+        "counter must keep the last buffered value, not aggregate"
+    )
+
+
+def test_dcgm_sampler_skips_field_with_empty_buffer(mod, monkeypatch):
+    """If a field has nothing buffered (perfworks slow to come up,
+    field unsupported on this GPU, etc), the field is OMITTED from
+    the entry rather than emitting `null` or an empty dict."""
+    triple, recorder = _build_fake_dcgm(gpu_ids=(0,))
+    monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
+    sampler = mod.DcgmSampler([
+        "DCGM_FI_PROF_SM_ACTIVE",
+        "DCGM_FI_DEV_GPU_UTIL",
+    ])
+    fid_util = triple[1].DCGM_FI_DEV_GPU_UTIL
+    recorder.drain_responses.append({
+        0: {fid_util: [FakeFieldValueRecord(45.0)]},
+        # SM_ACTIVE intentionally absent from this drain
+    })
+    rows = sampler.sample()
+    gpu0 = next(r for r in rows if r["index"] == 0)
+    assert "DCGM_FI_DEV_GPU_UTIL" in gpu0
+    assert "DCGM_FI_PROF_SM_ACTIVE" not in gpu0, (
+        "absent field must not appear in the entry"
+    )
+
+
+def test_dcgm_sampler_reuses_dfvc_across_drains(mod, monkeypatch):
+    """`GetAllSinceLastCall` carries a since-timestamp cursor inside
+    the DcgmFieldValueCollection it returns. Constructing a fresh
+    collection on every drain would replay the entire ring buffer.
+    Pin that the sampler passes its prior dfvc back in on call 2+."""
+    triple, recorder = _build_fake_dcgm(gpu_ids=(0,))
+    monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
+    sampler = mod.DcgmSampler(["DCGM_FI_DEV_GPU_UTIL"])
+
+    recorder.drain_responses.extend([{}, {}])
+    sampler.sample()
+    sampler.sample()
+
+    assert recorder.drain_calls == 2
+    first_dfvc_arg = recorder.last_dfvc_args[0][0]
+    second_dfvc_arg = recorder.last_dfvc_args[1][0]
+    assert first_dfvc_arg is None, "first drain should pass None (no cursor yet)"
+    # IDENTITY check (not `is not None`): the sampler must hand back the
+    # exact collection returned by drain #1. Any code that resets the
+    # cursor (e.g. `self._dfvc = None` at the top of sample(), or
+    # constructing a fresh collection) replays DCGM's entire ring buffer
+    # each tick -- a silent correctness bug that "is not None" wouldn't
+    # catch because a fresh collection is also not None.
+    assert second_dfvc_arg is recorder.returned_collections[0], (
+        "second drain MUST pass the SAME collection object returned by "
+        "drain #1 (carries _nextSinceTimestamp cursor). Producing a "
+        "fresh collection replays the entire DCGM ring buffer."
+    )
+
+
+def test_dcgm_sampler_emits_nothing_for_gpu_with_no_data(mod, monkeypatch):
+    """Multi-GPU host where one GPU has no samples this drain (e.g.
+    just started). Entry still appears with only the index field."""
+    triple, recorder = _build_fake_dcgm(gpu_ids=(0, 1))
+    monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
+    sampler = mod.DcgmSampler(["DCGM_FI_DEV_GPU_UTIL"])
+
+    fid = triple[1].DCGM_FI_DEV_GPU_UTIL
+    recorder.drain_responses.append({
+        0: {fid: [FakeFieldValueRecord(30.0), FakeFieldValueRecord(50.0)]},
+        # gpu 1 absent
+    })
+    rows = sampler.sample()
+    by_idx = {r["index"]: r for r in rows}
+    assert by_idx[0]["DCGM_FI_DEV_GPU_UTIL"]["mean"] == pytest.approx(40.0)
+    assert by_idx[1] == {"index": 1}
 
 
 def test_to_json_value_coerces_bytes_and_passes_scalars(mod):

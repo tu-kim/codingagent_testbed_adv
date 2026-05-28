@@ -179,11 +179,13 @@ opencode:
   port: 4096
   experimental_workspaces: true   # → OPENCODE_EXPERIMENTAL_WORKSPACES=true
 
-monitor:                          # DCGM GPU + psutil CPU/process sampler
-  enabled: true                   # included in `up all` when true
-  interval_s: 1.0                 # sampling period
+monitor:                          # DCGM GPU + psutil CPU/process sampler (opt-in; not in `up all` / `down all`)
+  interval_s: 1.0                 # NDJSON drain cadence (window length per row)
+  dcgm_update_freq_s: 0.1         # DCGM internal sampling period; window aggregates ~interval/this samples per field
   output: logs/resource.ndjson    # NDJSON output (`ts` matches profile NDJSON)
   pids_from: logs/                # per-process tracking via *.pid files
+  scrape_interval_s: 1.0          # vLLM /metrics scrape cadence (separate component)
+  scrape_output: logs/vllm_metrics.ndjson
 ```
 
 There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=0.5`, `seed=42`) live in `cli.py`. CLI flag > env override > yaml default.
@@ -210,8 +212,8 @@ Both etcd and NATS are treated as **external prerequisites**. `testbed.sh up etc
 `deploy/testbed.sh` is the only thing you need to remember. It is self-contained — no `_lib.sh`, no Makefile, no docker-compose.
 
 ```
-deploy/testbed.sh up     [nats|etcd|workers|frontend|opencode|monitor|all]   # default: all (= workers + frontend + opencode + monitor)
-deploy/testbed.sh down   [nats|etcd|workers|frontend|opencode|monitor|all]   # default: all
+deploy/testbed.sh up     [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all]   # default: all (= workers + frontend + opencode; monitor/scrape_metrics are opt-in)
+deploy/testbed.sh down   [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all]   # default: all (= opencode + frontend + workers; monitor/scrape_metrics excluded)
 deploy/testbed.sh status
 deploy/testbed.sh logs   <component>
 ```
@@ -230,7 +232,7 @@ All PID files and component logs are written to **`./logs/`** (created relative 
 
 `up opencode` renders `opencode/opencode.json` from the template, then runs `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <host> --port <port>` from inside the vendored `opencode/` directory. (`bun dev` is the bun shorthand for `bun run dev`; the actual flag is `--hostname`, not `--host`, per `opencode/packages/opencode/src/cli/network.ts`.)
 
-`up` with no arg brings up `workers → frontend → opencode` in order; `down` reverses.
+`up` with no arg brings up `workers → frontend → opencode` in order; `down` with no arg reverses those three. `monitor` and `scrape_metrics` are always opt-in (bring up/down separately; monitor requires `sudo -E` + `DCGM_PY`).
 
 ## Prerequisites (host install)
 
@@ -398,6 +400,7 @@ Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > buil
 - **`bun dev` vs `bun run dev`**: `bun dev` is the bun shorthand and `bun run dev` is the explicit form; both invoke the `dev` script from `opencode/package.json`. `--hostname` (not `--host`) is the OpenCode flag — see `opencode/packages/opencode/src/cli/network.ts`.
 - **OpenCode session ids are server-generated** and match `^ses.*` (per the SDK schema). The runner stores them as `session_id` in the trace; `directory` is the runner-chosen workspace folder name.
 - **PGID-based teardown** is necessary because OpenCode's `.opencode` worker and vLLM's TP/PP shards `setsid` out of the parent. The logic is inlined in `testbed.sh` (no `_lib.sh`). `down opencode` also runs `kill_port` on `opencode.port` as a backstop.
+- **`resource.ndjson` gauges are window aggregates, not point samples.** DCGM internally samples at `monitor.dcgm_update_freq_s` (default 100 ms) and `monitor_resources.py` drains via `DcgmGroupSamples.GetAllSinceLastCall(dfvc, fieldGroup)` every `interval_s` (default 1 s). Each output row's gauge field is therefore `{mean, min, max, n}` over the ~10 internal samples in that window. **Cumulative counters in `COUNTER_FIELDS`** (`PROF_PCIE_*_BYTES`, `PROF_NVLINK_*_BYTES`) stay as a single LAST-value scalar so downstream `(last_curr − last_prev) / interval_s` bandwidth math still works. The `dfvc` collection MUST be reused across drains — it carries the since-timestamp cursor inside; constructing a fresh one replays the whole DCGM ring buffer. Downstream consumers (`analyze_session_resources.py`) read `mean` out of the dict; the dict-vs-scalar branch is in `extract_metrics`.
 - **Single config file invariant**: do NOT introduce a second config source (e.g. a separate `workers.env`). If a new knob is needed, add it to `testbed.yaml` and teach `config.py` + `testbed.sh` to read it.
 - **Logs path is fixed**: `./logs/` (relative to `testbed.sh`'s CWD). PID files: `./logs/<component>.pid`. Stdout/stderr: `./logs/<component>.log`.
 

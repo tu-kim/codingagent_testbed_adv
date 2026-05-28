@@ -61,8 +61,13 @@ class _Strict(BaseModel):
 
 
 class MonitorCfg(_Strict):
-    enabled: bool = True
     interval_s: float = 1.0
+    # DCGM's internal sampling period -- DCGM buffers at this rate and we
+    # drain every `interval_s`, so each output row aggregates
+    # `interval_s / dcgm_update_freq_s` samples per field per GPU into
+    # {mean,min,max,n}. Default 0.1s = 10Hz, capped at 1s by DCGM
+    # perfworks (windows >1s round short compute bursts to 0).
+    dcgm_update_freq_s: float = 0.1
     output: str = "logs/resource.ndjson"
     pids_from: str = "logs/"
     # vLLM /metrics scraper (separate component from the DCGM/psutil

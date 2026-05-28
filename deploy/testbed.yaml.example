@@ -128,12 +128,18 @@ opencode:
   experimental_workspaces: true  # → OPENCODE_EXPERIMENTAL_WORKSPACES=true env
 
 # Optional resource monitor (DCGM GPU + psutil CPU/per-process).
-# Brought up by `testbed.sh up monitor` (and by `up all`). Output
-# NDJSON sits alongside profile NDJSON so the two timelines can be
-# joined on `ts`. Set enabled: false to keep it out of `up all`.
+# Brought up explicitly with `testbed.sh up monitor` (requires sudo +
+# DCGM_PY set). NOT included in `up all` / `down all` — bring up and
+# tear down separately.
 monitor:
-  enabled: true
-  interval_s: 1.0                # DCGM + psutil sampling period
+  interval_s: 1.0                # drain period: how often we write an NDJSON row
+  # DCGM's internal sampling period. DCGM samples every dcgm_update_freq_s
+  # and buffers; we drain every interval_s -- so each row aggregates
+  # interval_s / dcgm_update_freq_s samples per field per GPU into
+  # {mean,min,max,n}. Counter fields (PCIe/NVLink bytes) keep the last
+  # value so downstream delta-bandwidth math is unaffected. Capped at 1s
+  # by DCGM perfworks (longer windows round short compute bursts to 0).
+  dcgm_update_freq_s: 0.1
   output: logs/resource.ndjson   # relative to repo root
   # Per-process PID tracking source. Pointed at logs/ so every
   # component spawned by testbed.sh (vllm-*, dynamo-*, opencode) is

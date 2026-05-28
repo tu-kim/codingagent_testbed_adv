@@ -1,37 +1,45 @@
 #!/usr/bin/env python3
 """Sample GPU (DCGM) + CPU/host (psutil) metrics during agent runs.
 
-Writes one NDJSON line per sample with a wall-clock `ts` that lines up
-with OpenCode profile NDJSON's `ts`, so the two timelines can be
-joined for offline analysis (e.g. GPU SM-active% overlaid on session
-turn boundaries).
+Writes one NDJSON line per drain window. DCGM samples internally at
+`--dcgm-update-freq` (default 100 ms = 10 Hz) and we drain every
+`--interval` (default 1 s) -- so each output row aggregates all the
+samples DCGM buffered during that window, NOT just the instantaneous
+value at drain time. Gauge fields land as {mean, min, max, n};
+cumulative byte counters land as the last buffered value (delta math
+downstream still works the same way).
+
+The output `ts` lines up with OpenCode profile NDJSON's `ts`, so the
+two timelines can be joined for offline analysis (e.g. GPU SM-active%
+mean overlaid on session turn boundaries).
 
 GPU fields collected by default (full DCGM `DCGM_FI_*` names):
-  Compute / occupancy
+  Compute / occupancy           (gauge → {mean,min,max,n})
     DCGM_FI_PROF_SM_ACTIVE          per-SM active fraction       (0.0-1.0)
     DCGM_FI_PROF_SM_OCCUPANCY       warps active / max warps     (0.0-1.0)
     DCGM_FI_PROF_PIPE_TENSOR_ACTIVE tensor pipe active fraction  (0.0-1.0)
     DCGM_FI_PROF_PIPE_FP32_ACTIVE   FP32 pipe active fraction
     DCGM_FI_PROF_PIPE_FP16_ACTIVE   FP16 pipe active fraction
     DCGM_FI_DEV_GPU_UTIL            legacy NVML 0-100 %
-  Memory / bandwidth
+  Memory / bandwidth            (gauge → {mean,min,max,n})
     DCGM_FI_PROF_DRAM_ACTIVE        HBM read+write busy fraction (0.0-1.0)
     DCGM_FI_DEV_FB_USED             frame buffer used (MiB)
     DCGM_FI_DEV_FB_TOTAL            frame buffer total (MiB)
     DCGM_FI_DEV_MEM_COPY_UTIL       memory copy engine %         (0-100)
-  Interconnect
+  Interconnect                  (counter → last value)
     DCGM_FI_PROF_PCIE_RX_BYTES      cumulative PCIe RX bytes
     DCGM_FI_PROF_PCIE_TX_BYTES      cumulative PCIe TX bytes
     DCGM_FI_PROF_NVLINK_RX_BYTES    cumulative NVLink RX bytes
     DCGM_FI_PROF_NVLINK_TX_BYTES    cumulative NVLink TX bytes
-  Misc
+  Misc                          (gauge → {mean,min,max,n})
     DCGM_FI_DEV_POWER_USAGE         W
     DCGM_FI_DEV_GPU_TEMP            C
     DCGM_FI_DEV_SM_CLOCK            MHz
     DCGM_FI_DEV_MEM_CLOCK           MHz
 
-The PCIe / NVLink byte counters are CUMULATIVE. Downstream analysis
-should take per-sample deltas divided by interval to get bandwidth.
+The PCIe / NVLink byte counters are CUMULATIVE. We keep the LAST
+buffered value rather than a window mean so downstream `last-current
+- last-previous` delta math (bytes per second) still works.
 
 CPU side (via psutil):
   host        cpu_util_pct, load_1min, n_cores, mem (used / total / available)
@@ -112,6 +120,18 @@ PROF_SAMPLED_FIELDS = frozenset({
     "DCGM_FI_PROF_PIPE_FP32_ACTIVE",
     "DCGM_FI_PROF_PIPE_FP16_ACTIVE",
     "DCGM_FI_PROF_DRAM_ACTIVE",
+})
+
+
+# Cumulative byte counters. These monotonically increase and any kind
+# of intra-window averaging would destroy delta-bandwidth math. We
+# emit the LAST buffered value per window; downstream takes the
+# difference between successive samples and divides by `interval_s`.
+COUNTER_FIELDS = frozenset({
+    "DCGM_FI_PROF_PCIE_RX_BYTES",
+    "DCGM_FI_PROF_PCIE_TX_BYTES",
+    "DCGM_FI_PROF_NVLINK_RX_BYTES",
+    "DCGM_FI_PROF_NVLINK_TX_BYTES",
 })
 
 
@@ -218,11 +238,14 @@ def _import_psutil():
 
 
 class DcgmSampler:
-    """Wraps a DCGM field group and exposes a single `sample()` method
-    that returns the latest values for all watched fields, one entry
-    per GPU."""
+    """Wraps a DCGM field group. `sample()` drains every internal DCGM
+    sample buffered since the last call and emits one entry per GPU.
+    Gauge fields become {mean, min, max, n} aggregates over the window;
+    cumulative byte counters in COUNTER_FIELDS keep the last value so
+    downstream (last_curr - last_prev) / interval_s bandwidth math
+    still works."""
 
-    def __init__(self, field_names: list[str], update_freq_us: int = 1_000_000):
+    def __init__(self, field_names: list[str], update_freq_us: int = 100_000):
         ds, df, pd = _import_dcgm()
         self._ds, self._df, self._pd = ds, df, pd
 
@@ -250,10 +273,10 @@ class DcgmSampler:
             groupType=ds.DCGM_GROUP_DEFAULT,  # all GPUs
         )
 
-        # One field group with ALL fields — used for GetLatest. DCGM
-        # caches field values per-field (not per-watch), so a single
-        # GetLatest on the unified group returns every field regardless
-        # of which API watched it.
+        # One field group with ALL fields — used for the drain call.
+        # DCGM buffers per-field (not per-watch), so draining the
+        # unified group returns every field regardless of which API
+        # method (regular vs perfworks-activated) watched it.
         self._field_group = pd.DcgmFieldGroup(
             self._handle, name="testbed_monitor_fg", fieldIds=self._field_ids,
         )
@@ -304,22 +327,51 @@ class DcgmSampler:
 
         self._gpu_ids = list(system.discovery.GetAllSupportedGpuIds())
 
+        # GetAllSinceLastCall(dfvc, fieldGroup) advances a per-collection
+        # cursor (`_nextSinceTimestamp`) so successive calls return only
+        # NEW samples buffered since the previous drain. Pass None the
+        # first time; reuse the returned object thereafter. Reconstructing
+        # a fresh collection would replay DCGM's whole ring buffer.
+        self._dfvc = None
+
     def sample(self) -> list[dict]:
-        latest = self._group.samples.GetLatest(self._field_group)
+        # Drain everything DCGM buffered between the last call and now.
+        # At updateFreq=100ms + interval=1s we get ~10 samples per
+        # gauge per GPU; aggregate into {mean,min,max,n} per field.
+        # Cumulative counters (COUNTER_FIELDS) keep just the last value
+        # so downstream rate = (last_curr - last_prev) / interval_s.
+        self._dfvc = self._group.samples.GetAllSinceLastCall(
+            self._dfvc, self._field_group,
+        )
+        gpu_buckets_root = (
+            self._dfvc.values if self._dfvc is not None and hasattr(self._dfvc, "values") else {}
+        )
         rows: list[dict] = []
         for gpu_id in self._gpu_ids:
             entry: dict = {"index": int(gpu_id)}
-            gpu_data = (
-                latest.values.get(gpu_id) if hasattr(latest, "values") else None
-            )
-            if not gpu_data:
-                rows.append(entry)
-                continue
+            gpu_data = gpu_buckets_root.get(gpu_id) or {}
             for name, fid in zip(self._field_names, self._field_ids):
-                value = _extract_dcgm_value(gpu_data.get(fid))
-                if value is None or _is_dcgm_blank(value):
+                values = list(_iter_buffered_values(gpu_data.get(fid)))
+                if not values:
                     continue
-                entry[name] = _to_json_value(value)
+                if name in COUNTER_FIELDS:
+                    entry[name] = _to_json_value(values[-1])
+                    continue
+                numeric = [
+                    float(v) for v in values
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                ]
+                if numeric:
+                    entry[name] = {
+                        "mean": sum(numeric) / len(numeric),
+                        "min": min(numeric),
+                        "max": max(numeric),
+                        "n": len(numeric),
+                    }
+                else:
+                    # Non-numeric (e.g. driver_version bytes) -- can't
+                    # mean/min/max so just keep the most recent value.
+                    entry[name] = _to_json_value(values[-1])
             rows.append(entry)
         return rows
 
@@ -385,6 +437,33 @@ def _extract_dcgm_value(fv):
         return fv.value
     # Shape 3: bare value
     return fv
+
+
+def _iter_buffered_values(series):
+    """Yield every non-blank value from a DcgmFieldValueTimeSeries.
+
+    Each item in `series.values` is a `DcgmFieldValue_v1` exposing
+    `.value`, `.ts`, and (DCGM >= 2.x) `.isBlank`. Older bindings
+    don't set `.isBlank` so we ALSO fall back to the integer-sentinel
+    check in `_is_dcgm_blank`. Robust to the wrapping shape changing
+    between DCGM versions: accepts None, a TimeSeries wrapper, or a
+    bare iterable of records.
+    """
+    if series is None:
+        return
+    inner = getattr(series, "values", series)
+    try:
+        records = list(inner)
+    except TypeError:
+        # `series` is a bare scalar -- treat as singleton.
+        records = [series]
+    for item in records:
+        if getattr(item, "isBlank", False):
+            continue
+        v = getattr(item, "value", item)
+        if v is None or _is_dcgm_blank(v):
+            continue
+        yield v
 
 
 def _to_json_value(v):
@@ -511,7 +590,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output", required=True, type=Path,
                     help="NDJSON output file (one sample per line)")
     ap.add_argument("--interval", type=float, default=1.0, metavar="SECONDS",
-                    help="Sampling period (default 1.0s)")
+                    help="Drain period (default 1.0s). Each NDJSON line "
+                         "summarizes the DCGM samples buffered during this "
+                         "window. Independent of --dcgm-update-freq.")
+    ap.add_argument("--dcgm-update-freq", type=float, default=0.1, metavar="SECONDS",
+                    help="DCGM internal sampling period (default 0.1s = 10Hz). "
+                         "With --interval=1.0 each window aggregates ~10 "
+                         "samples per field per GPU into {mean,min,max,n}. "
+                         "Capped at 1.0s for PROF perfworks fields (longer "
+                         "windows round short compute bursts down to 0).")
     ap.add_argument("--fields", nargs="*", default=DEFAULT_DCGM_FIELDS,
                     help="DCGM field names to collect (default: rich set)")
     ap.add_argument("--pids-from", type=Path, default=None,
@@ -522,8 +609,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="Skip CPU sampling (GPU only)")
     args = ap.parse_args(argv)
 
-    dcgm = None if args.no_gpu else DcgmSampler(args.fields,
-                                                  update_freq_us=int(args.interval * 1e6))
+    dcgm = None if args.no_gpu else DcgmSampler(
+        args.fields,
+        update_freq_us=int(args.dcgm_update_freq * 1e6),
+    )
     cpu = None if args.no_cpu else CpuSampler(args.pids_from)
 
     stop = {"flag": False}

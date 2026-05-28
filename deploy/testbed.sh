@@ -420,27 +420,19 @@ up_etcd() {
 }
 
 up_monitor() {
-  local enabled interval output pids_from py lo
-  enabled=$(cfg_get_env MONITOR__ENABLED '.monitor.enabled // true')
-  # Match the truthy convention used by OPENCODE_PROFILE elsewhere:
-  # anything except empty / "0" / "false" (case-insensitive) is truthy.
-  lo="${enabled,,}"
-  if [[ -z "$lo" || "$lo" == "0" || "$lo" == "false" ]]; then
-    echo "monitor: disabled in testbed.yaml (enabled=$enabled), skipping"
-    return 0
-  fi
+  local interval dcgm_update_freq output pids_from py
   interval=$(cfg_get_env MONITOR__INTERVAL_S '.monitor.interval_s // 1.0')
+  dcgm_update_freq=$(cfg_get_env MONITOR__DCGM_UPDATE_FREQ_S '.monitor.dcgm_update_freq_s // 0.1')
   output=$(cfg_get_env MONITOR__OUTPUT '.monitor.output // "logs/resource.ndjson"')
   pids_from=$(cfg_get_env MONITOR__PIDS_FROM '.monitor.pids_from // "logs/"')
   # Resolve relative paths against REPO_ROOT so a `monitor:` field
   # like `logs/resource.ndjson` doesn't fly off into the user's CWD.
   [[ "$output" = /* ]] || output="$REPO_ROOT/$output"
   [[ "$pids_from" = /* ]] || pids_from="$REPO_ROOT/$pids_from"
-  py="${PYTHON:-python3}"
-  if ! command -v "$py" >/dev/null 2>&1; then
-    echo "up monitor: python interpreter '$py' not in PATH" >&2
-    return 1
-  fi
+  # DCGM bindings must be installed in the Python pointed to by DCGM_PY.
+  # Under `sudo -E` the user's PYTHONPATH is stripped, so we require an
+  # explicit interpreter path rather than relying on PATH resolution.
+  py="${DCGM_PY:?DCGM_PY must be set to the Python with DCGM bindings (e.g. export DCGM_PY=/usr/local/dcgm/python3)}"
   if [[ ! -f "$REPO_ROOT/scripts/monitor_resources.py" ]]; then
     echo "up monitor: $REPO_ROOT/scripts/monitor_resources.py is missing" >&2
     return 1
@@ -459,6 +451,7 @@ up_monitor() {
   spawn monitor ${dcgm_env[@]+"${dcgm_env[@]}"} -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
     --output "$output" \
     --interval "$interval" \
+    --dcgm-update-freq "$dcgm_update_freq" \
     --pids-from "$pids_from"
 }
 
@@ -525,8 +518,8 @@ down_one() {
 }
 
 down_all() {
-  down_one scrape_metrics
-  down_one monitor
+  # monitor and scrape_metrics are excluded: monitor runs under sudo and is
+  # brought up/down separately. Use `down monitor` / `down scrape_metrics`.
   down_one opencode
   down_one frontend
   down_one workers
@@ -563,8 +556,8 @@ usage() {
   cat <<USAGE
 usage: $0 <verb> [target]
 
-  up [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all]   default: all (= workers + frontend + opencode; monitor/scrape_metrics are opt-in)
-  down [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all] default: all (stops EVERY component including monitor/scrape_metrics)
+  up [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all]   default: all (= workers + frontend + opencode; monitor/scrape_metrics are opt-in, bring up separately)
+  down [nats|etcd|workers|frontend|opencode|monitor|scrape_metrics|all] default: all (= opencode + frontend + workers; monitor/scrape_metrics excluded — stop them separately)
   status
   logs <component>
 USAGE

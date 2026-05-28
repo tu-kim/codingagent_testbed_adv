@@ -197,6 +197,57 @@ def test_extract_metrics_collects_host_gpus_processes(mod):
     assert metrics["process.vllm-d0.rss_gib"] == [18.0, 19.0]
 
 
+def test_extract_metrics_unwraps_window_aggregate_dicts(mod):
+    """monitor_resources >= 2026-05-28 emits gauge fields as
+    {mean,min,max,n} dicts (each output row aggregates ~10 internal
+    DCGM samples). extract_metrics must walk into that dict and pull
+    `mean` as the scalar driving percentile math; counter fields and
+    legacy plain-scalar gauges keep their existing scalar path."""
+    samples = [
+        {
+            "ts": 1.0,
+            "gpus": [
+                # gauge in new dict shape
+                {"index": 0,
+                 "DCGM_FI_PROF_SM_ACTIVE": {"mean": 0.55, "min": 0.10, "max": 0.95, "n": 10},
+                 "DCGM_FI_DEV_FB_USED": {"mean": 40500.0, "min": 40000, "max": 41000, "n": 10},
+                 # counter stays scalar (last-value semantics)
+                 "DCGM_FI_PROF_PCIE_RX_BYTES": 12345678},
+            ],
+        },
+        {
+            "ts": 2.0,
+            "gpus": [
+                {"index": 0,
+                 "DCGM_FI_PROF_SM_ACTIVE": {"mean": 0.65, "min": 0.20, "max": 0.99, "n": 10},
+                 "DCGM_FI_DEV_FB_USED": {"mean": 41500.0, "min": 41000, "max": 42000, "n": 10},
+                 "DCGM_FI_PROF_PCIE_RX_BYTES": 23456789},
+            ],
+        },
+    ]
+    metrics = mod.extract_metrics(samples)
+    assert metrics["gpu0.DCGM_FI_PROF_SM_ACTIVE"] == [0.55, 0.65]
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"] == [40500.0, 41500.0]
+    assert metrics["gpu0.DCGM_FI_PROF_PCIE_RX_BYTES"] == [12345678.0, 23456789.0]
+
+
+def test_extract_metrics_skips_malformed_aggregate_dict(mod):
+    """If the dict lacks a numeric `mean` key (corrupted upstream
+    write, partial drain), drop the value rather than crash."""
+    samples = [
+        {"ts": 1.0, "gpus": [
+            {"index": 0,
+             "DCGM_FI_PROF_SM_ACTIVE": {"min": 0.1, "max": 0.9, "n": 5},  # no mean
+             "DCGM_FI_DEV_GPU_UTIL": {"mean": "not-a-number", "n": 3},
+             "DCGM_FI_DEV_FB_USED": {"mean": 40000.0, "n": 5}},
+        ]},
+    ]
+    metrics = mod.extract_metrics(samples)
+    assert "gpu0.DCGM_FI_PROF_SM_ACTIVE" not in metrics
+    assert "gpu0.DCGM_FI_DEV_GPU_UTIL" not in metrics
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"] == [40000.0]
+
+
 def test_extract_metrics_role_aggregate_when_role_map_present(mod):
     """When testbed.yaml maps GPUs to roles, emit per-role aggregate
     rows that average across GPUs sharing a role (per-sample)."""

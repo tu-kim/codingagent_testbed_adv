@@ -197,15 +197,26 @@ def extract_metrics(samples: list[dict],
             for k, v in gpu.items():
                 if k == "index":
                     continue
-                if not isinstance(v, (int, float)):
+                # monitor_resources >= 2026-05-28 emits gauge fields as
+                # {mean,min,max,n} dicts (window aggregate from a 100ms
+                # DCGM internal sample → 1s drain). Use the mean as the
+                # scalar feeding our percentile math; counters and
+                # legacy scalars stay as plain numbers.
+                if isinstance(v, dict):
+                    scalar = v.get("mean")
+                    if not isinstance(scalar, (int, float)):
+                        continue
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    scalar = v
+                else:
                     continue
                 # per-GPU (always)
                 base = f"gpu{idx}"
                 if worker_role:
                     base = f"gpu{idx}[{worker_role[0]}/{worker_role[1]}]"
-                metrics[f"{base}.{k}"].append(float(v))
+                metrics[f"{base}.{k}"].append(float(scalar))
                 if worker_role:
-                    role_field_vals[worker_role[1]][k].append(float(v))
+                    role_field_vals[worker_role[1]][k].append(float(scalar))
         # role aggregate: per-sample mean over GPUs sharing a role
         for role, field_vals in role_field_vals.items():
             for field, vals in field_vals.items():

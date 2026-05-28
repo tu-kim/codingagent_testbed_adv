@@ -157,6 +157,29 @@ def test_override_generation_config_yaml_value_replaces_default(tmp_path: Path):
     assert cfg.vllm.override_generation_config == {"temperature": 0.0, "top_k": -1}
 
 
+def test_monitor_dcgm_update_freq_default_is_100ms(tmp_path: Path):
+    """`monitor.dcgm_update_freq_s` is the DCGM internal sampling period.
+    Default 0.1s lets each 1s drain aggregate ~10 samples per field per
+    GPU into {mean,min,max,n}, replacing the old GetLatest point sample."""
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
+    assert cfg.monitor.dcgm_update_freq_s == 0.1
+
+
+def test_monitor_dcgm_update_freq_yaml_override(tmp_path: Path):
+    """Yaml `monitor.dcgm_update_freq_s` is honored. Used to dial DCGM
+    sampling cadence independently of the NDJSON drain `interval_s`."""
+    body = _BASE_YAML + "\nmonitor:\n  dcgm_update_freq_s: 0.05\n"
+    cfg = cfg_mod.load(_write(tmp_path, body), environ={})
+    assert cfg.monitor.dcgm_update_freq_s == 0.05
+
+
+def test_monitor_dcgm_update_freq_env_override(tmp_path: Path):
+    """`TESTBED__MONITOR__DCGM_UPDATE_FREQ_S` coerces from string."""
+    env = {"TESTBED__MONITOR__DCGM_UPDATE_FREQ_S": "0.2"}
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ=env)
+    assert cfg.monitor.dcgm_update_freq_s == 0.2
+
+
 def test_override_generation_config_env_without_yaml_bypasses_default_factory(tmp_path: Path):
     """Footgun documented in testbed.sh: when yaml OMITS the field entirely,
     a per-key env override creates a fresh dict containing ONLY the env-set
