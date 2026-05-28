@@ -154,6 +154,22 @@ class VLLMCfg(_Strict):
     seed: int = 42
     enforce_eager: bool | None = None
     disable_custom_all_reduce: bool | None = None
+    # vLLM's `--override-generation-config '<json>'` merges into the
+    # model's `generation_config.json` defaults BEFORE per-request
+    # SamplingParams are built. Closes the reproducibility hole that
+    # --seed alone misses: Qwen ships generation_config.json with
+    # repetition_penalty=1.05, which tilts logits even under greedy
+    # decoding (penalty applied before argmax). Default pins greedy +
+    # neutral so vLLM behaves as a pure-argmax server for any field
+    # the client doesn't override. Set to None / {} to skip the flag.
+    override_generation_config: dict[str, Any] | None = Field(
+        default_factory=lambda: {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "repetition_penalty": 1.0,
+        }
+    )
     prefill_workers: list[WorkerCfg]
     decode_workers: list[WorkerCfg]
     prefill: VLLMRoleCfg

@@ -202,6 +202,35 @@ spawn_worker() {
     # enabled (vLLM default).
   esac
 
+  # --override-generation-config '<json>' merges into the model's
+  # generation_config.json BEFORE per-request SamplingParams are built.
+  # Neutralizes Qwen's `repetition_penalty: 1.05` (which would tilt logits
+  # even under greedy decoding). yq -c emits compact single-line JSON; the
+  # `// empty` fallback returns "" when the field is null or absent, so
+  # older testbed.yaml files (or an explicit null) cleanly skip the flag.
+  # Env override: deliberately bypasses cfg_get_env (which only knows
+  # scalars). Pass the WHOLE dict as a JSON string via the env var --
+  # this is whole-value replacement, NOT a per-key merge. (On the Python
+  # side, _apply_env_overrides + _walk_set can express per-key overrides
+  # like TESTBED__VLLM__OVERRIDE_GENERATION_CONFIG__REPETITION_PENALTY,
+  # but those only merge cleanly when the yaml already provides the
+  # dict; if yaml omits it, _walk_set creates a fresh dict containing
+  # only the env-overridden key and pydantic's default_factory is
+  # bypassed. So per-key overrides assume the yaml-supplied baseline.)
+  # `{}` is NOT filtered -- it's a valid "merge nothing extra" signal
+  # that matches Python's pass-through semantics; vLLM treats it as a
+  # no-op flag. Only `null` / empty string skip the flag entirely.
+  local oge_json
+  local -a oge_flag=()
+  if [[ -n "${TESTBED__VLLM__OVERRIDE_GENERATION_CONFIG-}" ]]; then
+    oge_json="$TESTBED__VLLM__OVERRIDE_GENERATION_CONFIG"
+  else
+    oge_json=$(yq -c '.vllm.override_generation_config // empty' "$CFG")
+  fi
+  if [[ -n "$oge_json" && "$oge_json" != "null" ]]; then
+    oge_flag=(--override-generation-config "$oge_json")
+  fi
+
   # shellcheck disable=SC2206  # word splitting is intended for extra_args
   local extra_array=($extra_args)
 
@@ -240,6 +269,7 @@ spawn_worker() {
       ${chunked_flag[@]+"${chunked_flag[@]}"} \
       ${eager_flag[@]+"${eager_flag[@]}"} \
       ${dcar_flag[@]+"${dcar_flag[@]}"} \
+      ${oge_flag[@]+"${oge_flag[@]}"} \
       ${tool_parser_args[@]+"${tool_parser_args[@]}"} \
       ${extra_array[@]+"${extra_array[@]}"}
 }

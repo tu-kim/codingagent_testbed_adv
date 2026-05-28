@@ -132,6 +132,11 @@ vllm:
   kv_connector: NixlConnector     # vLLM kv-transfer connector class name (matches what vLLM expects)
   nixl_port_base: 6000            # rank N → VLLM_NIXL_SIDE_CHANNEL_PORT = base + N*100
   tool_call_parser: qwen3_coder   # → --dyn-tool-call-parser on DECODE workers only ("" disables)
+  override_generation_config:     # → --override-generation-config '<json>'; set null/omit to skip (see Conventions/gotchas)
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    repetition_penalty: 1.0       # neutralizes Qwen's 1.05 baked into generation_config.json (logits tilt under greedy)
 
   # Each worker entry:
   #   host: where this worker is deployed. Default 127.0.0.1.
@@ -183,11 +188,12 @@ monitor:                          # DCGM GPU + psutil CPU/process sampler
 
 There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=0.5`, `seed=42`) live in `cli.py`. CLI flag > env override > yaml default.
 
-### Worker role injection (kv_role + disaggregation_mode + tool_call_parser)
+### Worker role injection (kv_role + disaggregation_mode + tool_call_parser + override_generation_config)
 
 Each worker needs role-specific Dynamo/vLLM args. `testbed.sh` injects these at launch:
 - `prefill_workers[]` → `--disaggregation-mode prefill` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`
 - `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` plus (if `vllm.tool_call_parser` is non-empty) `--dyn-tool-call-parser <name>`
+- Both roles → `--override-generation-config '<json>'` (if `vllm.override_generation_config` is a non-null dict) so the model's `generation_config.json` defaults are merged with our reproducibility-pinned baseline (see the bullet in "Conventions / gotchas" for the rationale).
 
 The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:647-650` (`if model_type != ModelType.Prefill: runtime_config.tool_call_parser = ...`); applying the parser on prefill is a no-op but a smell.
 
@@ -217,7 +223,7 @@ All PID files and component logs are written to **`./logs/`** (created relative 
 1. validates `len(split(gpus, ',')) == tp * pp`,
 2. exports `VLLM_NIXL_SIDE_CHANNEL_HOST=<worker.host>`, `VLLM_NIXL_SIDE_CHANNEL_PORT=<nixl_port_base + rank*100>`, `CUDA_VISIBLE_DEVICES=<gpus>`,
 3. injects role-specific Dynamo args (kv_role / disaggregation_mode — see above),
-4. passes `--max-model-len`, `--max-num-batched-tokens`, `--max-num-seqs`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--kv-transfer-config` (with `kv_connector`) plus `vllm.extra_args`,
+4. passes `--max-model-len`, `--max-num-batched-tokens`, `--max-num-seqs`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--kv-transfer-config` (with `kv_connector`), `--override-generation-config` (from `vllm.override_generation_config`, when non-null) plus `vllm.extra_args`,
 5. spawns the worker locally. (Multi-node SSH spawn is TBD; for now keep all worker hosts at 127.0.0.1.)
 
 `up frontend` starts `dynamo.frontend` with `--http-host`, `--http-port`, `--router-mode`, `--discovery-backend`, `--request-plane`, and `--event-plane` from yaml, exporting `NATS_SERVER` and `ETCD_ENDPOINTS` into the child env. Assumes NATS and etcd (or whichever discovery backend is configured) are reachable.
@@ -378,6 +384,7 @@ Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > buil
   - `model.seed: 42` — per-request seed. Rendered into `opencode.json`'s `agent.<name>.options.seed` (FLAT — opencode's `ProviderTransform.providerOptions(model, options)` at `provider/transform.ts:1186` wraps the dict under the provider key automatically; pre-nesting under `options.<provider>.seed` produces a double-wrap that vLLM rejects with HTTP 400). The wrapped value reaches the openai-compatible AI SDK adapter as `providerOptions[<provider>].seed`, which gets forwarded as the OpenAI request body's `seed` field, which `dynamo/components/src/dynamo/vllm/handlers.py:411` then maps onto `SamplingParams.seed`. Pins tie-break RNG draws in the sampler.
   - `vllm.seed: 42` — engine-level `--seed`. Pins vLLM's scheduler / sampler RNG across runs.
   - `vllm.enable_prefix_caching` / `enable_chunked_prefill` / `enforce_eager` / `disable_custom_all_reduce` — **default null = leave vLLM defaults on**. Prefix caching, chunked prefill, continuous batching, custom all-reduce, and CUDA-graph capture all introduce only epsilon-level FP variance that rarely flips greedy argmax for typical SWE-bench text. Flip them to false/true ONE AT A TIME and bisect if you observe output divergence with seeds pinned.
+  - `vllm.override_generation_config` — dict merged into vLLM's `--override-generation-config '<json>'`. Closes the reproducibility gap that `--seed` alone misses: model-shipped `generation_config.json` defaults (Qwen's is `{temperature:0.7, top_p:0.8, top_k:20, repetition_penalty:1.05}`) flow into the server's default `SamplingParams`, and **`repetition_penalty` is applied to logits BEFORE argmax** — so leaving it at 1.05 makes "greedy" not actually pure-argmax. Default ships as `{temperature:0.0, top_p:1.0, top_k:-1, repetition_penalty:1.0}` to neutralize this. Per-request fields from opencode (`model.temperature`, `model.top_p`, `seed` via providerOptions) still win field-by-field; this only changes the server default for fields the client doesn't set. Wired in `deploy/testbed.sh` via `yq -c '.vllm.override_generation_config'` → `--override-generation-config '<compact-json>'`. Set to `null` or `{}` in yaml to skip the flag.
   Hard limit at the edge: with `--max-in-flight > 1`, concurrent batches mix requests differently across runs which CAN flip argmax on near-tie tokens. If strict per-task output reproducibility matters more than throughput, run with `runner --max-in-flight 1`. Multi-GPU TP also retains residual variance in some kernels regardless.
 - **Vendored sources are authoritative for any implementation detail.** When in doubt about a CLI flag, an env var, or a wire-format detail of OpenCode/Dynamo/vLLM, read the vendored source (`opencode/`, `dynamo/`) — do not rely on memory or external docs that may not match the pinned version.
 - **OpenCode is headless-only**, launched as `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <h> --port <p>` from `opencode/`. No TUI, no shared global workspace. Every session/message call must include `?directory=<absolute path>` (`InstanceMiddleware` reads it). Without the env var, concurrent agents will trample each other in a single CWD. **Always send the absolute path** — `InstanceMiddleware` calls `AppFileSystem.resolve()` (Node `path.resolve()`) so a bare folder name resolves against OpenCode's CWD (= the `opencode/` repo), not against `workspace_root`.

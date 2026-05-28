@@ -53,6 +53,28 @@ vllm:
   enforce_eager: null
   disable_custom_all_reduce: null
 
+  # Server-side default sampling params, passed to vLLM as
+  # --override-generation-config '<json>'. Merges INTO the model's
+  # generation_config.json before per-request SamplingParams are built.
+  # Why this exists: Qwen ships generation_config.json with
+  # `temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05`,
+  # and `repetition_penalty` is applied to logits BEFORE argmax -- so
+  # leaving it at 1.05 tilts even greedy decoding away from a pure
+  # argmax. Pinning to neutral closes the last reproducibility gap
+  # that --seed alone doesn't cover. Per-request overrides (opencode's
+  # `model.temperature` / `model.top_p` + the seed wired via
+  # providerOptions) still win on a field-by-field basis; this just
+  # changes the SERVER DEFAULT for any field the client doesn't set.
+  # Set to null (or to an empty mapping {}) to skip the flag and let
+  # Qwen's generation_config.json defaults flow through unmodified.
+  # Override the WHOLE dict via TESTBED__VLLM__OVERRIDE_GENERATION_CONFIG
+  # passing a JSON string (env-var replacement is whole-value, not per-key).
+  override_generation_config:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    repetition_penalty: 1.0
+
   # Dynamo's Rust-side tool-call parser. Applied ONLY to decode workers via
   # `--dyn-tool-call-parser <name>` (dynamo/components/src/dynamo/vllm/main.py:647-650
   # skips Prefill). Without it the frontend logs

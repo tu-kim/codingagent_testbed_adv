@@ -101,3 +101,72 @@ def test_tool_call_parser_yaml_empty_string_disables_cleanly(tmp_path: Path):
     body = _BASE_YAML + '  tool_call_parser: ""\n'
     cfg = cfg_mod.load(_write(tmp_path, body), environ={})
     assert cfg.vllm.tool_call_parser == ""
+
+
+def test_override_generation_config_default_neutralizes_qwen_defaults(tmp_path: Path):
+    """Default must pin pure-argmax greedy: temperature=0, top_p=1, top_k=-1,
+    AND repetition_penalty=1.0. The last one is the load-bearing field --
+    Qwen's generation_config.json ships repetition_penalty=1.05 which tilts
+    logits BEFORE argmax, breaking 'greedy' reproducibility under --seed."""
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
+    assert cfg.vllm.override_generation_config == {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "repetition_penalty": 1.0,
+    }
+
+
+def test_override_generation_config_yaml_null_opts_out(tmp_path: Path):
+    body = _BASE_YAML + "  override_generation_config: null\n"
+    cfg = cfg_mod.load(_write(tmp_path, body), environ={})
+    assert cfg.vllm.override_generation_config is None
+
+
+def test_override_generation_config_per_key_env_override_merges_into_yaml(tmp_path: Path):
+    """`_apply_env_overrides` + `_walk_set` mutate `data["vllm"]["override_..."]`
+    BEFORE pydantic instantiation, so per-key env overrides merge into the
+    yaml-loaded dict. (When the yaml omits the field entirely, `_walk_set`
+    creates a fresh dict containing ONLY the env-overridden keys -- pydantic's
+    default_factory is bypassed because the key is present in `data`.)"""
+    body = _BASE_YAML + (
+        "  override_generation_config:\n"
+        "    temperature: 0.0\n"
+        "    top_p: 1.0\n"
+        "    top_k: -1\n"
+        "    repetition_penalty: 1.0\n"
+    )
+    env = {"TESTBED__VLLM__OVERRIDE_GENERATION_CONFIG__REPETITION_PENALTY": "0.95"}
+    cfg = cfg_mod.load(_write(tmp_path, body), environ=env)
+    assert cfg.vllm.override_generation_config == {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "repetition_penalty": 0.95,
+    }
+
+
+def test_override_generation_config_yaml_value_replaces_default(tmp_path: Path):
+    body = _BASE_YAML + (
+        "  override_generation_config:\n"
+        "    temperature: 0.0\n"
+        "    top_k: -1\n"
+    )
+    cfg = cfg_mod.load(_write(tmp_path, body), environ={})
+    # yaml-provided dict replaces the default wholesale (no merge).
+    assert cfg.vllm.override_generation_config == {"temperature": 0.0, "top_k": -1}
+
+
+def test_override_generation_config_env_without_yaml_bypasses_default_factory(tmp_path: Path):
+    """Footgun documented in testbed.sh: when yaml OMITS the field entirely,
+    a per-key env override creates a fresh dict containing ONLY the env-set
+    key. pydantic's default_factory is bypassed because `data["vllm"]
+    ["override_generation_config"]` is now present in the input dict, so
+    `temperature`/`top_p`/`top_k` are LOST. Per-key env overrides therefore
+    assume the yaml-supplied baseline; users who want a different repetition
+    penalty without losing the other fields must either keep the yaml block
+    intact or pass the whole JSON via TESTBED__VLLM__OVERRIDE_GENERATION_CONFIG."""
+    env = {"TESTBED__VLLM__OVERRIDE_GENERATION_CONFIG__REPETITION_PENALTY": "1.0"}
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ=env)
+    # NOT the four-key default -- just the single key.
+    assert cfg.vllm.override_generation_config == {"repetition_penalty": 1.0}
