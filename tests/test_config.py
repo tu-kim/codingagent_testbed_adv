@@ -213,6 +213,34 @@ def test_monitor_dcgm_py_env_override(tmp_path: Path):
     assert cfg.monitor.dcgm_bindings_path == "/tmp/bindings"
 
 
+def test_monitor_vllm_metric_names_default_is_none(tmp_path: Path):
+    """null/absent means 'use scrape_vllm_metrics.py's DEFAULT_METRIC_NAMES'.
+    Passing the empty string through the script CLI also triggers the
+    fallback, so this and an empty list both express the same intent;
+    we just default to None for cleanliness."""
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
+    assert cfg.monitor.vllm_metric_names is None
+
+
+def test_monitor_vllm_metric_names_yaml_list(tmp_path: Path):
+    """User can pin an explicit allowlist via yaml. The list is the
+    source of truth; env-var override is intentionally not supported
+    (lists don't round-trip through scalar TESTBED__* vars)."""
+    body = _BASE_YAML + (
+        "\nmonitor:\n"
+        "  vllm_metric_names:\n"
+        "    - vllm:gpu_cache_usage_perc\n"
+        "    - vllm:num_preemptions_total\n"
+        "    - vllm:num_requests_running\n"
+    )
+    cfg = cfg_mod.load(_write(tmp_path, body), environ={})
+    assert cfg.monitor.vllm_metric_names == [
+        "vllm:gpu_cache_usage_perc",
+        "vllm:num_preemptions_total",
+        "vllm:num_requests_running",
+    ]
+
+
 def test_override_generation_config_env_without_yaml_bypasses_default_factory(tmp_path: Path):
     """Footgun documented in testbed.sh: when yaml OMITS the field entirely,
     a per-key env override creates a fresh dict containing ONLY the env-set

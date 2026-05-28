@@ -32,16 +32,22 @@ Output NDJSON (one row per worker per sample tick):
     }
   }
 
-By default we keep only metrics whose name starts with one of
-{vllm:, dynamo_, nv_} -- skips Python/process-level prometheus_client
-internals (process_cpu_seconds_total etc.) that aren't workload signal.
+By default we keep only a curated allowlist of EXACT metric names
+focused on KV cache memory + queue depth + token throughput
+(see DEFAULT_METRIC_NAMES). Latency histograms (TTFT/ITL/E2E) and
+Python/process internals are dropped -- per-request latency is already
+captured in dynamo's in-band `nvext.timing` + opencode profile NDJSON.
+
+Override the allowlist by either:
+  --keep-all                       # capture every metric (legacy behavior)
+  --metric-names "name1,name2,..." # comma-list of exact names
+  monitor.vllm_metric_names: [...] # in testbed.yaml (preferred)
 
 Usage:
   scripts/scrape_vllm_metrics.py \\
       --testbed-yaml deploy/testbed.yaml \\
       --output logs/vllm_metrics.ndjson \\
-      --interval 1.0 \\
-      [--keep-all]              # keep every metric, not just vllm:/dynamo_
+      --interval 1.0
 
 Stop with SIGTERM (`testbed.sh down scrape_metrics`) or Ctrl-C.
 """
@@ -59,7 +65,28 @@ import urllib.request
 from pathlib import Path
 
 
-DEFAULT_PREFIXES = ("vllm:", "dynamo_", "nv_")
+# Curated allowlist of vLLM Prometheus metric names. Tight by design:
+# the user's complaint is signal:noise -- KV cache memory + queue + token
+# counts are what matters for workload analysis. Latency histograms are
+# omitted because per-request latency is already in dynamo's in-band
+# `nvext.timing` and opencode profile NDJSON (no need to duplicate).
+# Override via --metric-names or monitor.vllm_metric_names in testbed.yaml.
+DEFAULT_METRIC_NAMES = frozenset({
+    # KV cache memory (the headline signal)
+    "vllm:gpu_cache_usage_perc",          # 0.0-1.0 fraction of HBM KV blocks in use
+    "vllm:cpu_cache_usage_perc",          # CPU offload (if configured)
+    "vllm:num_preemptions_total",         # counter: evictions under cache pressure
+    # Prefix cache effectiveness
+    "vllm:gpu_prefix_cache_queries_total",
+    "vllm:gpu_prefix_cache_hits_total",
+    # Queue depth
+    "vllm:num_requests_running",
+    "vllm:num_requests_waiting",
+    "vllm:num_requests_swapped",
+    # Token throughput counters
+    "vllm:prompt_tokens_total",
+    "vllm:generation_tokens_total",
+})
 
 # Prometheus text-format line (no labels): metric value [ts]
 # With labels:                              metric{labels} value [ts]
@@ -73,12 +100,15 @@ _METRIC_LINE = re.compile(
 _LABEL_PAIR = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 
 
-def parse_prometheus(text: str, keep_prefixes: tuple[str, ...] | None = None) -> dict[str, list[dict]]:
+def parse_prometheus(text: str,
+                     keep_names: frozenset[str] | set[str] | None = None,
+                    ) -> dict[str, list[dict]]:
     """Parse Prometheus exposition-format text into
     {metric_name: [{labels: {...}, value: float}, ...]}.
 
-    `keep_prefixes` filters by name prefix at parse time. Pass None to
-    keep everything (used by --keep-all)."""
+    `keep_names` is an exact-match allowlist applied at parse time
+    (only matching names enter the output). Pass None to keep
+    everything (--keep-all)."""
     out: dict[str, list[dict]] = {}
     for line in text.splitlines():
         line = line.strip()
@@ -88,7 +118,7 @@ def parse_prometheus(text: str, keep_prefixes: tuple[str, ...] | None = None) ->
         if not m:
             continue
         name = m.group("name")
-        if keep_prefixes is not None and not any(name.startswith(p) for p in keep_prefixes):
+        if keep_names is not None and name not in keep_names:
             continue
         labels: dict[str, str] = {}
         if m.group("labels"):
@@ -139,7 +169,7 @@ def load_workers(testbed_yaml: Path) -> list[dict]:
 
 
 def scrape_one(host: str, port: int, timeout_s: float,
-               keep_prefixes: tuple[str, ...] | None,
+               keep_names: frozenset[str] | set[str] | None,
               ) -> tuple[bool, dict | str]:
     """GET http://<host>:<port>/metrics, parse, return (ok, payload).
     payload is the parsed metrics dict on success, an error string on
@@ -151,11 +181,11 @@ def scrape_one(host: str, port: int, timeout_s: float,
             text = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
         return False, f"{type(e).__name__}: {e}"
-    return True, parse_prometheus(text, keep_prefixes)
+    return True, parse_prometheus(text, keep_names)
 
 
 def run_scraper(workers: list[dict], interval_s: float, output: Path,
-                keep_prefixes: tuple[str, ...] | None, timeout_s: float,
+                keep_names: frozenset[str] | set[str] | None, timeout_s: float,
                 stop_fn) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     n = 0
@@ -163,7 +193,7 @@ def run_scraper(workers: list[dict], interval_s: float, output: Path,
         while not stop_fn():
             tick_ts = time.time()
             for w in workers:
-                ok, payload = scrape_one(w["host"], w["port"], timeout_s, keep_prefixes)
+                ok, payload = scrape_one(w["host"], w["port"], timeout_s, keep_names)
                 row = {
                     "ts": tick_ts,
                     "interval_s": interval_s,
@@ -198,8 +228,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=float, default=2.0, metavar="SECONDS",
                     help="HTTP timeout per scrape; default 2.0s")
     ap.add_argument("--keep-all", action="store_true",
-                    help="Capture every Prometheus metric; default is to "
-                         "keep only names starting with vllm:/dynamo_/nv_")
+                    help="Capture every Prometheus metric; bypasses the "
+                         "default + --metric-names allowlist entirely")
+    ap.add_argument("--metric-names", default="", metavar="N1,N2,...",
+                    help="Comma-separated allowlist of exact metric names. "
+                         "Empty = use DEFAULT_METRIC_NAMES (KV cache + queue "
+                         "+ token throughput). Ignored if --keep-all is set.")
     args = ap.parse_args(argv)
 
     if not args.testbed_yaml.exists():
@@ -211,7 +245,15 @@ def main(argv: list[str] | None = None) -> int:
     for w in workers:
         print(f"  {w['worker']:<8} {w['role']:<8} {w['host']}:{w['port']}")
 
-    keep = None if args.keep_all else DEFAULT_PREFIXES
+    if args.keep_all:
+        keep: frozenset[str] | None = None
+        print("metric filter: --keep-all (no filter)")
+    elif args.metric_names:
+        keep = frozenset(n for n in args.metric_names.split(",") if n)
+        print(f"metric filter: {len(keep)} names from --metric-names")
+    else:
+        keep = DEFAULT_METRIC_NAMES
+        print(f"metric filter: DEFAULT_METRIC_NAMES ({len(keep)} names)")
 
     stop = {"flag": False}
     def _sig(signum, frame): stop["flag"] = True

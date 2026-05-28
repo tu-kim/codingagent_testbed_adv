@@ -84,6 +84,14 @@ class MonitorCfg(_Strict):
     # uses TESTBED__MONITOR__SCRAPE_INTERVAL_S etc.
     scrape_interval_s: float = 1.0
     scrape_output: str = "logs/vllm_metrics.ndjson"
+    # Exact-name allowlist of vLLM Prometheus metric names to keep.
+    # null/empty = use scrape_vllm_metrics.py's DEFAULT_METRIC_NAMES
+    # (~10 KV-cache/queue/throughput metrics). Provide a list to
+    # override -- e.g. to add latency histograms back, or to capture
+    # a narrower subset. `TESTBED__MONITOR__VLLM_METRIC_NAMES` env
+    # override is NOT supported (lists don't round-trip cleanly
+    # through scalar env vars); edit the yaml.
+    vllm_metric_names: list[str] | None = None
 
 
 class ModelCfg(_Strict):

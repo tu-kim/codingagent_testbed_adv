@@ -60,7 +60,7 @@ python_info{implementation="CPython",major="3",minor="11"} 1.0
 
 
 def test_parse_extracts_gauge_with_label(mod):
-    out = mod.parse_prometheus(SAMPLE_METRICS, keep_prefixes=("vllm:",))
+    out = mod.parse_prometheus(SAMPLE_METRICS, keep_names=None)
     rows = out["vllm:num_requests_running"]
     assert len(rows) == 1
     assert rows[0]["labels"]["model"] == "qwen3-coder-30b-a3b-instruct-fp8"
@@ -68,7 +68,7 @@ def test_parse_extracts_gauge_with_label(mod):
 
 
 def test_parse_extracts_histogram_buckets_count_sum(mod):
-    out = mod.parse_prometheus(SAMPLE_METRICS, keep_prefixes=("vllm:",))
+    out = mod.parse_prometheus(SAMPLE_METRICS, keep_names=None)
     # buckets accumulate as separate entries because labels differ (le=)
     assert "vllm:time_to_first_token_seconds_bucket" in out
     buckets = out["vllm:time_to_first_token_seconds_bucket"]
@@ -80,20 +80,65 @@ def test_parse_extracts_histogram_buckets_count_sum(mod):
     assert out["vllm:time_to_first_token_seconds_sum"][0]["value"] == pytest.approx(38.412)
 
 
-def test_parse_default_prefix_filter_drops_python_internals(mod):
-    """Default keep_prefixes hides process_cpu_seconds_total and python_info."""
-    out = mod.parse_prometheus(SAMPLE_METRICS, keep_prefixes=mod.DEFAULT_PREFIXES)
+def test_parse_default_allowlist_keeps_only_curated_names(mod):
+    """DEFAULT_METRIC_NAMES is an EXACT-MATCH allowlist (not a prefix
+    filter): it keeps the ~10 KV-cache/queue/throughput names and
+    drops everything else, including Python internals AND vLLM
+    latency histograms (per-request latency is already in
+    nvext.timing + opencode profile NDJSON, so duplicating it here
+    would just balloon the NDJSON size)."""
+    out = mod.parse_prometheus(SAMPLE_METRICS, keep_names=mod.DEFAULT_METRIC_NAMES)
+    # Kept: in DEFAULT_METRIC_NAMES.
+    assert "vllm:num_requests_running" in out
+    assert "vllm:gpu_cache_usage_perc" in out      # the headline KV cache memory signal
+    assert "vllm:prompt_tokens_total" in out
+    # Dropped: Python/process internals.
     assert "process_cpu_seconds_total" not in out
     assert "python_info" not in out
-    assert "vllm:num_requests_running" in out
+    # Dropped: latency histograms (not in the default allowlist).
+    assert "vllm:time_to_first_token_seconds_bucket" not in out
+    assert "vllm:time_to_first_token_seconds_count" not in out
+    assert "vllm:time_to_first_token_seconds_sum" not in out
 
 
 def test_parse_keep_all_returns_everything(mod):
-    """--keep-all passes keep_prefixes=None → no filtering."""
-    out = mod.parse_prometheus(SAMPLE_METRICS, keep_prefixes=None)
+    """--keep-all passes keep_names=None → no filtering."""
+    out = mod.parse_prometheus(SAMPLE_METRICS, keep_names=None)
     assert "process_cpu_seconds_total" in out
     assert "python_info" in out
     assert "vllm:num_requests_running" in out
+    # Histograms also surface in keep-all mode.
+    assert "vllm:time_to_first_token_seconds_bucket" in out
+
+
+def test_parse_custom_allowlist_keeps_exactly_named(mod):
+    """Custom set passed via --metric-names yields exact-match behavior:
+    only names in the set survive; everything else (even other vllm:*)
+    is dropped."""
+    out = mod.parse_prometheus(
+        SAMPLE_METRICS,
+        keep_names=frozenset({"vllm:gpu_cache_usage_perc"}),
+    )
+    assert list(out.keys()) == ["vllm:gpu_cache_usage_perc"]
+
+
+def test_default_metric_names_covers_headline_kv_cache_signals(mod):
+    """Smoke check on the allowlist composition itself: the load-
+    bearing KV-cache + queue depth fields must be present so users
+    relying on the default get meaningful output without --metric-names."""
+    assert isinstance(mod.DEFAULT_METRIC_NAMES, frozenset)
+    must_include = {
+        "vllm:gpu_cache_usage_perc",
+        "vllm:num_preemptions_total",
+        "vllm:gpu_prefix_cache_hits_total",
+        "vllm:num_requests_running",
+        "vllm:num_requests_waiting",
+        "vllm:prompt_tokens_total",
+    }
+    assert must_include.issubset(mod.DEFAULT_METRIC_NAMES)
+    # Latency histograms are explicitly NOT in the default (duplicates
+    # nvext.timing + opencode profile, ballons NDJSON size).
+    assert "vllm:time_to_first_token_seconds_bucket" not in mod.DEFAULT_METRIC_NAMES
 
 
 def test_parse_handles_inf_and_nan_values(mod):
@@ -102,7 +147,7 @@ def test_parse_handles_inf_and_nan_values(mod):
         'vllm:test_nan_or_neg{le="+Inf"} +Inf\n'
         'vllm:test_neg{model="x"} -1.5\n'
     )
-    out = mod.parse_prometheus(text, keep_prefixes=("vllm:",))
+    out = mod.parse_prometheus(text, keep_names=None)
     assert out["vllm:test_inf"][0]["value"] == 1.5e10
     assert out["vllm:test_neg"][0]["value"] == -1.5
     # +Inf parses to math.inf
@@ -111,13 +156,13 @@ def test_parse_handles_inf_and_nan_values(mod):
 
 def test_parse_skips_comments_and_blank_lines(mod):
     text = "\n# a comment\n  \n"
-    out = mod.parse_prometheus(text, keep_prefixes=None)
+    out = mod.parse_prometheus(text, keep_names=None)
     assert out == {}
 
 
 def test_parse_unescapes_label_quotes_and_backslashes(mod):
     text = r'vllm:test{path="a\"b\\c"} 1'
-    out = mod.parse_prometheus(text + "\n", keep_prefixes=None)
+    out = mod.parse_prometheus(text + "\n", keep_names=None)
     assert out["vllm:test"][0]["labels"]["path"] == 'a"b\\c'
 
 
@@ -187,7 +232,7 @@ def test_scrape_one_returns_parsed_metrics_on_200(mod):
     with patch.object(mod.urllib.request, "urlopen",
                        side_effect=lambda *a, **kw: _mk_response(SAMPLE_METRICS)):
         ok, payload = mod.scrape_one("127.0.0.1", 21000, 2.0,
-                                       keep_prefixes=mod.DEFAULT_PREFIXES)
+                                       keep_names=mod.DEFAULT_METRIC_NAMES)
     assert ok is True
     assert "vllm:num_requests_running" in payload
     assert payload["vllm:num_requests_running"][0]["value"] == 4.0
@@ -199,7 +244,7 @@ def test_scrape_one_returns_error_on_connection_failure(mod):
         raise urllib.error.URLError("Connection refused")
     with patch.object(mod.urllib.request, "urlopen", side_effect=_raise):
         ok, payload = mod.scrape_one("127.0.0.1", 21000, 2.0,
-                                       keep_prefixes=mod.DEFAULT_PREFIXES)
+                                       keep_names=mod.DEFAULT_METRIC_NAMES)
     assert ok is False
     assert "Connection refused" in payload
 
@@ -216,7 +261,7 @@ def test_scrape_one_returns_error_on_http_5xx(mod):
         )
     with patch.object(mod.urllib.request, "urlopen", side_effect=_raise):
         ok, payload = mod.scrape_one("127.0.0.1", 21000, 2.0,
-                                       keep_prefixes=mod.DEFAULT_PREFIXES)
+                                       keep_names=mod.DEFAULT_METRIC_NAMES)
     assert ok is False
     assert "HTTPError" in payload
     assert "500" in payload
@@ -229,7 +274,7 @@ def test_scrape_one_returns_ok_with_empty_metrics_on_blank_body(mod):
     with patch.object(mod.urllib.request, "urlopen",
                        side_effect=lambda *a, **kw: _mk_response("")):
         ok, payload = mod.scrape_one("127.0.0.1", 21000, 2.0,
-                                       keep_prefixes=mod.DEFAULT_PREFIXES)
+                                       keep_names=mod.DEFAULT_METRIC_NAMES)
     assert ok is True
     assert payload == {}
 
@@ -254,7 +299,7 @@ def test_run_scraper_writes_one_row_per_worker_per_tick(mod, tmp_path):
     with patch.object(mod.urllib.request, "urlopen",
                        side_effect=lambda *a, **kw: _mk_response(SAMPLE_METRICS)):
         n = mod.run_scraper(workers, 0.0, out_path,
-                             mod.DEFAULT_PREFIXES, 2.0, stop)
+                             mod.DEFAULT_METRIC_NAMES, 2.0, stop)
     assert n == 4  # 2 workers × 2 ticks
     lines = [json.loads(l) for l in out_path.read_text().splitlines() if l]
     assert len(lines) == 4
@@ -279,7 +324,7 @@ def test_run_scraper_records_error_when_worker_unreachable(mod, tmp_path):
     with patch.object(mod.urllib.request, "urlopen",
                        side_effect=urllib.error.URLError("ECONNREFUSED")):
         n = mod.run_scraper(workers, 0.0, out_path,
-                             mod.DEFAULT_PREFIXES, 2.0, stop)
+                             mod.DEFAULT_METRIC_NAMES, 2.0, stop)
     assert n == 1
     row = json.loads(out_path.read_text().strip())
     assert row["ok"] is False

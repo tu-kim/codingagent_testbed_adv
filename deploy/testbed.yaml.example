@@ -163,3 +163,20 @@ monitor:
   # writes NDJSON. Requires vllm.system_port_base > 0.
   scrape_interval_s: 1.0
   scrape_output: logs/vllm_metrics.ndjson
+  # Exact-name allowlist of vLLM Prometheus metric names. null = use
+  # scrape_vllm_metrics.py's DEFAULT_METRIC_NAMES (~10 KV-cache + queue +
+  # token throughput metrics; latency histograms are skipped because
+  # nvext.timing + opencode profile already record per-request latency).
+  # Specify a list to override. Use `--keep-all` for raw debugging.
+  vllm_metric_names: null
+  # Example -- add TTFT histogram back on top of the default set:
+  #   vllm_metric_names:
+  #     - vllm:gpu_cache_usage_perc
+  #     - vllm:num_preemptions_total
+  #     - vllm:num_requests_running
+  #     - vllm:num_requests_waiting
+  #     - vllm:prompt_tokens_total
+  #     - vllm:generation_tokens_total
+  #     - vllm:time_to_first_token_seconds_bucket
+  #     - vllm:time_to_first_token_seconds_count
+  #     - vllm:time_to_first_token_seconds_sum

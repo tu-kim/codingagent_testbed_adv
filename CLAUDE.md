@@ -188,6 +188,7 @@ monitor:                          # DCGM GPU + psutil CPU/process sampler (opt-i
   pids_from: logs/                # per-process tracking via *.pid files
   scrape_interval_s: 1.0          # vLLM /metrics scrape cadence (separate component)
   scrape_output: logs/vllm_metrics.ndjson
+  vllm_metric_names: null         # null = script's DEFAULT_METRIC_NAMES (~10 KV-cache + queue + token metrics); list overrides
 ```
 
 There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=0.5`, `seed=42`) live in `cli.py`. CLI flag > env override > yaml default.

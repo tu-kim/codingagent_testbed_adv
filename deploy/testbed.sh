@@ -455,7 +455,7 @@ up_monitor() {
 }
 
 up_scrape_metrics() {
-  local interval output py
+  local interval output py metric_names
   # Env names mirror the yaml path so TESTBED__MONITOR__SCRAPE_INTERVAL_S
   # is consistent with TESTBED__MONITOR__INTERVAL_S / __OUTPUT (same
   # section prefix, key in snake_case).
@@ -471,10 +471,20 @@ up_scrape_metrics() {
     echo "up scrape_metrics: $REPO_ROOT/scripts/scrape_vllm_metrics.py is missing" >&2
     return 1
   fi
+  # monitor.vllm_metric_names: list -> comma-joined for the --metric-names
+  # CLI arg. null/absent -> empty string -> script falls back to its
+  # DEFAULT_METRIC_NAMES allowlist. `// []` ensures join doesn't error
+  # on the null case.
+  metric_names=$(yq -r '(.monitor.vllm_metric_names // []) | join(",")' "$CFG")
+  local -a metric_args=()
+  if [[ -n "$metric_names" ]]; then
+    metric_args=(--metric-names "$metric_names")
+  fi
   spawn scrape_metrics -- "$py" "$REPO_ROOT/scripts/scrape_vllm_metrics.py" \
     --testbed-yaml "$CFG" \
     --output "$output" \
-    --interval "$interval"
+    --interval "$interval" \
+    ${metric_args[@]+"${metric_args[@]}"}
 }
 
 up_all() {
