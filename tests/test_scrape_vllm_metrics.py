@@ -37,9 +37,12 @@ SAMPLE_METRICS = """\
 # HELP vllm:num_requests_running Number of running requests
 # TYPE vllm:num_requests_running gauge
 vllm:num_requests_running{model="qwen3-coder-30b-a3b-instruct-fp8"} 4.0
-# HELP vllm:gpu_cache_usage_perc GPU KV cache usage
-# TYPE vllm:gpu_cache_usage_perc gauge
-vllm:gpu_cache_usage_perc{model="qwen3-coder-30b-a3b-instruct-fp8"} 0.6234
+# HELP vllm:kv_cache_usage_perc KV cache usage fraction (v1 renamed from gpu_cache_usage_perc)
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model="qwen3-coder-30b-a3b-instruct-fp8"} 0.6234
+# HELP vllm:prompt_tokens_cached_total Cumulative input tokens that hit the prefix cache
+# TYPE vllm:prompt_tokens_cached_total counter
+vllm:prompt_tokens_cached_total{model="qwen3-coder-30b-a3b-instruct-fp8"} 9999
 # HELP vllm:prompt_tokens_total Total prompt tokens generated
 # TYPE vllm:prompt_tokens_total counter
 vllm:prompt_tokens_total{model="qwen3-coder-30b-a3b-instruct-fp8"} 12345
@@ -88,9 +91,11 @@ def test_parse_default_allowlist_keeps_only_curated_names(mod):
     nvext.timing + opencode profile NDJSON, so duplicating it here
     would just balloon the NDJSON size)."""
     out = mod.parse_prometheus(SAMPLE_METRICS, keep_names=mod.DEFAULT_METRIC_NAMES)
-    # Kept: in DEFAULT_METRIC_NAMES.
+    # Kept: in DEFAULT_METRIC_NAMES (using vLLM v0.19.0 names -- v1
+    # engine dropped the `gpu_` prefix from cache gauges).
     assert "vllm:num_requests_running" in out
-    assert "vllm:gpu_cache_usage_perc" in out      # the headline KV cache memory signal
+    assert "vllm:kv_cache_usage_perc" in out        # headline KV cache memory
+    assert "vllm:prompt_tokens_cached_total" in out # hit-token counter
     assert "vllm:prompt_tokens_total" in out
     # Dropped: Python/process internals.
     assert "process_cpu_seconds_total" not in out
@@ -117,9 +122,9 @@ def test_parse_custom_allowlist_keeps_exactly_named(mod):
     is dropped."""
     out = mod.parse_prometheus(
         SAMPLE_METRICS,
-        keep_names=frozenset({"vllm:gpu_cache_usage_perc"}),
+        keep_names=frozenset({"vllm:kv_cache_usage_perc"}),
     )
-    assert list(out.keys()) == ["vllm:gpu_cache_usage_perc"]
+    assert list(out.keys()) == ["vllm:kv_cache_usage_perc"]
 
 
 def test_default_metric_names_covers_headline_kv_cache_signals(mod):
@@ -127,17 +132,33 @@ def test_default_metric_names_covers_headline_kv_cache_signals(mod):
     bearing KV-cache + queue depth fields must be present so users
     relying on the default get meaningful output without --metric-names."""
     assert isinstance(mod.DEFAULT_METRIC_NAMES, frozenset)
+    # Names verified against vLLM 0.19.0 (the dynamo-pinned version).
+    # The v1 engine renamed `gpu_cache_usage_perc` -> `kv_cache_usage_perc`
+    # and dropped the `gpu_` prefix from prefix-cache counters.
     must_include = {
-        "vllm:gpu_cache_usage_perc",
+        "vllm:kv_cache_usage_perc",
         "vllm:num_preemptions_total",
-        "vllm:gpu_prefix_cache_hits_total",
+        "vllm:prefix_cache_hits_total",
+        "vllm:prefix_cache_queries_total",
+        "vllm:prompt_tokens_cached_total",
         "vllm:num_requests_running",
         "vllm:num_requests_waiting",
         "vllm:prompt_tokens_total",
+        "vllm:generation_tokens_total",
     }
     assert must_include.issubset(mod.DEFAULT_METRIC_NAMES)
+    # Stale v0 names must be ABSENT (caught a real regression once --
+    # v0 prefix-cache-and-gpu-prefix names silently produced empty
+    # scrape output against a v1 engine).
+    stale_v0_names = {
+        "vllm:gpu_cache_usage_perc",
+        "vllm:cpu_cache_usage_perc",
+        "vllm:gpu_prefix_cache_queries_total",
+        "vllm:gpu_prefix_cache_hits_total",
+    }
+    assert stale_v0_names.isdisjoint(mod.DEFAULT_METRIC_NAMES)
     # Latency histograms are explicitly NOT in the default (duplicates
-    # nvext.timing + opencode profile, ballons NDJSON size).
+    # nvext.timing + opencode profile, balloons NDJSON size).
     assert "vllm:time_to_first_token_seconds_bucket" not in mod.DEFAULT_METRIC_NAMES
 
 

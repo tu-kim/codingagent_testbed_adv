@@ -14,7 +14,7 @@ Two modes (same shape as analyze_session_resources.py):
 
 Metric handling (suffix-based, Prometheus convention):
 
-  Gauge  (`vllm:num_requests_running`, `vllm:gpu_cache_usage_perc`, …)
+  Gauge  (`vllm:num_requests_running`, `vllm:kv_cache_usage_perc`, …)
     → mean/median/p90/p99/max across the per-tick sample values
       (NOT counter-style; we treat each scrape as an independent
       observation of the gauge).

@@ -169,10 +169,14 @@ monitor:
   # nvext.timing + opencode profile already record per-request latency).
   # Specify a list to override. Use `--keep-all` for raw debugging.
   vllm_metric_names: null
-  # Example -- add TTFT histogram back on top of the default set:
+  # Example -- add TTFT histogram back on top of the default set
+  # (names match vLLM v0.19.0; v1 engine dropped the `gpu_` prefix):
   #   vllm_metric_names:
-  #     - vllm:gpu_cache_usage_perc
+  #     - vllm:kv_cache_usage_perc
   #     - vllm:num_preemptions_total
+  #     - vllm:prefix_cache_queries_total
+  #     - vllm:prefix_cache_hits_total
+  #     - vllm:prompt_tokens_cached_total
   #     - vllm:num_requests_running
   #     - vllm:num_requests_waiting
   #     - vllm:prompt_tokens_total

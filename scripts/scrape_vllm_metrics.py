@@ -24,7 +24,7 @@ Output NDJSON (one row per worker per sample tick):
     "ok": true,
     "metrics": {
       "vllm:num_requests_running": [{"labels": {...}, "value": 4}],
-      "vllm:gpu_cache_usage_perc": [...],
+      "vllm:kv_cache_usage_perc": [...],
       "vllm:time_to_first_token_seconds_bucket": [...],
       "vllm:time_to_first_token_seconds_count": [...],
       "vllm:time_to_first_token_seconds_sum": [...],
@@ -65,25 +65,33 @@ import urllib.request
 from pathlib import Path
 
 
-# Curated allowlist of vLLM Prometheus metric names. Tight by design:
-# the user's complaint is signal:noise -- KV cache memory + queue + token
-# counts are what matters for workload analysis. Latency histograms are
-# omitted because per-request latency is already in dynamo's in-band
-# `nvext.timing` and opencode profile NDJSON (no need to duplicate).
-# Override via --metric-names or monitor.vllm_metric_names in testbed.yaml.
+# Curated allowlist of vLLM Prometheus metric names. Names verified
+# against vllm v0.19.0 (the dynamo-pinned version) -- the v1 engine
+# renamed several gauges (dropped `gpu_` prefix, removed `cpu_` variant)
+# vs the older v0 names. See dynamo/docs/observability/metrics-comparison.md
+# for the live-scrape reference table. Latency histograms are omitted
+# because per-request latency is already in dynamo's in-band
+# `nvext.timing` + opencode profile NDJSON (duplicating would just
+# balloon the NDJSON). Override via --metric-names or
+# monitor.vllm_metric_names in testbed.yaml.
 DEFAULT_METRIC_NAMES = frozenset({
     # KV cache memory (the headline signal)
-    "vllm:gpu_cache_usage_perc",          # 0.0-1.0 fraction of HBM KV blocks in use
-    "vllm:cpu_cache_usage_perc",          # CPU offload (if configured)
+    "vllm:kv_cache_usage_perc",           # 0.0-1.0 fraction of KV blocks in use
+                                          # (v1 rename of v0 `gpu_cache_usage_perc`;
+                                          # v1 dropped the cpu_cache_usage_perc variant)
     "vllm:num_preemptions_total",         # counter: evictions under cache pressure
-    # Prefix cache effectiveness
-    "vllm:gpu_prefix_cache_queries_total",
-    "vllm:gpu_prefix_cache_hits_total",
+    # Prefix cache effectiveness (v1 dropped the `gpu_` prefix)
+    "vllm:prefix_cache_queries_total",
+    "vllm:prefix_cache_hits_total",
+    # Cached-input-token volume -- aggregate counterpart to the per-
+    # request `usage.prompt_tokens_details.cached_tokens` field that
+    # the dynamo worker propagates to clients. Pairs with preempt count.
+    "vllm:prompt_tokens_cached_total",       # hit tokens (counter)
+    "vllm:prompt_tokens_recomputed_total",   # tokens lost to preemption + recomputed
     # Queue depth
     "vllm:num_requests_running",
     "vllm:num_requests_waiting",
-    "vllm:num_requests_swapped",
-    # Token throughput counters
+    # Token throughput counters (cumulative; analyze_vllm_metrics derives delta+rate)
     "vllm:prompt_tokens_total",
     "vllm:generation_tokens_total",
 })
