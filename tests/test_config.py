@@ -180,6 +180,39 @@ def test_monitor_dcgm_update_freq_env_override(tmp_path: Path):
     assert cfg.monitor.dcgm_update_freq_s == 0.2
 
 
+def test_monitor_dcgm_py_default_is_empty(tmp_path: Path):
+    """`monitor.dcgm_py` defaults to empty string -- testbed.sh treats
+    empty as 'not configured' and refuses to bring up monitor. Lives in
+    yaml (not $DCGM_PY env) so `sudo testbed.sh up monitor` works
+    without sudo preserving user env."""
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
+    assert cfg.monitor.dcgm_py == ""
+    assert cfg.monitor.dcgm_bindings_path == ""
+
+
+def test_monitor_dcgm_py_yaml_value(tmp_path: Path):
+    body = _BASE_YAML + (
+        "\nmonitor:\n"
+        "  dcgm_py: /opt/venv/bin/python\n"
+        "  dcgm_bindings_path: /usr/local/dcgm/bindings/python3\n"
+    )
+    cfg = cfg_mod.load(_write(tmp_path, body), environ={})
+    assert cfg.monitor.dcgm_py == "/opt/venv/bin/python"
+    assert cfg.monitor.dcgm_bindings_path == "/usr/local/dcgm/bindings/python3"
+
+
+def test_monitor_dcgm_py_env_override(tmp_path: Path):
+    """`TESTBED__MONITOR__DCGM_PY` overrides yaml. Useful when the user
+    wants to swap interpreters without editing yaml."""
+    env = {
+        "TESTBED__MONITOR__DCGM_PY": "/tmp/py",
+        "TESTBED__MONITOR__DCGM_BINDINGS_PATH": "/tmp/bindings",
+    }
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ=env)
+    assert cfg.monitor.dcgm_py == "/tmp/py"
+    assert cfg.monitor.dcgm_bindings_path == "/tmp/bindings"
+
+
 def test_override_generation_config_env_without_yaml_bypasses_default_factory(tmp_path: Path):
     """Footgun documented in testbed.sh: when yaml OMITS the field entirely,
     a per-key env override creates a fresh dict containing ONLY the env-set

@@ -180,6 +180,8 @@ opencode:
   experimental_workspaces: true   # → OPENCODE_EXPERIMENTAL_WORKSPACES=true
 
 monitor:                          # DCGM GPU + psutil CPU/process sampler (opt-in; not in `up all` / `down all`)
+  dcgm_py: ""                     # REQUIRED for `up monitor`: path to Python with DCGM bindings (read from yaml so sudo doesn't strip it)
+  dcgm_bindings_path: ""          # optional: dir with dcgm_fields.py if not pip-discoverable from dcgm_py
   interval_s: 1.0                 # NDJSON drain cadence (window length per row)
   dcgm_update_freq_s: 0.1         # DCGM internal sampling period; window aggregates ~interval/this samples per field
   output: logs/resource.ndjson    # NDJSON output (`ts` matches profile NDJSON)
@@ -232,7 +234,7 @@ All PID files and component logs are written to **`./logs/`** (created relative 
 
 `up opencode` renders `opencode/opencode.json` from the template, then runs `OPENCODE_EXPERIMENTAL_WORKSPACES=true bun run dev serve --hostname <host> --port <port>` from inside the vendored `opencode/` directory. (`bun dev` is the bun shorthand for `bun run dev`; the actual flag is `--hostname`, not `--host`, per `opencode/packages/opencode/src/cli/network.ts`.)
 
-`up` with no arg brings up `workers → frontend → opencode` in order; `down` with no arg reverses those three. `monitor` and `scrape_metrics` are always opt-in (bring up/down separately; monitor requires `sudo -E` + `DCGM_PY`).
+`up` with no arg brings up `workers → frontend → opencode` in order; `down` with no arg reverses those three. `monitor` and `scrape_metrics` are always opt-in (bring up/down separately; monitor requires `sudo` and `monitor.dcgm_py` set in yaml).
 
 ## Prerequisites (host install)
 

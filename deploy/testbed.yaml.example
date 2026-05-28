@@ -128,10 +128,23 @@ opencode:
   experimental_workspaces: true  # → OPENCODE_EXPERIMENTAL_WORKSPACES=true env
 
 # Optional resource monitor (DCGM GPU + psutil CPU/per-process).
-# Brought up explicitly with `testbed.sh up monitor` (requires sudo +
-# DCGM_PY set). NOT included in `up all` / `down all` — bring up and
-# tear down separately.
+# Brought up explicitly with `testbed.sh up monitor` (requires sudo).
+# NOT included in `up all` / `down all` — bring up and tear down
+# separately. Sudo strips env vars, so dcgm_py/dcgm_bindings_path live
+# here (yaml) rather than as $DCGM_PY / $DCGM_BINDINGS_PATH exports.
 monitor:
+  # REQUIRED for `up monitor`. Path to the Python interpreter that has
+  # DCGM bindings installed (or can find them via dcgm_bindings_path).
+  # Examples: /usr/bin/python3 (if you `pip install pydcgm` system-wide),
+  # /home/$USER/.venv/bin/python (a venv with pydcgm installed).
+  dcgm_py: ""
+  # OPTIONAL. Directory containing dcgm_fields.py / dcgm_structs.py.
+  # Set when DCGM is installed system-side but bindings aren't pip-
+  # discoverable from dcgm_py. Common locations:
+  #   /usr/local/dcgm/bindings/python3
+  #   /usr/local/dcgm-4/bindings/python3
+  # Leave empty if the bindings are already on dcgm_py's sys.path.
+  dcgm_bindings_path: ""
   interval_s: 1.0                # drain period: how often we write an NDJSON row
   # DCGM's internal sampling period. DCGM samples every dcgm_update_freq_s
   # and buffers; we drain every interval_s -- so each row aggregates

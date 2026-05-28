@@ -420,7 +420,7 @@ up_etcd() {
 }
 
 up_monitor() {
-  local interval dcgm_update_freq output pids_from py
+  local interval dcgm_update_freq output pids_from py bindings_path
   interval=$(cfg_get_env MONITOR__INTERVAL_S '.monitor.interval_s // 1.0')
   dcgm_update_freq=$(cfg_get_env MONITOR__DCGM_UPDATE_FREQ_S '.monitor.dcgm_update_freq_s // 0.1')
   output=$(cfg_get_env MONITOR__OUTPUT '.monitor.output // "logs/resource.ndjson"')
@@ -429,24 +429,23 @@ up_monitor() {
   # like `logs/resource.ndjson` doesn't fly off into the user's CWD.
   [[ "$output" = /* ]] || output="$REPO_ROOT/$output"
   [[ "$pids_from" = /* ]] || pids_from="$REPO_ROOT/$pids_from"
-  # DCGM bindings must be installed in the Python pointed to by DCGM_PY.
-  # Under `sudo -E` the user's PYTHONPATH is stripped, so we require an
-  # explicit interpreter path rather than relying on PATH resolution.
-  py="${DCGM_PY:?DCGM_PY must be set to the Python with DCGM bindings (e.g. export DCGM_PY=/usr/local/dcgm/python3)}"
+  # dcgm_py + dcgm_bindings_path read from yaml (not $DCGM_PY env) so
+  # `sudo testbed.sh up monitor` works without sudo's env-keep dance.
+  py=$(cfg_get_env MONITOR__DCGM_PY '.monitor.dcgm_py // ""')
+  if [[ -z "$py" || "$py" == "null" ]]; then
+    echo "up monitor: monitor.dcgm_py is empty in testbed.yaml" >&2
+    echo "  Set it to the Python interpreter that has DCGM bindings" >&2
+    echo "  installed (or that can find them via monitor.dcgm_bindings_path)." >&2
+    return 1
+  fi
   if [[ ! -f "$REPO_ROOT/scripts/monitor_resources.py" ]]; then
     echo "up monitor: $REPO_ROOT/scripts/monitor_resources.py is missing" >&2
     return 1
   fi
-  # DCGM profiling metrics need root + access to the bindings. Under
-  # `sudo` the user's PYTHONPATH is stripped, so pass DCGM_BINDINGS_PATH
-  # through explicitly if the caller set it (point at the dir that
-  # contains dcgm_fields.py). Common locations:
-  #   /usr/local/dcgm/bindings/python3
-  #   /usr/local/dcgm-4/bindings/python3
-  #   $(dpkg -L datacenter-gpu-manager{,-4} | grep dcgm_fields.py)
+  bindings_path=$(cfg_get_env MONITOR__DCGM_BINDINGS_PATH '.monitor.dcgm_bindings_path // ""')
   local dcgm_env=()
-  if [[ -n "${DCGM_BINDINGS_PATH:-}" ]]; then
-    dcgm_env+=("DCGM_BINDINGS_PATH=$DCGM_BINDINGS_PATH")
+  if [[ -n "$bindings_path" && "$bindings_path" != "null" ]]; then
+    dcgm_env+=("DCGM_BINDINGS_PATH=$bindings_path")
   fi
   spawn monitor ${dcgm_env[@]+"${dcgm_env[@]}"} -- "$py" "$REPO_ROOT/scripts/monitor_resources.py" \
     --output "$output" \

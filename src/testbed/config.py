@@ -61,6 +61,14 @@ class _Strict(BaseModel):
 
 
 class MonitorCfg(_Strict):
+    # Python interpreter with DCGM bindings installed. Required by
+    # `up monitor`; reading from yaml (instead of $DCGM_PY) sidesteps
+    # sudo's env-stripping. Empty/null means "not configured".
+    dcgm_py: str = ""
+    # Optional dir containing dcgm_fields.py, prepended to sys.path by
+    # monitor_resources.py when the bindings aren't pip-installed.
+    # Same yaml-over-env motivation as dcgm_py.
+    dcgm_bindings_path: str = ""
     interval_s: float = 1.0
     # DCGM's internal sampling period -- DCGM buffers at this rate and we
     # drain every `interval_s`, so each output row aggregates
