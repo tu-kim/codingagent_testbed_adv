@@ -94,6 +94,29 @@ DEFAULT_DCGM_FIELDS = [
 ]
 
 
+# DCGM_FI_PROF_* fields that REQUIRE the perfworks profiling subsystem
+# to be active. Watching them via `samples.WatchFields` (the regular
+# path) silently returns 0 — observed first-hand on DCGM 2.x with a
+# running vLLM workload showing SM_ACTIVE=0 for 30+ minutes while
+# PROF_PCIE_*_BYTES (which are hardware counters, not perfworks)
+# read correctly.
+#
+# These must be watched via `DcgmGroup.profiling.WatchFields` which
+# under the hood calls `dcgmProfWatchFields` to activate the perfworks
+# subsystem.
+#
+# Fields NOT in this set (e.g. PROF_PCIE_*_BYTES, PROF_NVLINK_*_BYTES,
+# all DCGM_FI_DEV_*) can be watched normally via samples.WatchFields.
+PROF_SAMPLED_FIELDS = frozenset({
+    "DCGM_FI_PROF_SM_ACTIVE",
+    "DCGM_FI_PROF_SM_OCCUPANCY",
+    "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE",
+    "DCGM_FI_PROF_PIPE_FP32_ACTIVE",
+    "DCGM_FI_PROF_PIPE_FP16_ACTIVE",
+    "DCGM_FI_PROF_DRAM_ACTIVE",
+})
+
+
 def _dcgm_candidate_paths() -> list[str]:
     """Where to look for NVIDIA's DCGM Python bindings.
 
@@ -228,17 +251,77 @@ class DcgmSampler:
             groupName="testbed_monitor_group",
             groupType=ds.DCGM_GROUP_DEFAULT,  # all GPUs
         )
+
+        # One field group with ALL fields — used for GetLatest. DCGM
+        # caches field values per-field (not per-watch), so a single
+        # GetLatest on the unified group returns every field regardless
+        # of which API watched it.
         self._field_group = pd.DcgmFieldGroup(
             self._handle, name="testbed_monitor_fg", fieldIds=self._field_ids,
         )
-        # WatchFields registers a sampler that DCGM keeps populating
-        # in the background; we just GetLatest each tick.
-        self._group.samples.WatchFields(
-            self._field_group,
-            updateFreq=update_freq_us,
-            maxKeepAge=600.0,
-            maxKeepSamples=0,
-        )
+
+        # Split watches by required subsystem. Names in
+        # PROF_SAMPLED_FIELDS need the perfworks profiling subsystem
+        # activated via dcgmProfWatchFields; otherwise they silently
+        # return 0. Everything else (DCGM_FI_DEV_*, PROF_*_BYTES
+        # hardware counters) uses the regular dcgmWatchFields path.
+        prof_names = [n for n in field_names if n in PROF_SAMPLED_FIELDS]
+        regular_names = [n for n in field_names if n not in PROF_SAMPLED_FIELDS]
+        self._prof_field_ids = [getattr(df, n) for n in prof_names]
+        self._regular_field_ids = [getattr(df, n) for n in regular_names]
+
+        if self._regular_field_ids:
+            regular_fg = pd.DcgmFieldGroup(
+                self._handle,
+                name="testbed_monitor_regular_fg",
+                fieldIds=self._regular_field_ids,
+            )
+            self._group.samples.WatchFields(
+                regular_fg,
+                updateFreq=update_freq_us,
+                maxKeepAge=600.0,
+                maxKeepSamples=0,
+            )
+
+        if self._prof_field_ids:
+            prof_fg = pd.DcgmFieldGroup(
+                self._handle,
+                name="testbed_monitor_prof_fg",
+                fieldIds=self._prof_field_ids,
+            )
+            # Profiling counters have higher hardware resolution. Cap
+            # the update period at 1s — longer windows make perfworks
+            # average over irrelevantly-large intervals and round
+            # short bursts to 0.
+            prof_update_freq = min(update_freq_us, 1_000_000)
+            try:
+                self._group.profiling.WatchFields(
+                    prof_fg,
+                    updateFreq=prof_update_freq,
+                    maxKeepAge=600.0,
+                    maxKeepSamples=0,
+                )
+            except Exception as e:
+                # DCGM 3.0+ deprecated dcgmProfWatchFields in favor of
+                # auto-detection inside dcgmWatchFields. On those
+                # versions the call above raises; fall back to the
+                # regular watch (which DOES activate profiling on 3.x).
+                print(
+                    f"monitor_resources: profiling.WatchFields failed "
+                    f"({type(e).__name__}: {e}); falling back to "
+                    f"samples.WatchFields for PROF fields. If "
+                    f"SM_ACTIVE etc. still read 0, check whether "
+                    f"another DCGM client holds the profiling lock "
+                    f"(only one client at a time per GPU).",
+                    file=sys.stderr,
+                )
+                self._group.samples.WatchFields(
+                    prof_fg,
+                    updateFreq=prof_update_freq,
+                    maxKeepAge=600.0,
+                    maxKeepSamples=0,
+                )
+
         self._gpu_ids = list(system.discovery.GetAllSupportedGpuIds())
 
     def sample(self) -> list[dict]:
