@@ -6,14 +6,29 @@ Two modes (selected by whether --profile is passed):
 
   Session-window mode (--profile <session.jsonl>):
     Joins profile NDJSON with resource NDJSON on wall-clock ts to
-    compute mean / median / p90 / p99 / max for every metric DURING
-    that session's `query.start` → `query.end` window.
+    compute summary statistics for every metric DURING that session's
+    `query.start` → `query.end` window.
 
   All-points mode (omit --profile):
     Aggregate stats across EVERY sample in the resource NDJSON,
     regardless of session boundaries. Useful for "overall workload
     average" or steady-state monitoring snapshots that span many
     sessions / idle gaps.
+
+Window-aggregate awareness: monitor_resources >= 2026-05-28 writes
+each drain window as {mean,min,max,n} rather than a point sample.
+This analyzer unpacks all four series so:
+  - `mean`   = n-weighted average of window-means (true period mean)
+  - `median/p90/p99` = percentiles of window-means (window-level
+    distribution; per-window variation is smoothed out)
+  - `min`    = MIN of all window-mins (true within-period valley)
+  - `max`    = MAX of all window-maxs (true within-period peak,
+    NOT the misleading max-of-window-means the old flat code emitted)
+  - `n_windows` = drain windows contributing
+  - `n_samples` = total DCGM internal samples (= sum of per-window n)
+Plain-scalar values (counter fields, host/process metrics, legacy
+data) collapse to min=max=mean=value with n=1 so the same code path
+works on both shapes.
 
 Optionally reads `deploy/testbed.yaml` to label each GPU as
 prefill/decode/other based on `vllm.prefill_workers[].gpus` and
@@ -35,7 +50,9 @@ Usage:
       --output results/run1/global_resources
 
 Outputs:
-  session_resources_stats.csv   per-metric stats (mean/median/p90/p99/max)
+  session_resources_stats.csv   per-metric stats
+                                  (n_windows, n_samples, mean, median,
+                                   p90, p99, min, max)
   stdout                        pretty table
 """
 
@@ -156,11 +173,57 @@ def parse_gpu_role_map(testbed_yaml: Path | None) -> dict[int, tuple[str, str]]:
 # ---------- metric extraction ----------
 
 
+def _empty_record() -> dict[str, list[float]]:
+    return {"mean": [], "min": [], "max": [], "n": []}
+
+
+def _push(metrics: dict[str, dict[str, list[float]]],
+          name: str, mean: float, mn: float, mx: float, n: float) -> None:
+    rec = metrics[name]
+    rec["mean"].append(float(mean))
+    rec["min"].append(float(mn))
+    rec["max"].append(float(mx))
+    rec["n"].append(float(n))
+
+
+def _coerce_value(v) -> tuple[float, float, float, float] | None:
+    """Normalize a sample value to (mean, min, max, n). Dict-shape gauges
+    from monitor_resources >= 2026-05-28 unpack all four; plain scalars
+    (counters, host/process fields, legacy gauges) collapse to
+    mean=min=max=val, n=1. Returns None for non-numeric / malformed."""
+    if isinstance(v, dict):
+        m = v.get("mean")
+        if not isinstance(m, (int, float)) or isinstance(m, bool):
+            return None
+        mn = v.get("min", m)
+        mx = v.get("max", m)
+        n = v.get("n", 1)
+        if not isinstance(mn, (int, float)) or isinstance(mn, bool):
+            mn = m
+        if not isinstance(mx, (int, float)) or isinstance(mx, bool):
+            mx = m
+        if not isinstance(n, (int, float)) or isinstance(n, bool):
+            n = 1
+        return float(m), float(mn), float(mx), float(n)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        f = float(v)
+        return f, f, f, 1.0
+    return None
+
+
 def extract_metrics(samples: list[dict],
                     gpu_role: dict[int, tuple[str, str]] | None = None,
-                   ) -> dict[str, list[float]]:
+                   ) -> dict[str, dict[str, list[float]]]:
     """Walk every sample row and bucket numeric values by metric name.
-    Returns {metric_name: [values...]}.
+    Returns {metric_name: {"mean": [...], "min": [...], "max": [...], "n": [...]}}
+    where each list has one entry per drain window.
+
+    For dict-shape gauges (monitor_resources >= 2026-05-28), the four
+    series carry the window's {mean, min, max, n}. For scalar values
+    (counters, host/process fields, legacy gauges), mean/min/max all
+    collapse to the same scalar and n=1. Downstream `stats()` reads the
+    `min` / `max` series to report true within-run peaks (vs the
+    misleading "max-of-window-means" the old flat structure produced).
 
     Metric naming:
       host.cpu_util_pct, host.mem_used_gib, host.mem_available_gib
@@ -171,24 +234,21 @@ def extract_metrics(samples: list[dict],
       process.<name>.rss_gib
     """
     gpu_role = gpu_role or {}
-    metrics: dict[str, list[float]] = defaultdict(list)
-    # For role aggregation, accumulate per-sample per-role per-field
-    # AVERAGES across GPUs sharing that role, then push one value per
-    # sample into metrics[<role>.<field>]. This keeps p90/p99 meaningful
-    # at the role level (vs flattening all GPU samples together which
-    # would double-count when N_prefill_gpus != N_decode_gpus).
+    metrics: dict[str, dict[str, list[float]]] = defaultdict(_empty_record)
     for s in samples:
         # host
         h = s.get("host") or {}
-        if isinstance(h.get("cpu_util_pct"), (int, float)):
-            metrics["host.cpu_util_pct"].append(float(h["cpu_util_pct"]))
-        if isinstance(h.get("mem_used_bytes"), (int, float)):
-            metrics["host.mem_used_gib"].append(h["mem_used_bytes"] / (1 << 30))
-        if isinstance(h.get("mem_available_bytes"), (int, float)):
-            metrics["host.mem_available_gib"].append(h["mem_available_bytes"] / (1 << 30))
+        if isinstance(h.get("cpu_util_pct"), (int, float)) and not isinstance(h["cpu_util_pct"], bool):
+            v = float(h["cpu_util_pct"]); _push(metrics, "host.cpu_util_pct", v, v, v, 1.0)
+        if isinstance(h.get("mem_used_bytes"), (int, float)) and not isinstance(h["mem_used_bytes"], bool):
+            v = h["mem_used_bytes"] / (1 << 30); _push(metrics, "host.mem_used_gib", v, v, v, 1.0)
+        if isinstance(h.get("mem_available_bytes"), (int, float)) and not isinstance(h["mem_available_bytes"], bool):
+            v = h["mem_available_bytes"] / (1 << 30); _push(metrics, "host.mem_available_gib", v, v, v, 1.0)
 
-        # gpus
-        role_field_vals: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+        # gpus -- collect per-(role,field) tuples to derive a per-sample
+        # role aggregate after the per-GPU push.
+        role_field_vals: dict[str, dict[str, list[tuple[float, float, float, float]]]] = \
+            defaultdict(lambda: defaultdict(list))
         for gpu in s.get("gpus") or []:
             idx = gpu.get("index")
             if not isinstance(idx, int):
@@ -197,39 +257,38 @@ def extract_metrics(samples: list[dict],
             for k, v in gpu.items():
                 if k == "index":
                     continue
-                # monitor_resources >= 2026-05-28 emits gauge fields as
-                # {mean,min,max,n} dicts (window aggregate from a 100ms
-                # DCGM internal sample → 1s drain). Use the mean as the
-                # scalar feeding our percentile math; counters and
-                # legacy scalars stay as plain numbers.
-                if isinstance(v, dict):
-                    scalar = v.get("mean")
-                    if not isinstance(scalar, (int, float)):
-                        continue
-                elif isinstance(v, (int, float)) and not isinstance(v, bool):
-                    scalar = v
-                else:
+                coerced = _coerce_value(v)
+                if coerced is None:
                     continue
-                # per-GPU (always)
+                mean, mn, mx, n = coerced
                 base = f"gpu{idx}"
                 if worker_role:
                     base = f"gpu{idx}[{worker_role[0]}/{worker_role[1]}]"
-                metrics[f"{base}.{k}"].append(float(scalar))
+                _push(metrics, f"{base}.{k}", mean, mn, mx, n)
                 if worker_role:
-                    role_field_vals[worker_role[1]][k].append(float(scalar))
-        # role aggregate: per-sample mean over GPUs sharing a role
+                    role_field_vals[worker_role[1]][k].append((mean, mn, mx, n))
+        # role aggregate: arithmetic mean of per-GPU means (matches the
+        # legacy behavior so p90/p99 at the role level still reflects
+        # cross-sample variation), min of per-GPU mins, max of per-GPU
+        # maxs, sum of per-GPU ns.
         for role, field_vals in role_field_vals.items():
-            for field, vals in field_vals.items():
-                if vals:
-                    metrics[f"{role}.{field}"].append(float(np.mean(vals)))
+            for field, tuples in field_vals.items():
+                if not tuples:
+                    continue
+                ms = [t[0] for t in tuples]
+                mns = [t[1] for t in tuples]
+                mxs = [t[2] for t in tuples]
+                ns = [t[3] for t in tuples]
+                _push(metrics, f"{role}.{field}",
+                      float(np.mean(ms)), float(min(mns)), float(max(mxs)), float(sum(ns)))
 
         # processes
         for p in s.get("processes") or []:
             name = p.get("name") or "?"
-            if isinstance(p.get("cpu_util_pct"), (int, float)):
-                metrics[f"process.{name}.cpu_util_pct"].append(float(p["cpu_util_pct"]))
-            if isinstance(p.get("rss_bytes"), (int, float)):
-                metrics[f"process.{name}.rss_gib"].append(p["rss_bytes"] / (1 << 30))
+            if isinstance(p.get("cpu_util_pct"), (int, float)) and not isinstance(p["cpu_util_pct"], bool):
+                v = float(p["cpu_util_pct"]); _push(metrics, f"process.{name}.cpu_util_pct", v, v, v, 1.0)
+            if isinstance(p.get("rss_bytes"), (int, float)) and not isinstance(p["rss_bytes"], bool):
+                v = p["rss_bytes"] / (1 << 30); _push(metrics, f"process.{name}.rss_gib", v, v, v, 1.0)
 
     return metrics
 
@@ -237,18 +296,45 @@ def extract_metrics(samples: list[dict],
 # ---------- stats ----------
 
 
-def stats(values: list[float]) -> dict[str, float | int | None]:
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return {"n": 0, "mean": None, "median": None,
-                "p90": None, "p99": None, "max": None}
+def stats(record: dict[str, list[float]] | list[float]) -> dict[str, float | int | None]:
+    """Reduce a metric's window-record to a row of summary statistics.
+
+    Accepts either the rich {mean,min,max,n} dict produced by the
+    refactored extract_metrics, OR a flat list of scalars (legacy
+    callers / tests). For the flat-list path, min==max==mean==value
+    and n=1 are synthesized so the output keys are stable.
+
+    Returned keys:
+      n_windows    drain windows contributing to this metric
+      n_samples    sum of underlying DCGM samples (= sum of record["n"])
+      mean         n-weighted mean of window-means (true period mean)
+      median/p90/p99   percentiles of window-means
+      min          min across window-mins (TRUE valley, not min-of-means)
+      max          max across window-maxs (TRUE peak, not max-of-means)
+    """
+    if isinstance(record, list):
+        record = {"mean": list(record), "min": list(record),
+                  "max": list(record), "n": [1.0] * len(record)}
+    means = np.asarray(record.get("mean", []), dtype=float)
+    if means.size == 0:
+        return {"n_windows": 0, "n_samples": 0, "mean": None, "median": None,
+                "p90": None, "p99": None, "min": None, "max": None}
+    mins = np.asarray(record.get("min", []), dtype=float)
+    maxs = np.asarray(record.get("max", []), dtype=float)
+    ns = np.asarray(record.get("n", []), dtype=float)
+    if ns.size != means.size or ns.sum() <= 0:
+        weights = None
+    else:
+        weights = ns
     return {
-        "n": int(arr.size),
-        "mean": float(np.mean(arr)),
-        "median": float(np.median(arr)),
-        "p90": float(np.percentile(arr, 90)),
-        "p99": float(np.percentile(arr, 99)),
-        "max": float(np.max(arr)),
+        "n_windows": int(means.size),
+        "n_samples": int(ns.sum()) if ns.size else int(means.size),
+        "mean": float(np.average(means, weights=weights)),
+        "median": float(np.median(means)),
+        "p90": float(np.percentile(means, 90)),
+        "p99": float(np.percentile(means, 99)),
+        "min": float(np.min(mins)) if mins.size else float(np.min(means)),
+        "max": float(np.max(maxs)) if maxs.size else float(np.max(means)),
     }
 
 
@@ -271,7 +357,8 @@ def write_csv(stats_per_metric: dict[str, dict],
         w.writerow([
             "session_id", "window_start_unix_s", "window_end_unix_s",
             "window_duration_s", "metric",
-            "n", "mean", "median", "p90", "p99", "max",
+            "n_windows", "n_samples",
+            "mean", "median", "p90", "p99", "min", "max",
         ])
         s_ts, e_ts = window
         dur = e_ts - s_ts
@@ -279,9 +366,10 @@ def write_csv(stats_per_metric: dict[str, dict],
             s = stats_per_metric[name]
             w.writerow([
                 session_id, f"{s_ts:.3f}", f"{e_ts:.3f}", f"{dur:.3f}",
-                name, s["n"],
+                name, s["n_windows"], s["n_samples"],
                 _fmt(s["mean"]), _fmt(s["median"]),
-                _fmt(s["p90"]), _fmt(s["p99"]), _fmt(s["max"]),
+                _fmt(s["p90"]), _fmt(s["p99"]),
+                _fmt(s["min"]), _fmt(s["max"]),
             ])
 
 
@@ -292,7 +380,9 @@ def print_table(stats_per_metric: dict[str, dict],
     print(f"Session: {session_id}")
     print(f"Window:  ts={s_ts:.3f} → {e_ts:.3f}  ({e_ts - s_ts:.2f}s)")
     print(f"         {len(stats_per_metric)} metrics")
-    hdr = f"{'metric':<55} {'n':>5} {'mean':>10} {'median':>10} {'p90':>10} {'p99':>10} {'max':>10}"
+    hdr = (f"{'metric':<55} {'win':>5} {'samp':>6} "
+           f"{'mean':>10} {'median':>10} {'p90':>10} {'p99':>10} "
+           f"{'min':>10} {'max':>10}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -301,8 +391,9 @@ def print_table(stats_per_metric: dict[str, dict],
 
     for name in sorted(stats_per_metric.keys()):
         s = stats_per_metric[name]
-        print(f"{name:<55} {s['n']:>5} {_p(s['mean'])} {_p(s['median'])} "
-              f"{_p(s['p90'])} {_p(s['p99'])} {_p(s['max'])}")
+        print(f"{name:<55} {s['n_windows']:>5} {s['n_samples']:>6} "
+              f"{_p(s['mean'])} {_p(s['median'])} {_p(s['p90'])} {_p(s['p99'])} "
+              f"{_p(s['min'])} {_p(s['max'])}")
 
 
 # ---------- main ----------

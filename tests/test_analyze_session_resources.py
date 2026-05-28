@@ -188,13 +188,17 @@ def test_extract_metrics_collects_host_gpus_processes(mod):
         },
     ]
     metrics = mod.extract_metrics(samples)
-    assert metrics["host.cpu_util_pct"] == [30.0, 40.0]
-    assert metrics["host.mem_used_gib"] == [16.0, 17.0]
-    assert metrics["gpu0.DCGM_FI_PROF_SM_ACTIVE"] == [0.5, 0.6]
-    assert metrics["gpu2.DCGM_FI_PROF_SM_ACTIVE"] == [0.8, 0.9]
-    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"] == [40000, 41000]
-    assert metrics["process.vllm-d0.cpu_util_pct"] == [220.0, 250.0]
-    assert metrics["process.vllm-d0.rss_gib"] == [18.0, 19.0]
+    # Scalar values collapse: mean == min == max == value, n == 1.
+    assert metrics["host.cpu_util_pct"]["mean"] == [30.0, 40.0]
+    assert metrics["host.cpu_util_pct"]["min"] == [30.0, 40.0]
+    assert metrics["host.cpu_util_pct"]["max"] == [30.0, 40.0]
+    assert metrics["host.cpu_util_pct"]["n"] == [1.0, 1.0]
+    assert metrics["host.mem_used_gib"]["mean"] == [16.0, 17.0]
+    assert metrics["gpu0.DCGM_FI_PROF_SM_ACTIVE"]["mean"] == [0.5, 0.6]
+    assert metrics["gpu2.DCGM_FI_PROF_SM_ACTIVE"]["mean"] == [0.8, 0.9]
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"]["mean"] == [40000, 41000]
+    assert metrics["process.vllm-d0.cpu_util_pct"]["mean"] == [220.0, 250.0]
+    assert metrics["process.vllm-d0.rss_gib"]["mean"] == [18.0, 19.0]
 
 
 def test_extract_metrics_unwraps_window_aggregate_dicts(mod):
@@ -226,9 +230,18 @@ def test_extract_metrics_unwraps_window_aggregate_dicts(mod):
         },
     ]
     metrics = mod.extract_metrics(samples)
-    assert metrics["gpu0.DCGM_FI_PROF_SM_ACTIVE"] == [0.55, 0.65]
-    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"] == [40500.0, 41500.0]
-    assert metrics["gpu0.DCGM_FI_PROF_PCIE_RX_BYTES"] == [12345678.0, 23456789.0]
+    # Dict-shape gauge: mean/min/max/n all populated from the dict.
+    sm = metrics["gpu0.DCGM_FI_PROF_SM_ACTIVE"]
+    assert sm["mean"] == [0.55, 0.65]
+    assert sm["min"] == [0.10, 0.20]
+    assert sm["max"] == [0.95, 0.99]
+    assert sm["n"] == [10.0, 10.0]
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"]["mean"] == [40500.0, 41500.0]
+    # Counter stays scalar; mean/min/max all == value, n == 1.
+    rx = metrics["gpu0.DCGM_FI_PROF_PCIE_RX_BYTES"]
+    assert rx["mean"] == [12345678.0, 23456789.0]
+    assert rx["min"] == rx["max"] == rx["mean"]
+    assert rx["n"] == [1.0, 1.0]
 
 
 def test_extract_metrics_skips_malformed_aggregate_dict(mod):
@@ -245,7 +258,11 @@ def test_extract_metrics_skips_malformed_aggregate_dict(mod):
     metrics = mod.extract_metrics(samples)
     assert "gpu0.DCGM_FI_PROF_SM_ACTIVE" not in metrics
     assert "gpu0.DCGM_FI_DEV_GPU_UTIL" not in metrics
-    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"] == [40000.0]
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"]["mean"] == [40000.0]
+    # min/max default to the mean when only mean is present (no min/max in dict).
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"]["min"] == [40000.0]
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"]["max"] == [40000.0]
+    assert metrics["gpu0.DCGM_FI_DEV_FB_USED"]["n"] == [5.0]
 
 
 def test_extract_metrics_role_aggregate_when_role_map_present(mod):
@@ -270,9 +287,47 @@ def test_extract_metrics_role_aggregate_when_role_map_present(mod):
     # per-GPU rows include the role suffix
     assert "gpu0[p0/prefill].DCGM_FI_PROF_SM_ACTIVE" in metrics
     assert "gpu2[d0/decode].DCGM_FI_PROF_SM_ACTIVE" in metrics
-    # role aggregate = mean across GPUs in that role
-    assert metrics["prefill.DCGM_FI_PROF_SM_ACTIVE"] == [0.5]   # mean(0.4, 0.6)
-    assert metrics["decode.DCGM_FI_PROF_SM_ACTIVE"] == [0.9]    # mean(0.8, 1.0)
+    # role aggregate: mean of per-GPU means, min/max across per-GPU
+    # extrema, n = sum of per-GPU contributions.
+    pref = metrics["prefill.DCGM_FI_PROF_SM_ACTIVE"]
+    assert pref["mean"] == [0.5]   # mean(0.4, 0.6)
+    assert pref["min"] == [0.4]
+    assert pref["max"] == [0.6]
+    assert pref["n"] == [2.0]      # 1 + 1 (two scalar GPU contributions)
+    dec = metrics["decode.DCGM_FI_PROF_SM_ACTIVE"]
+    assert dec["mean"] == [0.9]    # mean(0.8, 1.0)
+    assert dec["min"] == [0.8]
+    assert dec["max"] == [1.0]
+
+
+def test_extract_metrics_role_aggregate_with_dict_shape_input(mod):
+    """Role aggregation must propagate the inner extrema. When per-GPU
+    fields are dict-shape `{mean,min,max,n}`, the role row's `min`
+    should be `min(per-GPU mins)` (cross-GPU TRUE valley), not
+    `min(per-GPU means)`. Same for max. Otherwise bursty signals look
+    flat at the role level even when one of the GPUs hit a peak.
+    Only the role-aggregate path can confirm this -- the per-GPU
+    rows store the dict's mean/min/max directly."""
+    samples = [
+        {"ts": 1.0, "gpus": [
+            {"index": 0, "DCGM_FI_PROF_SM_ACTIVE":
+                {"mean": 0.50, "min": 0.10, "max": 0.95, "n": 10}},
+            {"index": 1, "DCGM_FI_PROF_SM_ACTIVE":
+                {"mean": 0.60, "min": 0.20, "max": 0.99, "n": 10}},
+        ]},
+    ]
+    gpu_role = {0: ("p0", "prefill"), 1: ("p0", "prefill")}
+    metrics = mod.extract_metrics(samples, gpu_role=gpu_role)
+    pref = metrics["prefill.DCGM_FI_PROF_SM_ACTIVE"]
+    # mean of per-GPU means (no n-weighting at the aggregation step --
+    # n-weighting happens later in stats() across windows).
+    assert pref["mean"] == pytest.approx([0.55])
+    # min of per-GPU mins (TRUE cross-GPU valley) -- NOT min of means.
+    assert pref["min"] == pytest.approx([0.10])
+    # max of per-GPU maxs (TRUE cross-GPU peak) -- NOT max of means.
+    assert pref["max"] == pytest.approx([0.99])
+    # n = sum of per-GPU contributions (10 + 10).
+    assert pref["n"] == [20.0]
 
 
 def test_extract_metrics_role_aggregate_across_multiple_samples(mod):
@@ -295,10 +350,10 @@ def test_extract_metrics_role_aggregate_across_multiple_samples(mod):
     ]
     gpu_role = {0: ("p0", "prefill"), 1: ("p0", "prefill")}
     metrics = mod.extract_metrics(samples, gpu_role=gpu_role)
-    assert metrics["prefill.DCGM_FI_PROF_SM_ACTIVE"] == [0.5, 0.7, 0.9]
+    assert metrics["prefill.DCGM_FI_PROF_SM_ACTIVE"]["mean"] == [0.5, 0.7, 0.9]
     # per-GPU lists still have one value per sample
-    assert metrics["gpu0[p0/prefill].DCGM_FI_PROF_SM_ACTIVE"] == [0.4, 0.6, 0.8]
-    assert metrics["gpu1[p0/prefill].DCGM_FI_PROF_SM_ACTIVE"] == [0.6, 0.8, 1.0]
+    assert metrics["gpu0[p0/prefill].DCGM_FI_PROF_SM_ACTIVE"]["mean"] == [0.4, 0.6, 0.8]
+    assert metrics["gpu1[p0/prefill].DCGM_FI_PROF_SM_ACTIVE"]["mean"] == [0.6, 0.8, 1.0]
 
 
 def test_extract_metrics_handles_empty_processes_list(mod):
@@ -306,7 +361,7 @@ def test_extract_metrics_handles_empty_processes_list(mod):
     spurious `process.*` keys."""
     samples = [{"ts": 1.0, "host": {"cpu_util_pct": 20.0}, "gpus": [], "processes": []}]
     metrics = mod.extract_metrics(samples)
-    assert metrics["host.cpu_util_pct"] == [20.0]
+    assert metrics["host.cpu_util_pct"]["mean"] == [20.0]
     assert not any(k.startswith("process.") for k in metrics)
     assert not any(k.startswith("gpu") for k in metrics)
 
@@ -320,7 +375,7 @@ def test_extract_metrics_skips_non_numeric_fields(mod):
                   "DCGM_FI_PROF_SM_ACTIVE": 0.5}],
     }]
     metrics = mod.extract_metrics(samples)
-    assert metrics["gpu0.DCGM_FI_PROF_SM_ACTIVE"] == [0.5]
+    assert metrics["gpu0.DCGM_FI_PROF_SM_ACTIVE"]["mean"] == [0.5]
     assert "gpu0.DCGM_FI_DEV_DRIVER_VERSION" not in metrics
 
 
@@ -328,17 +383,60 @@ def test_extract_metrics_skips_non_numeric_fields(mod):
 
 
 def test_stats_empty_returns_none_n_zero(mod):
-    s = mod.stats([])
-    assert s == {"n": 0, "mean": None, "median": None,
-                  "p90": None, "p99": None, "max": None}
+    s = mod.stats({"mean": [], "min": [], "max": [], "n": []})
+    assert s == {"n_windows": 0, "n_samples": 0, "mean": None, "median": None,
+                  "p90": None, "p99": None, "min": None, "max": None}
+    # Empty flat-list path also collapses cleanly.
+    assert mod.stats([])["n_windows"] == 0
 
 
-def test_stats_basic_correctness(mod):
+def test_stats_basic_correctness_flat_list(mod):
+    """Flat-list input still works (legacy callers): min == max == mean
+    for each value, n_samples synthesized as len()."""
     s = mod.stats([10.0, 20.0, 30.0, 40.0, 50.0])
-    assert s["n"] == 5
+    assert s["n_windows"] == 5
+    assert s["n_samples"] == 5
     assert s["mean"] == pytest.approx(30.0)
     assert s["median"] == pytest.approx(30.0)
+    assert s["min"] == pytest.approx(10.0)
     assert s["max"] == pytest.approx(50.0)
+
+
+def test_stats_dict_uses_extrema_for_min_max(mod):
+    """For dict-shape records, `max` must be max-of-window-maxs (TRUE
+    peak), not max-of-window-means. Same for min. This is the load-
+    bearing fix that motivated the refactor: with point-sample input
+    these collapsed; with window-aggregate input the difference can
+    be large for bursty signals like SM_ACTIVE."""
+    rec = {
+        "mean": [0.50, 0.55, 0.60],   # window-means cluster around 0.55
+        "min":  [0.05, 0.10, 0.15],   # but some windows dipped to 0.05
+        "max":  [0.95, 0.98, 0.99],   # and other windows peaked at 0.99
+        "n":    [10, 10, 10],
+    }
+    s = mod.stats(rec)
+    assert s["n_windows"] == 3
+    assert s["n_samples"] == 30
+    assert s["mean"] == pytest.approx(0.55)   # n-weighted mean of means
+    assert s["min"] == pytest.approx(0.05)    # true within-period valley
+    assert s["max"] == pytest.approx(0.99)    # true within-period peak
+    # p99 stays on the window-means -- it's a window-level percentile.
+    assert s["p99"] <= 0.60
+
+
+def test_stats_weights_mean_by_n(mod):
+    """When window-n varies (e.g. partial window at the start/end of a
+    sample stream), the cross-window mean must weight by n rather than
+    treating every window equally."""
+    rec = {
+        "mean": [0.10, 0.90],
+        "min":  [0.05, 0.85],
+        "max":  [0.15, 0.95],
+        "n":    [1, 9],         # second window has 9x the weight
+    }
+    s = mod.stats(rec)
+    # Weighted: (0.10*1 + 0.90*9) / 10 = 0.82
+    assert s["mean"] == pytest.approx(0.82)
 
 
 # ---------- CSV ----------
@@ -346,8 +444,10 @@ def test_stats_basic_correctness(mod):
 
 def test_write_csv_columns_and_rows(mod, tmp_path):
     stats_per_metric = {
-        "host.cpu_util_pct": {"n": 3, "mean": 35.0, "median": 33.0,
-                               "p90": 50.0, "p99": 58.0, "max": 60.0},
+        "host.cpu_util_pct": {"n_windows": 3, "n_samples": 30,
+                              "mean": 35.0, "median": 33.0,
+                              "p90": 50.0, "p99": 58.0,
+                              "min": 12.0, "max": 60.0},
     }
     csv_path = tmp_path / "out.csv"
     mod.write_csv(stats_per_metric, "ses_x", (100.0, 200.0), csv_path)
@@ -358,8 +458,12 @@ def test_write_csv_columns_and_rows(mod, tmp_path):
     assert row["session_id"] == "ses_x"
     assert row["window_duration_s"] == "100.000"
     assert row["metric"] == "host.cpu_util_pct"
+    assert row["n_windows"] == "3"
+    assert row["n_samples"] == "30"
     assert row["mean"] == "35.0000"
     assert row["p99"] == "58.0000"
+    assert row["min"] == "12.0000"
+    assert row["max"] == "60.0000"
 
 
 # ---------- main end-to-end ----------
@@ -495,7 +599,9 @@ def test_main_all_points_mode_when_profile_omitted(mod, tmp_path, capsys):
         if row["metric"] == "host.cpu_util_pct":
             assert float(row["mean"]) == pytest.approx(30.0)
             assert float(row["max"]) == pytest.approx(50.0)
-            assert row["n"] == "5"
+            assert float(row["min"]) == pytest.approx(10.0)
+            assert row["n_windows"] == "5"
+            assert row["n_samples"] == "5"   # scalar inputs → 1 each
             break
     else:
         pytest.fail("host.cpu_util_pct row missing from CSV")
