@@ -175,12 +175,16 @@ def _build_fake_dcgm():
     return (fake_ds, fake_df, fake_pd), recorder
 
 
-def test_dcgm_sampler_routes_prof_sampled_to_profiling_watch(mod, monkeypatch):
+def test_dcgm_sampler_splits_prof_sampled_into_dedicated_field_group(mod, monkeypatch):
     """Real bug regression-guard: PROF_SM_ACTIVE / PIPE_* / DRAM_ACTIVE
-    MUST be watched via DcgmGroup.profiling.WatchFields (perfworks
-    activation), not samples.WatchFields — otherwise they silently
-    return 0 for the full run. Observed live with vLLM serving for
-    30+ minutes and SM_ACTIVE pinned at 0 until this split landed."""
+    MUST live in a SEPARATE field group from non-profiling fields.
+    Mixing them into the regular group suppresses perfworks auto-
+    activation in DCGM 3.x and they silently return 0 (observed live
+    with vLLM serving for 30+ minutes).
+
+    Both groups still go through samples.WatchFields — DCGM 3.x's
+    auto-detection looks at field group membership, not which API
+    method was called."""
     triple, recorder = _build_fake_dcgm()
     monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
 
@@ -192,14 +196,20 @@ def test_dcgm_sampler_routes_prof_sampled_to_profiling_watch(mod, monkeypatch):
         "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE",
     ], update_freq_us=5_000_000)
 
-    by_api = {api: (fg_name, freq, fids) for api, fg_name, freq, fids in recorder.calls}
-    assert set(by_api) == {"samples", "profiling"}, (
-        f"both APIs must be invoked when both classes of fields are "
-        f"requested; got {set(by_api)}"
+    samples_calls = [c for c in recorder.calls if c[0] == "samples"]
+    assert len(samples_calls) == 2, (
+        f"expected TWO samples.WatchFields calls (regular fg + PROF "
+        f"sampled fg, separated for perfworks activation); got "
+        f"{samples_calls}"
     )
 
-    # samples.WatchFields gets DEV_* + PROF byte counters
-    _, _, regular_fids = by_api["samples"]
+    # Locate which call is which by field-group name.
+    by_name = {fg_name: (freq, fids) for _, fg_name, freq, fids in samples_calls}
+    assert "testbed_monitor_regular_fg" in by_name
+    assert "testbed_monitor_prof_fg" in by_name
+
+    # Regular group: DEV_* + PROF byte counters (which don't need perfworks)
+    _, regular_fids = by_name["testbed_monitor_regular_fg"]
     regular_names = {
         n for n in ("DCGM_FI_DEV_GPU_UTIL", "DCGM_FI_DEV_FB_USED",
                     "DCGM_FI_PROF_PCIE_RX_BYTES")
@@ -209,84 +219,41 @@ def test_dcgm_sampler_routes_prof_sampled_to_profiling_watch(mod, monkeypatch):
         "DCGM_FI_DEV_GPU_UTIL", "DCGM_FI_DEV_FB_USED",
         "DCGM_FI_PROF_PCIE_RX_BYTES",
     }
+    # PROF sampled must NOT leak into the regular group (the whole bug)
+    assert getattr(triple[1], "DCGM_FI_PROF_SM_ACTIVE") not in regular_fids
 
-    # profiling.WatchFields gets PROF sampled
-    _, prof_freq, prof_fids = by_api["profiling"]
+    # PROF group: only PROF sampled fields
+    prof_freq, prof_fids = by_name["testbed_monitor_prof_fg"]
     prof_names = {
         n for n in ("DCGM_FI_PROF_SM_ACTIVE", "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE")
         if getattr(triple[1], n) in prof_fids
     }
     assert prof_names == {"DCGM_FI_PROF_SM_ACTIVE", "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"}
 
-    # Profiling update freq is capped at 1s even when caller asks for 5s
-    # — perfworks rounds long windows toward 0 on short bursts.
+    # PROF update freq capped at 1s even when caller asks for 5s.
     assert prof_freq == 1_000_000, (
         f"prof updateFreq must be capped at 1s (1_000_000us), got {prof_freq}"
     )
 
 
-def test_dcgm_sampler_skips_profiling_when_no_prof_sampled_requested(mod, monkeypatch):
-    """Caller asked only for regular fields → don't touch profiling
-    subsystem at all (leaves the perfworks lock free for dcgm-exporter
-    or another monitoring process)."""
+def test_dcgm_sampler_skips_prof_group_when_no_prof_sampled_requested(mod, monkeypatch):
+    """Caller asked only for regular fields → no PROF group created,
+    only one samples.WatchFields call."""
     triple, recorder = _build_fake_dcgm()
     monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
 
     mod.DcgmSampler([
         "DCGM_FI_DEV_GPU_UTIL",
-        "DCGM_FI_PROF_PCIE_RX_BYTES",  # counter, not sampled
+        "DCGM_FI_PROF_PCIE_RX_BYTES",  # counter, not perfworks-sampled
     ])
 
-    apis = {api for api, *_ in recorder.calls}
-    assert apis == {"samples"}, (
-        f"profiling.WatchFields must not be called when no PROF sampled "
-        f"fields requested; got {apis}"
-    )
-
-
-def test_dcgm_sampler_falls_back_to_samples_on_profiling_failure(mod, monkeypatch, capsys):
-    """DCGM 3.0+ deprecated dcgmProfWatchFields. When the profiling API
-    raises, fall back to samples.WatchFields for the PROF fields rather
-    than crashing — modern DCGM's samples.WatchFields auto-activates
-    profiling internally on 3.0+."""
-    triple, recorder = _build_fake_dcgm()
-    fake_ds, fake_df, fake_pd = triple
-
-    # Replace DcgmGroup.profiling.WatchFields with a raising one.
-    class RaisingFakeWatcher:
-        def __init__(self, api_label):
-            self.api_label = api_label
-        def WatchFields(self, fg, updateFreq, maxKeepAge, maxKeepSamples):
-            if self.api_label == "profiling":
-                raise RuntimeError("dcgmProfWatchFields removed in DCGM 3.0+")
-            recorder.calls.append((self.api_label, fg.name, updateFreq, tuple(fg.fieldIds)))
-
-    class RaisingFakeGroup:
-        def __init__(self, *a, **kw):
-            self.samples = RaisingFakeWatcher("samples")
-            self.profiling = RaisingFakeWatcher("profiling")
-
-    fake_pd.DcgmGroup.side_effect = RaisingFakeGroup
-    monkeypatch.setattr(mod, "_import_dcgm", lambda: triple)
-
-    mod.DcgmSampler([
-        "DCGM_FI_DEV_GPU_UTIL",
-        "DCGM_FI_PROF_SM_ACTIVE",
-    ])
-
-    # PROF fields should now appear in a SECOND samples.WatchFields call
     samples_calls = [c for c in recorder.calls if c[0] == "samples"]
-    assert len(samples_calls) == 2, (
-        f"expected one regular + one fallback samples.WatchFields call; "
-        f"got {samples_calls}"
+    assert len(samples_calls) == 1, (
+        f"expected exactly one samples.WatchFields call when no PROF "
+        f"sampled fields requested; got {samples_calls}"
     )
-    fallback_fids = samples_calls[1][3]
-    assert getattr(fake_df, "DCGM_FI_PROF_SM_ACTIVE") in fallback_fids
-
-    # User must see the warning so they can debug if the fallback also yields 0
-    err = capsys.readouterr().err
-    assert "profiling.WatchFields failed" in err
-    assert "RuntimeError" in err
+    fg_name = samples_calls[0][1]
+    assert fg_name == "testbed_monitor_regular_fg"
 
 
 def test_to_json_value_coerces_bytes_and_passes_scalars(mod):

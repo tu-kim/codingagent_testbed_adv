@@ -94,19 +94,17 @@ DEFAULT_DCGM_FIELDS = [
 ]
 
 
-# DCGM_FI_PROF_* fields that REQUIRE the perfworks profiling subsystem
-# to be active. Watching them via `samples.WatchFields` (the regular
-# path) silently returns 0 — observed first-hand on DCGM 2.x with a
-# running vLLM workload showing SM_ACTIVE=0 for 30+ minutes while
-# PROF_PCIE_*_BYTES (which are hardware counters, not perfworks)
-# read correctly.
+# DCGM_FI_PROF_* fields that depend on the perfworks profiling
+# subsystem. On DCGM 3.x these are auto-activated when watched via
+# samples.WatchFields, but ONLY when they're isolated in their own
+# field group (mixing them with non-profiling fields in a single
+# group is the configuration where activation gets skipped). Keeping
+# them on a dedicated field group + short updateFreq is the
+# documented-working recipe.
 #
-# These must be watched via `DcgmGroup.profiling.WatchFields` which
-# under the hood calls `dcgmProfWatchFields` to activate the perfworks
-# subsystem.
-#
-# Fields NOT in this set (e.g. PROF_PCIE_*_BYTES, PROF_NVLINK_*_BYTES,
-# all DCGM_FI_DEV_*) can be watched normally via samples.WatchFields.
+# Fields NOT in this set (PROF_PCIE/NVLINK_*_BYTES, all DCGM_FI_DEV_*)
+# are hardware counters / NVML and don't need perfworks. They go on
+# the regular field group with the caller's updateFreq.
 PROF_SAMPLED_FIELDS = frozenset({
     "DCGM_FI_PROF_SM_ACTIVE",
     "DCGM_FI_PROF_SM_OCCUPANCY",
@@ -289,38 +287,20 @@ class DcgmSampler:
                 name="testbed_monitor_prof_fg",
                 fieldIds=self._prof_field_ids,
             )
-            # Profiling counters have higher hardware resolution. Cap
-            # the update period at 1s — longer windows make perfworks
-            # average over irrelevantly-large intervals and round
-            # short bursts to 0.
+            # Cap update period at 1s — perfworks windows longer than
+            # ~1s average over irrelevantly-large intervals and round
+            # short compute bursts down to 0. The samples.WatchFields
+            # path here auto-activates perfworks in DCGM 3.x BECAUSE
+            # the field group contains ONLY PROF sampled fields (the
+            # original bug was mixing them into the regular group,
+            # which suppressed activation).
             prof_update_freq = min(update_freq_us, 1_000_000)
-            try:
-                self._group.profiling.WatchFields(
-                    prof_fg,
-                    updateFreq=prof_update_freq,
-                    maxKeepAge=600.0,
-                    maxKeepSamples=0,
-                )
-            except Exception as e:
-                # DCGM 3.0+ deprecated dcgmProfWatchFields in favor of
-                # auto-detection inside dcgmWatchFields. On those
-                # versions the call above raises; fall back to the
-                # regular watch (which DOES activate profiling on 3.x).
-                print(
-                    f"monitor_resources: profiling.WatchFields failed "
-                    f"({type(e).__name__}: {e}); falling back to "
-                    f"samples.WatchFields for PROF fields. If "
-                    f"SM_ACTIVE etc. still read 0, check whether "
-                    f"another DCGM client holds the profiling lock "
-                    f"(only one client at a time per GPU).",
-                    file=sys.stderr,
-                )
-                self._group.samples.WatchFields(
-                    prof_fg,
-                    updateFreq=prof_update_freq,
-                    maxKeepAge=600.0,
-                    maxKeepSamples=0,
-                )
+            self._group.samples.WatchFields(
+                prof_fg,
+                updateFreq=prof_update_freq,
+                maxKeepAge=600.0,
+                maxKeepSamples=0,
+            )
 
         self._gpu_ids = list(system.discovery.GetAllSupportedGpuIds())
 
