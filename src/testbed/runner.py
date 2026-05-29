@@ -246,10 +246,25 @@ async def run(
     router_label: str,
     task_timeout_s: float | None = None,
     reset_workspace: bool = False,
+    sequential: bool = False,
 ) -> None:
-    """Drive `num_samples` SWE-bench tasks at `qps` Poisson rate."""
+    """Drive `num_samples` SWE-bench tasks.
+
+    Default mode: Poisson arrivals at `qps`, bounded concurrency at
+    `max_in_flight`. arrival_offsets are computed up front and tasks fire
+    at their offsets via `poisson.arrivals` -- so the system experiences
+    realistic burst patterns and queueing behavior.
+
+    sequential=True: ignore qps + max_in_flight; run tasks strictly
+    back-to-back (task N+1 starts the moment task N's TaskRecord lands).
+    Guarantees exactly one request in flight at all times -- no
+    concurrent batching, no scheduler-induced reordering, no router
+    cross-talk. Trades realism for reproducibility; pair with
+    --reset-workspace for byte-stable workspace state. `arrival_offset_s`
+    in TaskRecord becomes the elapsed wall-clock from run start at the
+    moment that task started (i.e. the cumulative RTT of prior tasks).
+    """
     samples = swebench.load_samples(split, seed, num_samples)
-    offsets = poisson.arrival_offsets(qps, num_samples, seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     workspace_root = Path(cfg.workspace_root)
@@ -275,6 +290,7 @@ async def run(
         "max_in_flight": max_in_flight,
         "task_timeout_s": task_timeout_s,
         "reset_workspace": reset_workspace,
+        "sequential": sequential,
         "router": router_label,
         "model": cfg.model.model_dump(mode="json"),
         "config": resolved_snapshot(cfg),
@@ -282,7 +298,9 @@ async def run(
     }
     (out_dir / "config.json").write_text(json.dumps(invocation, indent=2) + "\n")
 
-    sem = asyncio.Semaphore(max_in_flight)
+    # Semaphore exists even in sequential mode (passed to _run_one as a
+    # required positional) but is degenerate at size=1.
+    sem = asyncio.Semaphore(1 if sequential else max_in_flight)
     password = os.environ.get("OPENCODE_SERVER_PASSWORD") or None
 
     records: list[TaskRecord] = []
@@ -290,27 +308,46 @@ async def run(
 
     async with OpenCodeClient(cfg.opencode, password=password) as client:
         with trace_path.open("w") as trace_fh:
-            tasks: list[asyncio.Task[TaskRecord]] = []
             start = time.monotonic()
-            async for i in poisson.arrivals(offsets, start_monotonic=start):
-                tasks.append(
-                    asyncio.create_task(
-                        _run_one(
-                            client,
-                            samples[i],
-                            offsets[i],
-                            workspace_root,
-                            sem,
-                            task_timeout_s=task_timeout_s,
-                            reset_workspace=reset_workspace,
+            if sequential:
+                # Strictly serial: await each task fully before kicking off
+                # the next. No Poisson distribution, no concurrent tasks.
+                for i, sample in enumerate(samples):
+                    elapsed = time.monotonic() - start
+                    rec = await _run_one(
+                        client,
+                        sample,
+                        elapsed,
+                        workspace_root,
+                        sem,
+                        task_timeout_s=task_timeout_s,
+                        reset_workspace=reset_workspace,
+                    )
+                    trace_fh.write(rec.to_jsonl())
+                    trace_fh.flush()
+                    records.append(rec)
+            else:
+                offsets = poisson.arrival_offsets(qps, num_samples, seed)
+                tasks: list[asyncio.Task[TaskRecord]] = []
+                async for i in poisson.arrivals(offsets, start_monotonic=start):
+                    tasks.append(
+                        asyncio.create_task(
+                            _run_one(
+                                client,
+                                samples[i],
+                                offsets[i],
+                                workspace_root,
+                                sem,
+                                task_timeout_s=task_timeout_s,
+                                reset_workspace=reset_workspace,
+                            )
                         )
                     )
-                )
 
-            for fut in asyncio.as_completed(tasks):
-                rec = await fut
-                trace_fh.write(rec.to_jsonl())
-                trace_fh.flush()
-                records.append(rec)
+                for fut in asyncio.as_completed(tasks):
+                    rec = await fut
+                    trace_fh.write(rec.to_jsonl())
+                    trace_fh.flush()
+                    records.append(rec)
 
     (out_dir / "summary.json").write_text(json.dumps(_summary(records), indent=2) + "\n")

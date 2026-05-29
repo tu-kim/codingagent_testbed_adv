@@ -51,7 +51,20 @@ def main() -> None:
         "of the same sample -- required for reproducible system prompts "
         "in opencode (which embeds the cwd). Default off preserves the "
         "legacy UUID-suffix + accumulate behavior. For full agent-loop "
-        "reproducibility pair with --max-in-flight 1."
+        "reproducibility pair with --sequential."
+    ),
+)
+@click.option(
+    "--sequential",
+    is_flag=True,
+    default=False,
+    help=(
+        "Strictly back-to-back execution: task N+1 starts the moment "
+        "task N finishes. Ignores --qps and --max-in-flight. Guarantees "
+        "exactly one request in flight at all times -- no concurrent "
+        "batching, no router cross-talk, no scheduler reordering. "
+        "Use for reproducibility comparisons; pair with --reset-workspace. "
+        "Default off preserves the Poisson-arrival workload model."
     ),
 )
 @click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
@@ -65,6 +78,7 @@ def run_cmd(
     task_timeout_s: float,
     router: str,
     reset_workspace: bool,
+    sequential: bool,
     out: Path,
     config_path: Path | None,
 ) -> None:
@@ -82,6 +96,7 @@ def run_cmd(
             router_label=router,
             task_timeout_s=task_timeout_s if task_timeout_s > 0 else None,
             reset_workspace=reset_workspace,
+            sequential=sequential,
         )
     )
 

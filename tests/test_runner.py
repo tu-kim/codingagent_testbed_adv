@@ -459,3 +459,140 @@ def _fake_arrivals(indices):
         for i in indices:
             yield i
     return _gen
+
+
+# ---------------------------------------------------------------------------
+# Sequential mode
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_sequential_skips_poisson_and_marks_config(
+    monkeypatch, tmp_path: Path
+):
+    """sequential=True must NOT touch poisson.arrivals / arrival_offsets and
+    config.json must record sequential=True. This is the load-bearing
+    guarantee: in sequential mode the Poisson model is bypassed entirely."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    fake_client = _FakeClient()
+
+    def _boom(*a, **kw):
+        raise AssertionError("poisson must not be called in sequential mode")
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE, _SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", side_effect=_boom):
+                with patch.object(runner.poisson, "arrivals", side_effect=_boom):
+                    await runner.run(
+                        cfg,
+                        split="lite",
+                        num_samples=2,
+                        qps=1.0,
+                        seed=42,
+                        max_in_flight=16,   # ignored in sequential mode
+                        out_dir=tmp_path / "out",
+                        router_label="test",
+                        task_timeout_s=None,
+                        sequential=True,
+                    )
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["sequential"] is True
+    # qps and max_in_flight are still recorded (so reproducibility is
+    # documented) but did not influence execution.
+    assert config_json["qps"] == 1.0
+    assert config_json["max_in_flight"] == 16
+
+
+@pytest.mark.asyncio
+async def test_run_sequential_executes_strictly_back_to_back(
+    monkeypatch, tmp_path: Path
+):
+    """In sequential mode, task N+1's create_session MUST be called only
+    AFTER task N's list_messages completed. Verified by tracking event
+    order on a fake client whose send_message takes measurable time."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+
+    # Two samples with distinct ids so directory names differ.
+    samples = [
+        {**_SAMPLE, "instance_id": "task_a"},
+        {**_SAMPLE, "instance_id": "task_b"},
+    ]
+    events: list[str] = []
+
+    class _OrderedFakeClient:
+        async def create_session(self, directory: str) -> str:
+            events.append(f"create:{directory.split('/')[-1]}")
+            return "ses_" + directory.split("-")[-1]
+        async def send_message(self, session_id, prompt, directory):
+            events.append(f"send-start:{session_id}")
+            # Yield to the loop so any incorrectly-pipelined create_session
+            # call from the next task would race in here. In strict
+            # sequential mode no such call should exist.
+            await asyncio.sleep(0.01)
+            events.append(f"send-end:{session_id}")
+            return {"info": {}, "parts": []}
+        async def list_messages(self, session_id, directory):
+            events.append(f"list:{session_id}")
+            return [{"info": {}, "parts": []}]
+
+    fake_client = _OrderedFakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite",
+                num_samples=2,
+                qps=1.0,
+                seed=42,
+                max_in_flight=16,
+                out_dir=tmp_path / "out",
+                router_label="",
+                task_timeout_s=None,
+                sequential=True,
+            )
+
+    # Task A's full lifecycle must end before any event of task B begins.
+    a_last = max(i for i, e in enumerate(events) if "task_a" in e or e.endswith("ses_a"))
+    b_first = min(
+        i for i, e in enumerate(events) if "task_b" in e or e.endswith("ses_b")
+    )
+    assert a_last < b_first, f"events interleaved: {events}"
+
+
+@pytest.mark.asyncio
+async def test_run_sequential_arrival_offset_grows_with_elapsed(
+    monkeypatch, tmp_path: Path
+):
+    """arrival_offset_s in sequential mode = elapsed wall-clock when the
+    task began. Task 0 starts at ~0; subsequent tasks' offsets must be
+    strictly > prior task's offset (cumulative)."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    samples = [
+        {**_SAMPLE, "instance_id": f"task_{i}"} for i in range(3)
+    ]
+
+    class _SlowFakeClient(_FakeClient):
+        async def send_message(self, session_id, prompt, directory):
+            await asyncio.sleep(0.02)
+            return await super().send_message(session_id, prompt, directory)
+
+    fake = _SlowFakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=3, qps=1.0, seed=42, max_in_flight=16,
+                out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+            )
+
+    trace = [json.loads(l) for l in (tmp_path / "out" / "trace.jsonl").read_text().splitlines()]
+    offsets = [t["arrival_offset_s"] for t in trace]
+    assert offsets[0] >= 0.0
+    # Each task's offset must exceed the prior's by at least the sleep
+    # duration (per-task RTT includes the 20ms send sleep).
+    for prev, curr in zip(offsets, offsets[1:]):
+        assert curr > prev, f"offsets not monotonic: {offsets}"
