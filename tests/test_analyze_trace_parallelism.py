@@ -249,6 +249,31 @@ def test_task_input_description_falls_back_through_keys(mod, tmp_path):
     assert "foo" in descs[2] and "bar" in descs[2]
 
 
+def test_multiple_task_tools_in_one_step_detected(mod, tmp_path):
+    """Two `task` tools in a single LLM response = two sub-agents
+    spawned concurrently. Both must register as TaskSpawns AND the
+    batch's tools list must contain both, so the summary's
+    `tools.count("task") > 1` filter catches it."""
+    p = tmp_path / "trace.jsonl"
+    _write_trace(p, [{
+        "instance_id": "t",
+        "messages": [_msg("assistant", _step(
+            ("task", {"description": "agent A: find tests"}),
+            ("task", {"description": "agent B: find models"}),
+        ))],
+    }])
+    batches, spawns, _, _ = mod.analyze_trace(p)
+    assert len(batches) == 1
+    assert batches[0].tools == ["task", "task"]
+    assert batches[0].tools.count("task") == 2   # the multi-subagent signal
+    assert len(spawns) == 2
+    assert {s.description for s in spawns} == {
+        "agent A: find tests", "agent B: find models",
+    }
+    # callIDs share the synthetic name in the fixture but both recorded.
+    assert all(s.instance_id == "t" for s in spawns)
+
+
 def test_task_tool_inside_parallel_batch(mod, tmp_path):
     """A task tool called alongside other tools in the same step
     is both: a member of a parallel batch AND a sub-agent spawn."""

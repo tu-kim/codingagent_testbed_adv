@@ -173,11 +173,28 @@ def print_summary(batches: list[ParallelBatch],
     total_parallel = len(batches)
     rate_pct = (100.0 * total_parallel / total_steps) if total_steps else 0.0
 
+    # Steps that spawned MORE THAN ONE sub-agent concurrently (>1 `task`
+    # tool in the same LLM response). This is a notable case: parallel
+    # task spawns mean multiple nested opencode sessions running at once,
+    # each hammering the vLLM workers -- it inflates concurrency well
+    # beyond --max-in-flight and is a prime suspect when measured load
+    # spikes above what the arrival process should produce.
+    multi_task_batches = [b for b in batches if b.tools.count("task") > 1]
+
     print()
-    print(f"LLM steps total:          {total_steps}")
+    print(f"LLM steps total:           {total_steps}")
     print(f"Steps with parallel tools: {total_parallel}  ({rate_pct:.1f}%)")
     print(f"Sub-agent (task) spawns:   {len(spawns)}")
+    print(f"Steps spawning >1 task in parallel: {len(multi_task_batches)}")
     print()
+
+    if multi_task_batches:
+        print("PARALLEL SUB-AGENT steps (>1 task tool in one LLM response):")
+        for b in multi_task_batches:
+            n_task = b.tools.count("task")
+            print(f"  [{b.instance_id:<40}] msg#{b.msg_idx} step#{b.step_idx}  "
+                  f"{n_task} tasks  (full batch: {b.tools})")
+        print()
 
     # Top parallel-tool combinations (order-insensitive).
     combos: Counter[tuple[str, ...]] = Counter(
