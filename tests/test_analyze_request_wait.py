@@ -337,6 +337,56 @@ def test_main_writes_percentile_and_tail_csvs(mod, tmp_path, capsys):
     assert "wait_share" in captured
 
 
+# ---------- figures (matplotlib-gated) ----------
+
+
+def test_make_figures_writes_three_pdfs(mod, tmp_path):
+    """make_figures renders the three PDFs from matched rows. Skipped if
+    matplotlib isn't installed (the CSV/stdout path never needs it)."""
+    pytest.importorskip("matplotlib")
+    rows = [
+        mod.RequestWait(f"r{i}", total_ms=100.0 + 50 * i, ttft_ms=None,
+                        prefill_wait_ms=2.0 * i, decode_wait_ms=3.0 * i)
+        for i in range(6)
+    ]
+    out = tmp_path / "figs"
+    out.mkdir()
+    paths = mod.make_figures(rows, out)
+    names = {p.name for p in paths}
+    assert names == {
+        "fig_wait_vs_total.pdf",
+        "fig_wait_fraction_by_percentile.pdf",
+        "fig_latency_decomposition.pdf",
+    }
+    for p in paths:
+        assert p.exists() and p.stat().st_size > 0
+
+
+def test_make_figures_empty_when_no_matched(mod, tmp_path):
+    """No matched rows → no figures, no matplotlib import attempted."""
+    rows = [mod.RequestWait("r1", total_ms=100.0, ttft_ms=None,
+                            prefill_wait_ms=None, decode_wait_ms=None)]
+    assert mod.make_figures(rows, tmp_path) == []
+
+
+def test_main_figures_flag_renders_pdfs(mod, tmp_path):
+    pytest.importorskip("matplotlib")
+    fe = tmp_path / "frontend.log"
+    fe.write_text(_frontend_line("r1", 200) + _frontend_line("r2", 400))
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "vllm-d0.log").write_text(
+        _sched_line("r1", "decode", 30.0) + _sched_line("r2", "decode", 80.0)
+    )
+    out = tmp_path / "out"
+    rc = mod.main(["--frontend", str(fe), "--logs", str(logs),
+                   "--output", str(out), "--figures"])
+    assert rc == 0
+    assert (out / "fig_wait_vs_total.pdf").exists()
+    assert (out / "fig_wait_fraction_by_percentile.pdf").exists()
+    assert (out / "fig_latency_decomposition.pdf").exists()
+
+
 def test_main_missing_frontend_returns_2(mod, tmp_path):
     logs = tmp_path / "logs"; logs.mkdir()
     rc = mod.main(["--frontend", str(tmp_path / "nope.log"),

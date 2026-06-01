@@ -30,16 +30,23 @@ is never surfaced dynamo-side). Pass --session-map <csv> with columns
 the README/CLAUDE note on producing that map from the opencode profile.
 
 Outputs:
-  request_wait.csv    per-request join (one row per frontend request)
-  session_wait.csv    per-session rollup (only with --session-map)
-  stdout              coverage + wait-fraction distribution
+  request_wait.csv     per-request join (one row per frontend request)
+  wait_percentiles.csv p50..p99.9/max of wait_fraction / total_wait_ms / total_ms
+  wait_tail.csv        slowest-X% buckets: mean wait_fraction + wait_share
+  session_wait.csv     per-session rollup (only with --session-map)
+  fig_*.pdf            only with --figures (needs matplotlib):
+                         fig_wait_vs_total                (scatter, y=x ref)
+                         fig_wait_fraction_by_percentile  (rises in the tail)
+                         fig_latency_decomposition        (stacked compute|wait)
+  stdout               coverage + wait distribution + tail table
 
 Usage:
   scripts/analyze_request_wait.py \\
       --frontend logs/frontend.log \\
       --logs logs/ \\
       --output results/run1/wait \\
-      [--session-map results/run1/req_to_session.csv]
+      [--session-map results/run1/req_to_session.csv] \\
+      [--figures]
 """
 
 from __future__ import annotations
@@ -377,6 +384,127 @@ def write_tail_csv(buckets: list[TailBucket], path: Path) -> None:
                         _fmt(b.mean_wait_fraction), _fmt(b.wait_share)])
 
 
+# ---------- figures (opt-in: --figures; matplotlib imported lazily) ----------
+
+_PAPER_STYLE = {
+    "font.family": "serif",
+    "font.size": 9,
+    "axes.labelsize": 9,
+    "axes.titlesize": 10,
+    "figure.figsize": (3.4, 2.4),
+    "figure.dpi": 150,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.05,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "pdf.fonttype": 42,
+}
+
+
+def _setup_plt():
+    """Lazy matplotlib import with a headless backend so the CSV/stdout
+    path never requires matplotlib (only --figures does)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update(_PAPER_STYLE)
+    return plt
+
+
+def _matched_sorted(rows: list[RequestWait]) -> list[RequestWait]:
+    return sorted(
+        (r for r in rows if r.matched and r.wait_fraction is not None),
+        key=lambda r: r.total_ms,
+    )
+
+
+def plot_wait_vs_total(rows: list[RequestWait], out: Path) -> Path | None:
+    """Scatter: e2e (x) vs queue wait (y), coloured by wait fraction, with
+    the y=x reference. Points hugging y=x at the high-x end ⇒ the slowest
+    requests are slow because they're WAITING, not computing."""
+    m = _matched_sorted(rows)
+    if not m:
+        return None
+    plt = _setup_plt()
+    x = [r.total_ms for r in m]
+    y = [r.total_wait_ms for r in m]
+    c = [r.wait_fraction for r in m]
+    fig, ax = plt.subplots()
+    sc = ax.scatter(x, y, c=c, s=9, cmap="viridis", vmin=0.0, vmax=1.0,
+                    alpha=0.75, linewidths=0)
+    lim = max(max(x), max(y)) or 1.0
+    ax.plot([0, lim], [0, lim], ls="--", lw=0.6, color="0.5", zorder=0)
+    ax.set_xlabel("end-to-end latency (ms)")
+    ax.set_ylabel("scheduler queue wait (ms)")
+    cb = fig.colorbar(sc, ax=ax)
+    cb.set_label("wait fraction")
+    p = out / "fig_wait_vs_total.pdf"
+    fig.savefig(p)
+    plt.close(fig)
+    return p
+
+
+def plot_wait_fraction_by_percentile(rows: list[RequestWait], out: Path) -> Path | None:
+    """wait_fraction against e2e-latency percentile. A curve that rises
+    toward the right = the tail of the latency distribution is
+    increasingly wait-dominated."""
+    m = _matched_sorted(rows)
+    if not m:
+        return None
+    plt = _setup_plt()
+    n = len(m)
+    pct = [100.0 * (i + 0.5) / n for i in range(n)]
+    wf = [r.wait_fraction for r in m]
+    fig, ax = plt.subplots()
+    ax.plot(pct, wf, lw=1.0)
+    ax.set_xlabel("e2e latency percentile")
+    ax.set_ylabel("wait fraction")
+    ax.set_ylim(0, 1)
+    ax.set_xlim(0, 100)
+    p = out / "fig_wait_fraction_by_percentile.pdf"
+    fig.savefig(p)
+    plt.close(fig)
+    return p
+
+
+def plot_latency_decomposition(rows: list[RequestWait], out: Path) -> Path | None:
+    """Stacked area over the e2e percentile axis: compute+transfer (e2e
+    minus queue wait) on the bottom, queue wait on top. The wait band
+    thickening toward the right is the visual 'tail grows' statement."""
+    m = _matched_sorted(rows)
+    if not m:
+        return None
+    plt = _setup_plt()
+    n = len(m)
+    pct = [100.0 * (i + 0.5) / n for i in range(n)]
+    wait = [r.total_wait_ms for r in m]
+    compute = [max(0.0, r.total_ms - r.total_wait_ms) for r in m]
+    fig, ax = plt.subplots()
+    ax.stackplot(pct, compute, wait,
+                 labels=["compute + transfer", "queue wait"],
+                 colors=["#9ecae1", "#e6550d"])
+    ax.set_xlabel("e2e latency percentile")
+    ax.set_ylabel("latency (ms)")
+    ax.set_xlim(0, 100)
+    ax.legend(loc="upper left", frameon=False)
+    p = out / "fig_latency_decomposition.pdf"
+    fig.savefig(p)
+    plt.close(fig)
+    return p
+
+
+def make_figures(rows: list[RequestWait], out: Path) -> list[Path]:
+    paths: list[Path] = []
+    for fn in (plot_wait_vs_total,
+               plot_wait_fraction_by_percentile,
+               plot_latency_decomposition):
+        p = fn(rows, out)
+        if p is not None:
+            paths.append(p)
+    return paths
+
+
 def print_summary(rows: list[RequestWait], sessions: list[SessionWait] | None) -> None:
     matched = [r for r in rows if r.matched]
     print()
@@ -436,6 +564,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--session-map", type=Path, default=None,
                     help="Optional CSV (request_id,session_id) to roll up "
                          "per-request rows by opencode session")
+    ap.add_argument("--figures", action="store_true",
+                    help="Also render PDF figures (scatter, wait-fraction-by-"
+                         "percentile, stacked latency decomposition). Requires "
+                         "matplotlib; the CSV/stdout path does not.")
     args = ap.parse_args(argv)
 
     if not args.frontend.exists():
@@ -467,6 +599,10 @@ def main(argv: list[str] | None = None) -> int:
     tail_csv = args.output / "wait_tail.csv"
     write_tail_csv(tail_buckets(rows), tail_csv)
     print(f"  wrote {tail_csv}")
+
+    if args.figures:
+        for p in make_figures(rows, args.output):
+            print(f"  wrote {p}")
 
     sessions = None
     if args.session_map is not None:
