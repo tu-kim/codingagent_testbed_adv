@@ -82,9 +82,9 @@ class _ToolInterval:
 class _Turn:
     session_id: str
     step: int
-    # turn.end always carries duration_s in the profile patch; no
-    # ts-based fallback -- a truncated turn (no turn.end) stays None and
-    # yields a None ratio rather than a fabricated number.
+    # turn.end.duration_s is the authoritative turn wall; read directly.
+    # A truncated turn (no turn.end) stays None and yields a None ratio
+    # rather than a fabricated number.
     turn_duration_s: float | None = None
     tools: dict[str, _ToolInterval] = field(default_factory=dict)
 

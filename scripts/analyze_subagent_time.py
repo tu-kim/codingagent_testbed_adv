@@ -81,8 +81,9 @@ class _ToolInterval:
 class _Turn:
     session_id: str
     step: int
-    # From turn.end.duration_s. The profile patch ALWAYS emits duration_s
-    # on turn.end, so there's no ts-based fallback: a turn with no
+    # turn.end.duration_s is the authoritative turn wall (the patch's
+    # roundSec(nowMs() - turnStart)). We read it directly rather than
+    # differencing turn.start/turn.end timestamps. A turn with no
     # turn.end (truncated/crashed mid-step) keeps this None, which
     # correctly yields a None ratio downstream rather than a fabricated
     # number.
