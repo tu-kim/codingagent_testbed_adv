@@ -164,9 +164,12 @@ monitor:
   scrape_interval_s: 1.0
   scrape_output: logs/vllm_metrics.ndjson
   # Exact-name allowlist of vLLM Prometheus metric names. null = use
-  # scrape_vllm_metrics.py's DEFAULT_METRIC_NAMES (~10 KV-cache + queue +
-  # token throughput metrics; latency histograms are skipped because
-  # nvext.timing + opencode profile already record per-request latency).
+  # scrape_vllm_metrics.py's DEFAULT_METRIC_NAMES (~13 names: KV-cache +
+  # queue depth + token throughput + the request_queue_time_seconds
+  # histogram = prefill/decode scheduling delay). OTHER latency
+  # histograms (TTFT etc.) are skipped because nvext.timing + opencode
+  # profile already record per-request latency; queue-wait is the one
+  # exception since it isn't recoverable client-side.
   # Specify a list to override. Use `--keep-all` for raw debugging.
   vllm_metric_names: null
   # Example -- add TTFT histogram back on top of the default set

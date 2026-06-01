@@ -53,6 +53,13 @@ vllm:time_to_first_token_seconds_bucket{le="0.01",model="qwen3-coder-30b-a3b-ins
 vllm:time_to_first_token_seconds_bucket{le="+Inf",model="qwen3-coder-30b-a3b-instruct-fp8"} 142.0
 vllm:time_to_first_token_seconds_count{model="qwen3-coder-30b-a3b-instruct-fp8"} 142.0
 vllm:time_to_first_token_seconds_sum{model="qwen3-coder-30b-a3b-instruct-fp8"} 38.412
+# HELP vllm:request_queue_time_seconds Scheduler queue wait (scheduling delay) histogram
+# TYPE vllm:request_queue_time_seconds histogram
+vllm:request_queue_time_seconds_bucket{le="0.01",model="qwen3-coder-30b-a3b-instruct-fp8"} 5.0
+vllm:request_queue_time_seconds_bucket{le="0.1",model="qwen3-coder-30b-a3b-instruct-fp8"} 30.0
+vllm:request_queue_time_seconds_bucket{le="+Inf",model="qwen3-coder-30b-a3b-instruct-fp8"} 42.0
+vllm:request_queue_time_seconds_count{model="qwen3-coder-30b-a3b-instruct-fp8"} 42.0
+vllm:request_queue_time_seconds_sum{model="qwen3-coder-30b-a3b-instruct-fp8"} 3.21
 # HELP process_cpu_seconds_total Total CPU time
 # TYPE process_cpu_seconds_total counter
 process_cpu_seconds_total 1234.5
@@ -97,10 +104,17 @@ def test_parse_default_allowlist_keeps_only_curated_names(mod):
     assert "vllm:kv_cache_usage_perc" in out        # headline KV cache memory
     assert "vllm:prompt_tokens_cached_total" in out # hit-token counter
     assert "vllm:prompt_tokens_total" in out
+    # Kept: the scheduler queue-wait histogram (scheduling delay) -- all
+    # three suffixed series, since analyze_vllm_metrics needs bucket +
+    # count + sum to derive percentiles.
+    assert "vllm:request_queue_time_seconds_bucket" in out
+    assert "vllm:request_queue_time_seconds_count" in out
+    assert "vllm:request_queue_time_seconds_sum" in out
     # Dropped: Python/process internals.
     assert "process_cpu_seconds_total" not in out
     assert "python_info" not in out
-    # Dropped: latency histograms (not in the default allowlist).
+    # Dropped: OTHER latency histograms (TTFT etc.) -- recoverable from
+    # nvext.timing + opencode profile, unlike queue-wait.
     assert "vllm:time_to_first_token_seconds_bucket" not in out
     assert "vllm:time_to_first_token_seconds_count" not in out
     assert "vllm:time_to_first_token_seconds_sum" not in out
@@ -145,6 +159,10 @@ def test_default_metric_names_covers_headline_kv_cache_signals(mod):
         "vllm:num_requests_waiting",
         "vllm:prompt_tokens_total",
         "vllm:generation_tokens_total",
+        # Scheduler queue-wait histogram (prefill/decode scheduling delay).
+        "vllm:request_queue_time_seconds_bucket",
+        "vllm:request_queue_time_seconds_count",
+        "vllm:request_queue_time_seconds_sum",
     }
     assert must_include.issubset(mod.DEFAULT_METRIC_NAMES)
     # Stale v0 names must be ABSENT (caught a real regression once --

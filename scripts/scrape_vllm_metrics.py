@@ -69,10 +69,15 @@ from pathlib import Path
 # against vllm v0.19.0 (the dynamo-pinned version) -- the v1 engine
 # renamed several gauges (dropped `gpu_` prefix, removed `cpu_` variant)
 # vs the older v0 names. See dynamo/docs/observability/metrics-comparison.md
-# for the live-scrape reference table. Latency histograms are omitted
-# because per-request latency is already in dynamo's in-band
-# `nvext.timing` + opencode profile NDJSON (duplicating would just
-# balloon the NDJSON). Override via --metric-names or
+# for the live-scrape reference table. Most latency histograms are
+# omitted because per-request latency is already in dynamo's in-band
+# `nvext.timing` + opencode profile NDJSON -- EXCEPT the scheduler
+# queue-wait histogram, which is the one signal NOT recoverable from
+# the client side (it's the time a request sat in the worker's
+# scheduler queue before compute started = scheduling delay). Since we
+# scrape each worker's port separately, a prefill worker's queue-time
+# histogram IS the prefill scheduling-delay distribution and a decode
+# worker's is the decode one. Override via --metric-names or
 # monitor.vllm_metric_names in testbed.yaml.
 DEFAULT_METRIC_NAMES = frozenset({
     # KV cache memory (the headline signal)
@@ -88,9 +93,16 @@ DEFAULT_METRIC_NAMES = frozenset({
     # the dynamo worker propagates to clients. Pairs with preempt count.
     "vllm:prompt_tokens_cached_total",       # hit tokens (counter)
     "vllm:prompt_tokens_recomputed_total",   # tokens lost to preemption + recomputed
-    # Queue depth
+    # Queue depth (instantaneous)
     "vllm:num_requests_running",
     "vllm:num_requests_waiting",
+    # Scheduling delay: time in the worker scheduler queue before compute.
+    # Histogram -- the 3 suffixed series are all needed for
+    # analyze_vllm_metrics' bucket-delta percentiles. Per-worker scrape
+    # splits this into prefill vs decode scheduling-delay distributions.
+    "vllm:request_queue_time_seconds_bucket",
+    "vllm:request_queue_time_seconds_count",
+    "vllm:request_queue_time_seconds_sum",
     # Token throughput counters (cumulative; analyze_vllm_metrics derives delta+rate)
     "vllm:prompt_tokens_total",
     "vllm:generation_tokens_total",
