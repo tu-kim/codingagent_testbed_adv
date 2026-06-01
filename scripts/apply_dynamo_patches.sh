@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# Apply (or revert) testbed-side patches against the vendored opencode/
-# submodule. The submodule pointer stays at the upstream-tagged commit
-# (e.g. v1.14.41) and patches live under deploy/patches/ so the parent
-# repo can be cloned without depending on a local-only opencode SHA.
+# Apply (or revert) testbed-side patches against the vendored dynamo/
+# submodule. The submodule pointer stays at its pinned upstream commit
+# and patches live under deploy/patches/ (prefix dynamo-*.patch) so the
+# parent repo can be cloned without depending on a local-only dynamo SHA.
+#
+# Mirrors scripts/apply_opencode_patches.sh. Patches here are PYTHON-only
+# (e.g. dynamo-scheduling-log.patch touches components/src/dynamo/vllm/
+# handlers.py) so applying them needs NO cargo rebuild -- just restart the
+# workers (deploy/testbed.sh down workers && up workers) to pick them up.
 #
 # Usage:
-#   scripts/apply_opencode_patches.sh           # apply all patches (idempotent)
-#   scripts/apply_opencode_patches.sh --check   # report which patches are pending
-#   scripts/apply_opencode_patches.sh --revert  # reverse-apply all patches
+#   scripts/apply_dynamo_patches.sh           # apply all patches (idempotent)
+#   scripts/apply_dynamo_patches.sh --check   # report which patches are pending
+#   scripts/apply_dynamo_patches.sh --revert  # reverse-apply all patches
 
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCH_DIR="$REPO_ROOT/deploy/patches"
-SUBMODULE="$REPO_ROOT/opencode"
+SUBMODULE="$REPO_ROOT/dynamo"
 
 if [[ ! -d "$SUBMODULE/.git" && ! -f "$SUBMODULE/.git" ]]; then
-  echo "opencode submodule not initialized at $SUBMODULE" >&2
-  echo "  run: git submodule update --init opencode" >&2
+  echo "dynamo submodule not initialized at $SUBMODULE" >&2
+  echo "  run: git submodule update --init dynamo" >&2
   exit 1
 fi
 
@@ -29,15 +34,14 @@ case "${1-}" in
   *) echo "usage: $(basename "$0") [--check|--revert]" >&2; exit 2 ;;
 esac
 
-# Prefix-scoped: deploy/patches/ also holds dynamo-*.patch (applied to the
-# dynamo submodule by apply_dynamo_patches.sh). Only touch opencode-*.patch
-# here so the two submodules' patches never cross-apply.
+# Prefix-scoped to dynamo-*.patch (opencode-*.patch is handled by
+# apply_opencode_patches.sh) so the two submodules never cross-apply.
 shopt -s nullglob
-patches=("$PATCH_DIR"/opencode-*.patch)
+patches=("$PATCH_DIR"/dynamo-*.patch)
 shopt -u nullglob
 
 if [[ ${#patches[@]} -eq 0 ]]; then
-  echo "no patches in $PATCH_DIR"
+  echo "no dynamo-*.patch in $PATCH_DIR"
   exit 0
 fi
 

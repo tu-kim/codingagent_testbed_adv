@@ -29,7 +29,7 @@ def main() -> None:
 @click.option("--max-in-flight", default=16, show_default=True, type=int)
 @click.option(
     "--task-timeout-s",
-    default=600.0,
+    default=300.0,
     show_default=True,
     type=float,
     help=(
@@ -104,7 +104,7 @@ def run_cmd(
 @main.command("smoke")
 @click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
 @click.option("--seed", default=42, show_default=True, type=int)
-@click.option("--task-timeout-s", default=600.0, show_default=True, type=float,
+@click.option("--task-timeout-s", default=300.0, show_default=True, type=float,
               help="Per-task wall-clock cap; <=0 disables.")
 @click.option("--reset-workspace", is_flag=True, default=False,
               help="Same semantics as `run --reset-workspace` -- deterministic "

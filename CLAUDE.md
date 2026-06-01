@@ -339,6 +339,16 @@ OpenCode accepts a `?directory=` that points to an already-existing pre-cloned d
   On failure, `error` is `{"stage": "clone|session|message|list", "type": "...", "msg": "..."}`. `messages` is the raw OpenCode `list_messages` response with no transformation; `[]` if `error.stage` is upstream of the list call.
 - `summary.json` — strictly: `rtt_s` p50/p95, `success_rate`, `count`. Nothing else.
 
+## Vendored-submodule patches (`deploy/patches/`)
+
+Both submodules stay pinned at their upstream commits; testbed-owned changes live as patches under `deploy/patches/`, prefix-routed to two apply scripts so they never cross-apply:
+- `opencode-*.patch` → `scripts/apply_opencode_patches.sh` (opencode submodule)
+- `dynamo-*.patch`   → `scripts/apply_dynamo_patches.sh` (dynamo submodule)
+
+Both scripts take no arg (apply, idempotent), `--check` (report applied/pending), `--revert`. Run after `git submodule update --init`. The dynamo patches are **Python-only** (handlers.py) — no cargo rebuild, just restart workers (`testbed.sh down workers && up workers`) to pick them up.
+
+**`dynamo-scheduling-log.patch`** — adds `BaseWorkerHandler._log_scheduling_delay()` + 3 call sites (decode token/text, prefill) in `dynamo/components/src/dynamo/vllm/handlers.py`. Emits one `SCHED_DELAY request_id=.. role=prefill|decode queue_ms=.. queued_ts=.. scheduled_ts=..` line per request to the worker log, read from vLLM v1's per-request `RequestOutput.metrics.{queued_ts,scheduled_ts}` (the engine scheduler queue-wait = scheduling delay). This is the per-request sink because the value **cannot** ride in-band to the client: the frontend re-serializes `usage` through upstream async-openai types that drop unknown keys, and the `nvext` response block is Rust-only (no Python write path). Parse with `scripts/analyze_worker_scheduling.py --logs logs/` → per-(worker,role) p50/p90/p99. With PD disaggregation the prefill and decode workers each log their own line, so prefill vs decode scheduling delay come out separately.
+
 ## OpenCode profiling (ENV-gated)
 
 The profiler lives as a **testbed-owned patch** at `deploy/patches/opencode-profile.patch` (the `opencode/` submodule stays pinned at its upstream tag, e.g. `v1.14.41`, so the parent repo is portable). One-time setup after `git submodule update --init`:
