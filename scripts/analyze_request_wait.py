@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
 import sys
 from collections import defaultdict
@@ -278,6 +279,104 @@ def _pctiles(values: list[float]) -> str:
             f"max={a.max():.4f}")
 
 
+# ---------- tail analysis ----------
+#
+# The "tail grows" argument: it's not the typical request that hurts, it's
+# the slow ones -- and the slow ones are slow BECAUSE of queue wait, not
+# compute. Two complementary views below make that case from the
+# per-request join:
+#   percentile_summary  -- the wait distribution itself, out to p99.9.
+#   tail_buckets        -- take the slowest X% of requests (by e2e) and
+#                          show (a) their mean wait_fraction and (b) what
+#                          share of ALL wait time they concentrate. If the
+#                          slowest 1% hold a wait_share far above 1%, the
+#                          tail is wait-dominated.
+
+_PCTILES = (50.0, 90.0, 95.0, 99.0, 99.9)
+
+
+def percentile_summary(values: list[float]) -> dict[str, float | int] | None:
+    """{n, mean, p50, p90, p95, p99, p99.9, max} or None if empty."""
+    if not values:
+        return None
+    a = np.asarray(values, dtype=float)
+    out: dict[str, float | int] = {"n": int(a.size), "mean": float(a.mean())}
+    for p in _PCTILES:
+        out[f"p{p:g}"] = float(np.percentile(a, p))
+    out["max"] = float(a.max())
+    return out
+
+
+@dataclass
+class TailBucket:
+    frac: float            # e.g. 0.01 = slowest 1% by e2e
+    k: int                 # number of requests in the bucket
+    mean_total_ms: float
+    mean_wait_fraction: float
+    wait_share: float | None   # bucket's share of total wait across all matched
+
+
+def tail_buckets(rows: list[RequestWait],
+                 fracs: tuple[float, ...] = (0.10, 0.05, 0.01)) -> list[TailBucket]:
+    """For each tail fraction, take the slowest ceil(frac*n) requests by
+    e2e total_ms and summarize their wait. `wait_share` = this bucket's
+    total wait / all matched requests' total wait -- a number well above
+    `frac` means the tail concentrates a disproportionate amount of the
+    queue wait (the point of the 'tail grows' story)."""
+    matched = [r for r in rows if r.matched and r.wait_fraction is not None]
+    if not matched:
+        return []
+    s = sorted(matched, key=lambda r: r.total_ms, reverse=True)
+    n = len(s)
+    all_wait = sum(r.total_wait_ms for r in s)
+    out: list[TailBucket] = []
+    for frac in fracs:
+        k = max(1, math.ceil(frac * n))
+        top = s[:k]
+        bucket_wait = sum(r.total_wait_ms for r in top)
+        out.append(TailBucket(
+            frac=frac,
+            k=k,
+            mean_total_ms=float(np.mean([r.total_ms for r in top])),
+            mean_wait_fraction=float(np.mean([r.wait_fraction for r in top])),
+            wait_share=(bucket_wait / all_wait) if all_wait else None,
+        ))
+    return out
+
+
+def write_percentiles_csv(rows: list[RequestWait], path: Path) -> None:
+    """Percentile table (p50..p99.9, max) for the three per-request
+    metrics, one row per metric."""
+    matched = [r for r in rows if r.matched]
+    metrics = {
+        "wait_fraction": [r.wait_fraction for r in matched if r.wait_fraction is not None],
+        "total_wait_ms": [r.total_wait_ms for r in matched],
+        "total_ms": [r.total_ms for r in matched],
+    }
+    cols = ["metric", "n", "mean"] + [f"p{p:g}" for p in _PCTILES] + ["max"]
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for name, vals in metrics.items():
+            s = percentile_summary(vals)
+            if s is None:
+                w.writerow([name, 0] + [""] * (len(cols) - 2))
+                continue
+            w.writerow([name, s["n"], _fmt(s["mean"])]
+                       + [_fmt(s[f"p{p:g}"]) for p in _PCTILES]
+                       + [_fmt(s["max"])])
+
+
+def write_tail_csv(buckets: list[TailBucket], path: Path) -> None:
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["tail_frac", "k_requests", "mean_total_ms",
+                    "mean_wait_fraction", "wait_share"])
+        for b in buckets:
+            w.writerow([f"{b.frac:g}", b.k, _fmt(b.mean_total_ms),
+                        _fmt(b.mean_wait_fraction), _fmt(b.wait_share)])
+
+
 def print_summary(rows: list[RequestWait], sessions: list[SessionWait] | None) -> None:
     matched = [r for r in rows if r.matched]
     print()
@@ -300,6 +399,21 @@ def print_summary(rows: list[RequestWait], sessions: list[SessionWait] | None) -
         print()
         print(f"Aggregate: {tot_wait:.1f}ms wait / {tot_e2e:.1f}ms e2e "
               f"= {100*tot_wait/tot_e2e:.1f}% of total time in scheduler queues")
+
+    # Tail view: are the SLOWEST requests slow because of queue wait?
+    buckets = tail_buckets(rows)
+    if buckets:
+        print()
+        print("Tail (slowest X% by e2e) -- wait_share >> X% ⇒ tail is wait-dominated:")
+        hdr = (f"{'tail':>6} {'k':>5} {'mean_e2e_ms':>12} "
+               f"{'mean_wait_frac':>15} {'wait_share':>11}")
+        print(hdr)
+        print("-" * len(hdr))
+        for b in buckets:
+            share = "-" if b.wait_share is None else f"{100*b.wait_share:.1f}%"
+            print(f"{100*b.frac:>5.0f}% {b.k:>5} {b.mean_total_ms:>12.1f} "
+                  f"{b.mean_wait_fraction:>14.3f} {share:>11}")
+
     if sessions is not None:
         print()
         sfr = [s.wait_fraction for s in sessions if s.wait_fraction is not None]
@@ -345,6 +459,14 @@ def main(argv: list[str] | None = None) -> int:
     req_csv = args.output / "request_wait.csv"
     write_request_csv(rows, req_csv)
     print(f"  wrote {req_csv}")
+
+    pct_csv = args.output / "wait_percentiles.csv"
+    write_percentiles_csv(rows, pct_csv)
+    print(f"  wrote {pct_csv}")
+
+    tail_csv = args.output / "wait_tail.csv"
+    write_tail_csv(tail_buckets(rows), tail_csv)
+    print(f"  wrote {tail_csv}")
 
     sessions = None
     if args.session_map is not None:

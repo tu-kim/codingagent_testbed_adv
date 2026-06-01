@@ -241,6 +241,102 @@ def test_main_with_session_map(mod, tmp_path):
     assert float(sess[0]["wait_fraction"]) == pytest.approx(0.25)
 
 
+# ---------- tail analysis ----------
+
+
+def test_percentile_summary_keys_and_values(mod):
+    s = mod.percentile_summary([float(i) for i in range(1, 101)])  # 1..100
+    assert s["n"] == 100
+    assert s["mean"] == pytest.approx(50.5)
+    assert s["p50"] == pytest.approx(50.5, abs=1.0)
+    assert s["p99"] == pytest.approx(99.0, abs=1.0)
+    assert s["max"] == pytest.approx(100.0)
+    # p99.9 key uses %g formatting -> "p99.9"
+    assert "p99.9" in s
+
+
+def test_percentile_summary_empty_is_none(mod):
+    assert mod.percentile_summary([]) is None
+
+
+def test_tail_buckets_concentration(mod):
+    """20 requests: 18 fast with tiny wait, 2 slow with huge wait. The
+    slowest 10% (k=2) must concentrate almost all the wait -- wait_share
+    >> 0.10 -- which is exactly the 'tail is wait-dominated' signal."""
+    rows = []
+    # 18 fast: total 100ms, wait 5ms (fraction 0.05)
+    for i in range(18):
+        rows.append(mod.RequestWait(f"fast-{i}", total_ms=100.0, ttft_ms=None,
+                                    prefill_wait_ms=2.0, decode_wait_ms=3.0))
+    # 2 slow: total 1000ms, wait 800ms (fraction 0.8)
+    for i in range(2):
+        rows.append(mod.RequestWait(f"slow-{i}", total_ms=1000.0, ttft_ms=None,
+                                    prefill_wait_ms=300.0, decode_wait_ms=500.0))
+    buckets = {b.frac: b for b in mod.tail_buckets(rows, fracs=(0.10,))}
+    b = buckets[0.10]
+    assert b.k == 2                              # ceil(0.10 * 20)
+    assert b.mean_total_ms == pytest.approx(1000.0)
+    assert b.mean_wait_fraction == pytest.approx(0.8)
+    # total wait = 18*5 + 2*800 = 90 + 1600 = 1690; tail holds 1600.
+    assert b.wait_share == pytest.approx(1600.0 / 1690.0)
+    assert b.wait_share > 0.90                   # 10% of reqs hold >90% of wait
+
+
+def test_tail_buckets_k_is_ceil_and_at_least_one(mod):
+    rows = [mod.RequestWait(f"r{i}", total_ms=float(i + 1), ttft_ms=None,
+                            prefill_wait_ms=1.0, decode_wait_ms=1.0)
+            for i in range(5)]
+    # frac 0.01 * 5 = 0.05 -> ceil -> 1 (never zero)
+    buckets = {b.frac: b for b in mod.tail_buckets(rows, fracs=(0.01,))}
+    assert buckets[0.01].k == 1
+    # the single slowest is r4 (total_ms=5)
+    assert buckets[0.01].mean_total_ms == pytest.approx(5.0)
+
+
+def test_tail_buckets_empty_when_no_matched(mod):
+    rows = [mod.RequestWait("r1", total_ms=100.0, ttft_ms=None,
+                            prefill_wait_ms=None, decode_wait_ms=None)]
+    assert mod.tail_buckets(rows) == []
+
+
+def test_main_writes_percentile_and_tail_csvs(mod, tmp_path, capsys):
+    fe = tmp_path / "frontend.log"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    fe_lines, sched_p, sched_d = [], [], []
+    # 10 fast + 2 slow so the tail is clearly wait-heavy.
+    for i in range(10):
+        fe_lines.append(_frontend_line(f"f{i}", 100))
+        sched_p.append(_sched_line(f"f{i}", "prefill", 1.0))
+        sched_d.append(_sched_line(f"f{i}", "decode", 4.0))
+    for i in range(2):
+        fe_lines.append(_frontend_line(f"s{i}", 1000))
+        sched_p.append(_sched_line(f"s{i}", "prefill", 300.0))
+        sched_d.append(_sched_line(f"s{i}", "decode", 500.0))
+    fe.write_text("".join(fe_lines))
+    (logs / "vllm-p0.log").write_text("".join(sched_p))
+    (logs / "vllm-d0.log").write_text("".join(sched_d))
+
+    out = tmp_path / "out"
+    rc = mod.main(["--frontend", str(fe), "--logs", str(logs), "--output", str(out)])
+    assert rc == 0
+
+    pct = {r["metric"]: r for r in csv.DictReader((out / "wait_percentiles.csv").open())}
+    assert set(pct) == {"wait_fraction", "total_wait_ms", "total_ms"}
+    assert pct["total_ms"]["max"] == "1000.0000"
+
+    tail = list(csv.DictReader((out / "wait_tail.csv").open()))
+    by_frac = {r["tail_frac"]: r for r in tail}
+    # slowest 10% (k=ceil(0.1*12)=2) are the two slow reqs → wait_share high.
+    assert by_frac["0.1"]["k_requests"] == "2"
+    assert float(by_frac["0.1"]["mean_wait_fraction"]) == pytest.approx(0.8)
+    assert float(by_frac["0.1"]["wait_share"]) > 0.9
+
+    captured = capsys.readouterr().out
+    assert "Tail (slowest X% by e2e)" in captured
+    assert "wait_share" in captured
+
+
 def test_main_missing_frontend_returns_2(mod, tmp_path):
     logs = tmp_path / "logs"; logs.mkdir()
     rc = mod.main(["--frontend", str(tmp_path / "nope.log"),
