@@ -596,3 +596,66 @@ async def test_run_sequential_arrival_offset_grows_with_elapsed(
     # duration (per-task RTT includes the 20ms send sleep).
     for prev, curr in zip(offsets, offsets[1:]):
         assert curr > prev, f"offsets not monotonic: {offsets}"
+
+
+# ---------------------------------------------------------------------------
+# Progress output
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_prints_progress_to_stderr(monkeypatch, tmp_path, capsys):
+    """run() emits a start banner, one line per completed task, and a
+    final summary -- all to STDERR (stdout stays clean). The per-task
+    line carries the running done/total counter."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    samples = [{**_SAMPLE, "instance_id": f"task_{i}"} for i in range(2)]
+    fake = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=2, qps=1.0, seed=42, max_in_flight=16,
+                out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+            )
+
+    captured = capsys.readouterr()
+    err = captured.err
+    # Start banner names the mode and task count.
+    assert "testbed run: 2 tasks (sequential)" in err
+    # One progress line per task with the running counter.
+    assert "[  1/2]" in err
+    assert "[  2/2]" in err
+    # Cumulative tally + final summary.
+    assert "ok=2 fail=0" in err
+    assert "done. 2 tasks, 2 ok / 0 fail" in err
+    # Progress must NOT leak onto stdout.
+    assert "testbed run" not in captured.out
+
+
+@pytest.mark.asyncio
+async def test_run_progress_marks_failed_task(monkeypatch, tmp_path, capsys):
+    """A failed task shows FAIL:<stage> and increments the fail tally."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    samples = [{**_SAMPLE, "instance_id": "task_x"}]
+
+    class _FailingClient(_FakeClient):
+        async def create_session(self, directory: str) -> str:
+            raise RuntimeError("boom")
+
+    with patch.object(runner, "OpenCodeClient",
+                      return_value=_FakeClientCtx(_FailingClient())):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=1, qps=1.0, seed=42, max_in_flight=16,
+                out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+            )
+
+    err = capsys.readouterr().err
+    assert "FAIL:session" in err          # create_session failure → stage "session"
+    assert "done. 1 tasks, 0 ok / 1 fail" in err

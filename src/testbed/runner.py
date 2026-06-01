@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import statistics
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -34,6 +35,27 @@ class TaskRecord:
 
 def _err(stage: str, exc: BaseException) -> dict[str, Any]:
     return {"stage": stage, "type": type(exc).__name__, "msg": str(exc)}
+
+
+def _print_progress(rec: TaskRecord, records: list[TaskRecord],
+                    total: int, elapsed_s: float) -> None:
+    """One line per completed task → stderr (stdout stays clean for any
+    downstream capture). Shows running done/total, this task's status +
+    RTT, and the cumulative ok/fail tally."""
+    done = len(records)
+    n_ok = sum(1 for r in records if r.success)
+    n_fail = done - n_ok
+    if rec.success:
+        status = "ok"
+    else:
+        status = "FAIL:" + str((rec.error or {}).get("stage", "?"))
+    rtt = f"{rec.rtt_s:6.1f}s" if rec.rtt_s is not None else "     -  "
+    print(
+        f"[{done:>3}/{total}] {rec.instance_id:<34.34} {status:<11} "
+        f"rtt={rtt}  ok={n_ok} fail={n_fail}  elapsed={elapsed_s:5.0f}s",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _env_truthy(v: str | None) -> bool:
@@ -306,6 +328,11 @@ async def run(
     records: list[TaskRecord] = []
     trace_path = out_dir / "trace.jsonl"
 
+    total = len(samples)
+    mode = "sequential" if sequential else f"poisson qps={qps} max_in_flight={max_in_flight}"
+    print(f"testbed run: {total} tasks ({mode}) → {out_dir}",
+          file=sys.stderr, flush=True)
+
     async with OpenCodeClient(cfg.opencode, password=password) as client:
         with trace_path.open("w") as trace_fh:
             start = time.monotonic()
@@ -326,6 +353,7 @@ async def run(
                     trace_fh.write(rec.to_jsonl())
                     trace_fh.flush()
                     records.append(rec)
+                    _print_progress(rec, records, total, time.monotonic() - start)
             else:
                 offsets = poisson.arrival_offsets(qps, num_samples, seed)
                 tasks: list[asyncio.Task[TaskRecord]] = []
@@ -349,5 +377,12 @@ async def run(
                     trace_fh.write(rec.to_jsonl())
                     trace_fh.flush()
                     records.append(rec)
+                    _print_progress(rec, records, total, time.monotonic() - start)
 
-    (out_dir / "summary.json").write_text(json.dumps(_summary(records), indent=2) + "\n")
+    summary = _summary(records)
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    n_ok = sum(1 for r in records if r.success)
+    print(f"testbed run: done. {summary['count']} tasks, "
+          f"{n_ok} ok / {summary['count'] - n_ok} fail, "
+          f"elapsed={time.monotonic() - start:.0f}s → {out_dir}",
+          file=sys.stderr, flush=True)
