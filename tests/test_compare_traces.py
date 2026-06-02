@@ -93,6 +93,34 @@ def test_extract_session_counts_turns_tools_tokens(mod):
     assert sm.final_text == "fixing"       # last assistant text
 
 
+def test_extract_diffs_skips_boolean_summary(mod):
+    """opencode sets info.summary to a BOOLEAN on assistant messages (and
+    to a dict only on the user message). _extract_diffs must skip the
+    bool rather than crash on bool.get('diffs'). Regression for an
+    AttributeError observed on real traces."""
+    rec = _record("inst-1", messages=[
+        {"info": {"role": "assistant", "summary": True,
+                  "tokens": {"output": 5}},
+         "parts": [{"type": "step-start"}, {"type": "text", "text": "x"}]},
+        _user_with_diffs([{"file": "a.py", "additions": 2, "deletions": 0}]),
+    ])
+    sm = mod.extract_session(rec)
+    # The dict-summary user message is still found; the bool one is skipped.
+    assert sm.diff_signature == [("a.py", 2, 0)]
+
+
+def test_extract_diffs_all_boolean_summaries_returns_empty(mod):
+    """If NO message carries a dict summary (only booleans), diffs is []
+    -- not a crash."""
+    rec = _record("inst-1", messages=[
+        {"info": {"role": "assistant", "summary": False,
+                  "tokens": {"output": 5}},
+         "parts": [{"type": "step-start"}, {"type": "text", "text": "x"}]},
+    ])
+    sm = mod.extract_session(rec)
+    assert sm.diff_signature == []
+
+
 def test_extract_session_turn_fallback_to_assistant_count(mod):
     """If there are no step-start parts (older trace), n_turns falls back
     to the assistant-message count."""

@@ -87,8 +87,15 @@ def _sha(s: str) -> str:
 
 
 def _tokens(info: dict) -> tuple[int, int, int]:
-    t = info.get("tokens") or {}
-    cache = t.get("cache") or {}
+    # Defensive against non-dict shapes from the raw trace (same class of
+    # bug as info.summary being a bool): `x or {}` would leave a truthy
+    # non-dict in place and then .get() would crash.
+    t = info.get("tokens")
+    if not isinstance(t, dict):
+        t = {}
+    cache = t.get("cache")
+    if not isinstance(cache, dict):
+        cache = {}
     def _i(v) -> int:
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
     return _i(t.get("input")), _i(t.get("output")), _i(cache.get("read"))
@@ -96,7 +103,12 @@ def _tokens(info: dict) -> tuple[int, int, int]:
 
 def _extract_diffs(messages: list) -> list[tuple[str, int, int]]:
     for m in messages:
-        summary = ((m or {}).get("info") or {}).get("summary") or {}
+        # info.summary is a DICT (with `diffs`) only on the user message;
+        # on assistant messages opencode sets it to a BOOLEAN flag, so we
+        # must skip non-dict values rather than call .get() on a bool.
+        summary = ((m or {}).get("info") or {}).get("summary")
+        if not isinstance(summary, dict):
+            continue
         diffs = summary.get("diffs")
         if isinstance(diffs, list) and diffs:
             out = []
