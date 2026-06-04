@@ -16,6 +16,11 @@ This README is the **usage manual**. For architecture, module contracts, and got
 System packages and binaries expected on `PATH` before `deploy/testbed.sh up`.
 
 ```bash
+# Python virtual environment (uv is used for all installs below).
+python3.12 -m venv .venv && source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install uv
+
 # yq — testbed.sh reads testbed.yaml via yq. nats-server — single-node
 # convenience for `deploy/testbed.sh up nats`.
 sudo apt install -y yq nats-server
@@ -37,7 +42,7 @@ rm -rf /tmp/etcd.tar.gz /tmp/etcd-${ETCD_VER}-linux-amd64
 yq --version && nats-server --version && etcd --version && python -c "import vllm, nixl; print(vllm.__version__)"
 ```
 
-Vendored submodules (`opencode/`, `dynamo/`) are built per their own install guides — see CLAUDE.md.
+Vendored submodules (`opencode/`, `dynamo/`) are built from source — see §2.
 
 ---
 
@@ -58,6 +63,10 @@ cp deploy/testbed.yaml.example deploy/testbed.yaml
 $EDITOR deploy/testbed.yaml               # workspace, model, vLLM PD, dynamo, opencode
 ```
 
+Build the vendored stacks from source per their upstream guides:
+- **opencode** (run in dev mode): <https://github.com/anomalyco/opencode/blob/dev/CONTRIBUTING.md>
+- **dynamo** (build with the vLLM backend): <https://github.com/ai-dynamo/dynamo>
+
 Configuration resolves as **CLI flag > `TESTBED__*` env var > `deploy/testbed.yaml` > built-in default**. Any yaml key is overridable, e.g. `TESTBED__DYNAMO__ROUTER_MODE=kv`.
 
 ---
@@ -72,7 +81,7 @@ deploy/testbed.sh logs <component>        # tail -F logs/<component>.log
 ```
 
 - `up`/`down` with no target = `all` = **workers + frontend + opencode** (in order / reverse).
-- `monitor` and `scrape_metrics` are **opt-in** — never part of `all`, bring up/down separately.
+- `monitor` and `scrape_metrics` are **optional** — never part of `all`, bring up/down separately. `monitor` **must be started with `sudo`** (needs root for DCGM GPU access); `scrape_metrics` does not. See §6.
 - etcd + NATS are external prerequisites; `up etcd` / `up nats` are single-node conveniences.
 - All PID + log files live under `./logs/`.
 
@@ -184,12 +193,16 @@ All analyzers are standalone (`scripts/*.py`), write CSVs (+ optional `--figures
 | `analyze_worker_scheduling.py` | `logs/vllm-*.log` | per-request prefill/decode **scheduling delay** (needs dynamo patch, §7) |
 | `analyze_request_wait.py` | `frontend.log` + `logs/` | queue-wait as a **fraction of e2e**, joined by request_id; tail concentration; `--figures` |
 
-Collectors (run alongside a workload, opt-in):
+Collectors (**optional**, run alongside a workload — never part of `up all`, start/stop them separately):
 ```bash
-deploy/testbed.sh up scrape_metrics   # vLLM /metrics → logs/vllm_metrics.ndjson  (no sudo)
-sudo DCGM_PY=/path/to/venv/python deploy/testbed.sh up monitor   # DCGM GPU + psutil → logs/resource.ndjson
+deploy/testbed.sh up scrape_metrics        # vLLM /metrics → logs/vllm_metrics.ndjson   (no sudo)
+sudo deploy/testbed.sh up monitor          # DCGM GPU + psutil → logs/resource.ndjson   (sudo REQUIRED)
+...
+deploy/testbed.sh down scrape_metrics
+sudo deploy/testbed.sh down monitor
 ```
-`monitor` needs `sudo` and `monitor.dcgm_py` set in `testbed.yaml` (read from yaml so sudo's env-strip doesn't lose it).
+- `scrape_metrics` — vLLM `/metrics` poller; no sudo, needs `vllm.system_port_base > 0`.
+- `monitor` — DCGM GPU + psutil sampler; **must be run with `sudo`** (root for DCGM). Set `monitor.dcgm_py` in `testbed.yaml` to the Python with DCGM bindings (read from yaml so sudo's env-strip doesn't lose it).
 
 OpenCode profiling is ENV-gated: launch opencode with `OPENCODE_PROFILE=1` (per-session NDJSON lands in `<workspace_root>/profiles/`). Aggregate with `scripts/aggregate_profiles.sh <workspace_root>`.
 
