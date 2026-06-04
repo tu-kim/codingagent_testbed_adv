@@ -7,7 +7,7 @@ SWE-bench sample → runner.py (Poisson or sequential) → OpenCode server (:409
                      → Dynamo frontend (:8000/v1) → vLLM prefill+decode workers (KV via NIXL)
 ```
 
-This README is the **usage manual**. For architecture, module contracts, and gotchas see `CLAUDE.md`.
+This README is the **usage manual** for setting up, running, and analyzing testbed workloads.
 
 ---
 
@@ -160,7 +160,7 @@ Agent-loop output can diverge run-to-run; the knobs that remove the controllable
 
 - `--sequential` removes concurrent-batching and timing-induced ordering variance.
 - `--reset-workspace` makes the workspace path + state byte-stable (opencode embeds cwd in its system prompt).
-- Greedy decoding + seeds + `repetition_penalty: 1.0` are pinned in `testbed.yaml` (see CLAUDE.md "Reproducibility").
+- Greedy decoding + seeds + `repetition_penalty: 1.0` are pinned in `testbed.yaml` (see its inline comments for the rationale).
 
 Verify N runs reached the same result (see §6 `compare_traces.py`):
 ```bash
