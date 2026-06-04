@@ -114,6 +114,8 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 | `--task-timeout-s` | `300` | per-task cap on the agent loop; `<=0` disables |
 | `--reset-workspace` | off | deterministic per-instance workspace dir, reset to `base_commit` each task |
 | `--sequential` | off | strictly one request at a time; bypasses Poisson |
+| `--repo-cache` / `--no-repo-cache` | on | pre-clone each unique repo once into `<workspace_root>/.repo-cache`, then clone tasks locally from it (avoids GitHub rate-limit clone failures) |
+| `--repo-cache-dir` | `<workspace_root>/.repo-cache` | override cache location |
 | `--router` | `""` | label recorded in `config.json` only (does NOT change routing) |
 | `--out` | required | output directory |
 

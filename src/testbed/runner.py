@@ -9,6 +9,7 @@ import statistics
 import sys
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -75,37 +76,118 @@ async def _run_git(args: list[str]) -> None:
         raise RuntimeError(f"{' '.join(args)} failed: {stderr.decode().strip()}")
 
 
+async def _run_git_retry(args: list[str], *, retries: int = 3,
+                         base_delay: float = 2.0) -> None:
+    """_run_git with exponential backoff -- for NETWORK git ops (clone /
+    fetch) which fail transiently under GitHub rate-limiting. Local ops
+    use plain _run_git (a failure there is deterministic, not transient)."""
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            await _run_git(args)
+            return
+        except RuntimeError as exc:
+            last = exc
+            if attempt < retries - 1:
+                await asyncio.sleep(base_delay * (2 ** attempt))
+    assert last is not None
+    raise last
+
+
+def _repo_url(repo: str) -> str:
+    """GitHub HTTPS URL for a SWE-bench `repo` field (e.g. 'django/django').
+    Factored out so tests can point the cache at a local file:// repo."""
+    return f"https://github.com/{repo}.git"
+
+
+def _repo_cache_path(cache_dir: Path, repo: str) -> Path:
+    return cache_dir / repo.replace("/", "__")
+
+
+async def _ensure_repo_cached(repo: str, base_commits: set[str],
+                              cache_dir: Path) -> Path | None:
+    """Ensure a full clone of `repo` exists in the cache and contains every
+    needed base_commit. Returns the cache path, or None on failure (caller
+    then falls back to a direct per-task clone). Network ops are retried."""
+    cache = _repo_cache_path(cache_dir, repo)
+    try:
+        if not (cache / ".git").is_dir():
+            if cache.exists():
+                import shutil
+                shutil.rmtree(cache)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            await _run_git_retry(["git", "clone", "--quiet", _repo_url(repo), str(cache)])
+        missing = []
+        for c in base_commits:
+            try:
+                await _run_git(["git", "-C", str(cache), "cat-file", "-e", f"{c}^{{commit}}"])
+            except RuntimeError:
+                missing.append(c)
+        if missing:
+            # A shallow/old clone may lack some base_commits; pull full history.
+            await _run_git_retry(["git", "-C", str(cache), "fetch", "--quiet", "origin"])
+        return cache
+    except RuntimeError:
+        return None
+
+
+async def warm_repo_cache(samples: list[dict[str, Any]], cache_dir: Path,
+                          *, concurrency: int = 4) -> dict[str, Path]:
+    """Pre-clone every UNIQUE repo once into the cache before the workload
+    starts. SWE-bench draws many samples from the same repos, so this turns
+    N per-task network clones into U (unique-repo) clones and removes the
+    rate-limit / bandwidth pressure that makes mid-run clones flaky.
+    Returns {repo: cache_path} for repos that cached successfully; repos
+    absent from the map fall back to a direct per-task clone."""
+    by_repo: dict[str, set[str]] = defaultdict(set)
+    for s in samples:
+        by_repo[s["repo"]].add(s["base_commit"])
+    sem = asyncio.Semaphore(concurrency)
+    results: dict[str, Path] = {}
+
+    async def _one(repo: str, commits: set[str]) -> None:
+        async with sem:
+            path = await _ensure_repo_cached(repo, commits, cache_dir)
+            if path is not None:
+                results[repo] = path
+
+    await asyncio.gather(*(_one(r, c) for r, c in by_repo.items()))
+    return results
+
+
 async def _pre_clone(repo: str, base_commit: str, dest: Path,
-                     *, reset: bool = False) -> None:
-    """git clone <repo> <dest> && checkout <base_commit>. Fail-fast.
+                     *, reset: bool = False, cache_dir: Path | None = None) -> None:
+    """Prepare <dest> at <repo>@<base_commit>. Fail-fast.
+
+    Clone source: if `cache_dir` holds a cached clone of `repo`, copy from
+    it LOCALLY (git clone --local -- no network, immune to rate limits);
+    otherwise fall back to a direct (retried) network clone.
 
     With reset=True, an existing valid checkout is wiped back to
-    base_commit (git reset --hard + git clean -fdx) instead of being
-    reused as-is. Required for reproducible-workspace mode where the
-    same instance_id maps to the same dir across runs -- otherwise
-    artifacts from the previous agent loop (modified files, .opencode/
-    state, etc.) leak into the next run and divergence cascades.
-
+    base_commit (git reset --hard + git clean -fdx) instead of re-cloned.
+    Required for reproducible-workspace mode (same instance_id → same dir
+    across runs) -- otherwise prior agent-loop artifacts leak in.
     With reset=False (legacy), an existing dest is reused untouched."""
     if dest.exists():
         if not reset:
             return
         if (dest / ".git").is_dir():
-            # Fast reset path: keep the .git pack, just rewind working tree.
             await _run_git(["git", "-C", str(dest), "reset", "--hard", "--quiet", base_commit])
-            # -fdx removes untracked + ignored (e.g. .opencode/ working files,
-            # test runner caches). Same final state as a fresh clone+checkout
-            # of base_commit, without the network round trip.
             await _run_git(["git", "-C", str(dest), "clean", "-fdxq"])
             return
-        # Existed but not a usable git repo (interrupted clone, leftover
-        # junk). Nuke and re-clone -- the alternative (silently using a
-        # garbage dir) would just bury the failure deeper in the agent loop.
+        # Existed but not a usable git repo (interrupted clone). Re-create.
         import shutil
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    url = f"https://github.com/{repo}.git"
-    await _run_git(["git", "clone", "--quiet", url, str(dest)])
+
+    cache = _repo_cache_path(cache_dir, repo) if cache_dir is not None else None
+    if cache is not None and (cache / ".git").is_dir():
+        # Local clone from the warmed cache -- no network. Hardlinks the
+        # (immutable) object store, so it's fast and cheap on disk.
+        await _run_git(["git", "clone", "--quiet", "--local", str(cache), str(dest)])
+        await _run_git(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
+        return
+    await _run_git_retry(["git", "clone", "--quiet", _repo_url(repo), str(dest)])
     await _run_git(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
 
 
@@ -117,6 +199,7 @@ async def _run_one(
     sem: asyncio.Semaphore,
     task_timeout_s: float | None = None,
     reset_workspace: bool = False,
+    repo_cache_dir: Path | None = None,
 ) -> TaskRecord:
     instance_id = sample["instance_id"]
     # reset_workspace=True: drop the uuid suffix so the same instance_id
@@ -139,7 +222,7 @@ async def _run_one(
         # Stage 1: clone.
         try:
             await _pre_clone(sample["repo"], sample["base_commit"], dest,
-                             reset=reset_workspace)
+                             reset=reset_workspace, cache_dir=repo_cache_dir)
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,
@@ -269,6 +352,8 @@ async def run(
     task_timeout_s: float | None = None,
     reset_workspace: bool = False,
     sequential: bool = False,
+    repo_cache: bool = True,
+    repo_cache_dir: str | None = None,
 ) -> None:
     """Drive `num_samples` SWE-bench tasks.
 
@@ -292,6 +377,23 @@ async def run(
     workspace_root = Path(cfg.workspace_root)
     workspace_root.mkdir(parents=True, exist_ok=True)
 
+    # Pre-clone each unique repo once into a local cache BEFORE firing any
+    # task. Per-task clones then copy from the cache locally (no network),
+    # which removes the GitHub rate-limiting / bandwidth pressure that
+    # makes mid-run clones fail when many tasks clone the same repos.
+    cache_dir: Path | None = None
+    if repo_cache:
+        cache_dir = (Path(repo_cache_dir) if repo_cache_dir
+                     else workspace_root / ".repo-cache")
+        n_repos = len({s["repo"] for s in samples})
+        print(f"warming repo cache: {n_repos} unique repos → {cache_dir}",
+              file=sys.stderr, flush=True)
+        cached = await warm_repo_cache(samples, cache_dir)
+        if len(cached) < n_repos:
+            print(f"  {n_repos - len(cached)} repo(s) failed to cache -- those "
+                  f"tasks fall back to direct clone", file=sys.stderr, flush=True)
+        print(f"repo cache ready: {len(cached)}/{n_repos} repos", file=sys.stderr, flush=True)
+
     # OpenCode profiling state is ENV-gated and resolved outside testbed.yaml
     # (deploy/testbed.sh up_opencode injects OPENCODE_PROFILE_DIR into the
     # OpenCode child env). Capture whatever is visible on the runner-side
@@ -313,6 +415,8 @@ async def run(
         "task_timeout_s": task_timeout_s,
         "reset_workspace": reset_workspace,
         "sequential": sequential,
+        "repo_cache": repo_cache,
+        "repo_cache_dir": str(cache_dir) if cache_dir else None,
         "router": router_label,
         "model": cfg.model.model_dump(mode="json"),
         "config": resolved_snapshot(cfg),
@@ -349,6 +453,7 @@ async def run(
                         sem,
                         task_timeout_s=task_timeout_s,
                         reset_workspace=reset_workspace,
+                        repo_cache_dir=cache_dir,
                     )
                     trace_fh.write(rec.to_jsonl())
                     trace_fh.flush()
@@ -368,6 +473,7 @@ async def run(
                                 sem,
                                 task_timeout_s=task_timeout_s,
                                 reset_workspace=reset_workspace,
+                                repo_cache_dir=cache_dir,
                             )
                         )
                     )

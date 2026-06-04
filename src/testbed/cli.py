@@ -67,6 +67,23 @@ def main() -> None:
         "Default off preserves the Poisson-arrival workload model."
     ),
 )
+@click.option(
+    "--repo-cache/--no-repo-cache",
+    default=True,
+    show_default=True,
+    help=(
+        "Pre-clone each unique SWE-bench repo ONCE into a local cache "
+        "(<workspace_root>/.repo-cache) before the run, then make each "
+        "task clone locally from the cache instead of hitting GitHub. "
+        "Removes the rate-limit / bandwidth clone failures you get when "
+        "many tasks clone the same repos concurrently. --no-repo-cache "
+        "reverts to a direct network clone per task."
+    ),
+)
+@click.option("--repo-cache-dir", default=None,
+              type=click.Path(file_okay=False, path_type=Path),
+              help="Override the repo cache location (default "
+                   "<workspace_root>/.repo-cache).")
 @click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
 def run_cmd(
@@ -79,6 +96,8 @@ def run_cmd(
     router: str,
     reset_workspace: bool,
     sequential: bool,
+    repo_cache: bool,
+    repo_cache_dir: Path | None,
     out: Path,
     config_path: Path | None,
 ) -> None:
@@ -97,6 +116,8 @@ def run_cmd(
             task_timeout_s=task_timeout_s if task_timeout_s > 0 else None,
             reset_workspace=reset_workspace,
             sequential=sequential,
+            repo_cache=repo_cache,
+            repo_cache_dir=str(repo_cache_dir) if repo_cache_dir else None,
         )
     )
 

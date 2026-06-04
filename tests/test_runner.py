@@ -62,10 +62,18 @@ _SAMPLE = {
 
 @pytest.fixture(autouse=True)
 def _stub_pre_clone(monkeypatch):
-    async def _ok(repo: str, base_commit: str, dest: Path, *, reset: bool = False) -> None:
+    async def _ok(repo: str, base_commit: str, dest: Path, *,
+                  reset: bool = False, cache_dir=None) -> None:
         return None
 
     monkeypatch.setattr(runner, "_pre_clone", _ok)
+
+    # run() warms the repo cache before the task loop; stub it so the
+    # run-level tests never shell out to real git / the network.
+    async def _warm(samples, cache_dir, **kw):
+        return {}
+
+    monkeypatch.setattr(runner, "warm_repo_cache", _warm)
 
 
 async def test_happy_path_records_success_and_messages(tmp_path: Path):
@@ -127,7 +135,7 @@ async def test_reset_workspace_forwards_reset_kwarg_to_pre_clone(monkeypatch, tm
     the dir name is stable but the workspace state from the prior agent
     run isn't cleaned, defeating the reproducibility purpose."""
     seen: list[bool] = []
-    async def _spy(repo, base, dest, *, reset=False):
+    async def _spy(repo, base, dest, *, reset=False, cache_dir=None):
         seen.append(reset)
     monkeypatch.setattr(runner, "_pre_clone", _spy)
     client = _FakeClient()
@@ -137,8 +145,23 @@ async def test_reset_workspace_forwards_reset_kwarg_to_pre_clone(monkeypatch, tm
     assert seen == [True, False]
 
 
+async def test_run_one_forwards_repo_cache_dir_to_pre_clone(monkeypatch, tmp_path: Path):
+    """The cache dir must reach _pre_clone so the per-task clone copies
+    from the warmed cache instead of hitting the network."""
+    seen: list = []
+    async def _spy(repo, base, dest, *, reset=False, cache_dir=None):
+        seen.append(cache_dir)
+    monkeypatch.setattr(runner, "_pre_clone", _spy)
+    client = _FakeClient()
+    sem = asyncio.Semaphore(1)
+    cache = tmp_path / "cache"
+    await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, repo_cache_dir=cache)
+    await _run_one(client, _SAMPLE, 0.0, tmp_path, sem)   # default None
+    assert seen == [cache, None]
+
+
 async def test_clone_failure_marks_clone_stage(monkeypatch, tmp_path: Path):
-    async def _boom(repo, base, dest, *, reset=False):
+    async def _boom(repo, base, dest, *, reset=False, cache_dir=None):
         raise RuntimeError("git clone failed: network")
 
     monkeypatch.setattr(runner, "_pre_clone", _boom)
