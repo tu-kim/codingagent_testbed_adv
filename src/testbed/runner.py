@@ -191,6 +191,22 @@ async def _pre_clone(repo: str, base_commit: str, dest: Path,
     await _run_git(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
 
 
+async def _try_list_partial(client: OpenCodeClient, session_id: str,
+                            abs_dir: str, *, timeout_s: float = 30.0) -> list[Any]:
+    """Best-effort fetch of the turns completed BEFORE a timeout abort.
+    opencode persists each turn as it finishes, so the list endpoint
+    returns partial progress even after we cancelled the message call.
+    Returns [] on any error / its own timeout so it never re-hangs the
+    task or masks the original timeout."""
+    try:
+        return await asyncio.wait_for(
+            client.list_messages(session_id, directory=abs_dir),
+            timeout=timeout_s,
+        )
+    except Exception:
+        return []
+
+
 async def _run_one(
     client: OpenCodeClient,
     sample: dict[str, Any],
@@ -264,20 +280,26 @@ async def _run_one(
                 await asyncio.wait_for(send_coro, timeout=task_timeout_s)
             else:
                 await send_coro
-        except asyncio.TimeoutError as exc:
+        except asyncio.TimeoutError:
+            rtt_timeout = time.monotonic() - t0
+            # Best-effort: pull the turns opencode persisted before the
+            # abort so the trace shows how far the agent got (where it
+            # stalled), instead of an empty messages list.
+            partial = await _try_list_partial(client, session_id, abs_dir)
             return TaskRecord(
                 instance_id=instance_id,
                 session_id=session_id,
                 directory=directory,
                 arrival_offset_s=arrival_offset_s,
-                rtt_s=time.monotonic() - t0,
+                rtt_s=rtt_timeout,
                 success=False,
                 error={
                     "stage": "timeout",
                     "type": "TimeoutError",
                     "msg": f"send_message exceeded task_timeout_s={task_timeout_s}",
+                    "partial_messages": len(partial),
                 },
-                messages=[],
+                messages=partial,
             )
         except Exception as exc:
             return TaskRecord(

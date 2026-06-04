@@ -223,7 +223,8 @@ class _HangingClient(_FakeClient):
 
 async def test_message_timeout_marks_timeout_stage(tmp_path: Path):
     """When send_message exceeds task_timeout_s, the runner must abort it
-    with error.stage='timeout' instead of hanging the whole run."""
+    with error.stage='timeout' instead of hanging the whole run -- and
+    best-effort fetch the turns completed before the abort."""
     client = _HangingClient()
     sem = asyncio.Semaphore(1)
     rec = await _run_one(
@@ -237,8 +238,29 @@ async def test_message_timeout_marks_timeout_stage(tmp_path: Path):
     assert rec.rtt_s is not None and rec.rtt_s >= 0.05
     # session_id was acquired before the hang, so it's recoverable for diagnosis.
     assert rec.session_id == "ses_test"
-    # No list_messages call happens after a timeout.
-    assert client.list_calls == []
+    # Partial turns ARE fetched after the abort (so the trace shows
+    # how far the agent got), and the count is recorded on the error.
+    assert client.list_calls == [("ses_test", str(tmp_path / rec.directory))]
+    assert rec.messages == [{"info": {}, "parts": []}]
+    assert rec.error["partial_messages"] == 1
+
+
+class _HangingListFailsClient(_HangingClient):
+    """Hangs on send AND fails the post-timeout list (e.g. session gone)."""
+    async def list_messages(self, session_id: str, directory: str) -> list[dict]:
+        raise RuntimeError("session unavailable after abort")
+
+
+async def test_timeout_partial_list_failure_falls_back_to_empty(tmp_path: Path):
+    """If the best-effort partial list fails, the timeout record still
+    lands cleanly with messages=[] (the list failure must not mask the
+    timeout or re-hang the task)."""
+    client = _HangingListFailsClient()
+    sem = asyncio.Semaphore(1)
+    rec = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, task_timeout_s=0.05)
+    assert rec.error and rec.error["stage"] == "timeout"
+    assert rec.messages == []
+    assert rec.error["partial_messages"] == 0
 
 
 async def test_no_timeout_when_task_timeout_s_is_none(tmp_path: Path):

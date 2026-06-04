@@ -313,10 +313,10 @@ OpenCode accepts a `?directory=` that points to an already-existing pre-cloned d
 | `git clone` / `git checkout`                               | yes                 | false     | null                  | `clone`       |
 | `POST /session` (non-2xx or HTTP error)                    | yes                 | false     | null                  | `session`     |
 | `POST /session/:id/message` (non-2xx/network)              | yes                 | false     | wall-clock to failure | `message`     |
-| `POST /session/:id/message` exceeded `--task-timeout-s`    | yes                 | false     | task_timeout_s        | `timeout`     |
+| `POST /session/:id/message` exceeded `--task-timeout-s`    | yes                 | false     | wall to abort (≈timeout) | `timeout`  |
 | `GET /session/:id/message` (after good POST)               | yes                 | true      | from the POST         | `list`        |
 
-`error.stage = "list"` means RTT is valid but `messages` may be empty/partial. `error.stage = "timeout"` means the agent loop was wall-clock-aborted at `task_timeout_s`; the OpenCode session/workspace may still hold partial progress (inspect via `GET /session/:id/message` or `<workspace_root>/<directory>` on disk).
+`error.stage = "list"` means RTT is valid but `messages` may be empty/partial. `error.stage = "timeout"` means the agent loop was wall-clock-aborted at `task_timeout_s`. On timeout the runner does a **best-effort `GET /session/:id/message`** (bounded by its own 30 s cap) to capture the turns opencode persisted before the abort, so `messages` holds the partial trajectory (not `[]`) and `error.partial_messages` records how many were recovered (0 if that list call also failed). The OpenCode session/workspace may hold further state on disk at `<workspace_root>/<directory>`.
 
 **Cleanup**: none by default. `<workspace_root>/session-<instance_id>-<uuid>/` directories accumulate across runs; prune manually (`rm -rf /tmp/testbed-workspaces/session-*`) between large runs. Per-task cleanup is intentionally avoided so failing runs can be inspected. **With `--reset-workspace`**, the runner instead reuses `<workspace_root>/session-<instance_id>/` and wipes it back to `base_commit` (git reset --hard + git clean -fdx) before each task — same final state as a fresh clone, no network round-trip. Existing-but-not-a-git-repo dirs (interrupted prior clone) are nuked and re-cloned; non-existent dirs get the normal full clone path.
 
