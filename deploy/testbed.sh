@@ -387,6 +387,14 @@ up_opencode() {
   # (paths.ts:10-21), never reaching our rendered file -- which causes the
   # provider/model config to be ignored and HF (auto-enabled by HF_TOKEN) to
   # take over, routing inference to router.huggingface.co.
+  #
+  # OPENCODE_CLIENT=server disables the interactive `question` tool. It
+  # defaults to "cli" (core/flag/flag.ts), and registry.ts:193-194 exposes
+  # `question` whenever OPENCODE_CLIENT is one of app|cli|desktop. In a
+  # headless run nobody can answer: the model's question.ask() blocks on a
+  # Deferred (question/index.ts:174) until POST /question/:id/reply arrives,
+  # which the runner never sends -- so the task hangs until --task-timeout-s.
+  # "server" is outside the app|cli|desktop set, so the tool is not offered.
   pushd "$OPENCODE_DIR" >/dev/null
   # ${profile_envs[@]+"${profile_envs[@]}"} expands to nothing when the array
   # is empty -- needed because `set -u` is on and unguarded "${arr[@]}" errors
@@ -394,6 +402,7 @@ up_opencode() {
   spawn opencode \
     "OPENCODE_EXPERIMENTAL_WORKSPACES=$exp_env" \
     "OPENCODE_CONFIG=$oc_cfg" \
+    "OPENCODE_CLIENT=server" \
     ${profile_envs[@]+"${profile_envs[@]}"} \
     -- \
     bun run dev serve --hostname "$host" --port "$port"
