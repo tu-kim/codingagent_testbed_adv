@@ -185,7 +185,9 @@ def smoke_cmd(split: str, seed: int, task_timeout_s: float,
     """Run a single end-to-end task and print the resulting TaskRecord."""
     cfg = config_mod.load(config_path)
     sample = swebench.load_samples(split, seed, 1)[0]
-    workspace_root = Path(cfg.workspace_root)
+    # Same normalization as runner.run/pre_clone_run: a relative
+    # workspace_root must not anchor on the process CWD.
+    workspace_root = Path(cfg.workspace_root).expanduser().resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
     password = os.environ.get("OPENCODE_SERVER_PASSWORD") or None
     timeout = task_timeout_s if task_timeout_s > 0 else None

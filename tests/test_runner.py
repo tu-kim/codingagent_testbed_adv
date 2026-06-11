@@ -1382,6 +1382,76 @@ async def test_run_ignores_corrupt_manifest(monkeypatch, tmp_path: Path):
     assert config_json["workspace_manifest"] is None
 
 
+# ---------------------------------------------------------------------------
+# workspace_root relative-path resolution — run() and pre_clone_run()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_resolves_relative_workspace_root(monkeypatch, tmp_path: Path):
+    """run() must call Path(cfg.workspace_root).expanduser().resolve() so a
+    relative workspace_root (common in testbed.yaml checked into source) is
+    anchored on the process CWD at call-time, not on an accidental directory.
+
+    Arrange: monkeypatch.chdir() into tmp_path, pass workspace_root="ws_rel".
+    Assert: the workspace directory is created under tmp_path / "ws_rel" and
+    the trace record's directory (a relative name) points into that resolved root."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+
+    cfg = _minimal_cfg("ws_rel")   # relative, not absolute
+    fake_client = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=1, qps=1.0, seed=42,
+                max_in_flight=1, out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+                pre_clone_workspaces=False,
+            )
+
+    # Workspace root must have been created under tmp_path / "ws_rel".
+    expected_ws_root = tmp_path / "ws_rel"
+    assert expected_ws_root.is_dir(), (
+        f"resolved workspace_root {expected_ws_root} was not created"
+    )
+
+    # The absolute directory sent to OpenCode must live inside that root.
+    # fake_client.create_calls[0] is the abs_dir string.
+    sent_abs = fake_client.create_calls[0]
+    assert Path(sent_abs).is_absolute(), f"abs_dir must be absolute, got {sent_abs!r}"
+    assert Path(sent_abs).parent == expected_ws_root
+
+
+@pytest.mark.asyncio
+async def test_pre_clone_run_resolves_relative_workspace_root(monkeypatch, tmp_path: Path):
+    """pre_clone_run() must also apply expanduser().resolve() so its manifest
+    lands in the same place that run() will look for it.
+
+    Arrange: chdir to tmp_path, pass workspace_root="ws_rel".
+    Assert: manifest file lands at tmp_path / "ws_rel" / '.workspaces-...'."""
+    monkeypatch.chdir(tmp_path)
+
+    cfg = _minimal_cfg("ws_rel")
+    monkeypatch.setattr(runner.swebench, "load_samples",
+                        lambda *a, **kw: _SAMPLES_TWO)
+
+    failures = await pre_clone_run(
+        cfg, split="lite", num_samples=2, seed=42, reset_workspace=False,
+    )
+
+    assert failures == {}
+
+    expected_ws_root = tmp_path / "ws_rel"
+    assert expected_ws_root.is_dir()
+
+    manifest = workspace_manifest_path(expected_ws_root, "lite", 42, 2)
+    assert manifest.exists(), (
+        f"manifest not found at {manifest}; ws_rel may not have been resolved"
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_with_manifest_skips_batch_pre_clone_phase(
     monkeypatch, tmp_path: Path

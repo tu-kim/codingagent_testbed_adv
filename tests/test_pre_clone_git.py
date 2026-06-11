@@ -149,6 +149,114 @@ def test_pre_clone_non_git_dest_is_recreated(source_repo, tmp_path):
     assert not (dest / "partial_file.txt").exists()
 
 
+# ---------- half-written .git dir (broken checkout in BOTH modes) ----------
+
+
+def test_pre_clone_half_git_reset_false_reclones(source_repo, tmp_path):
+    """A dest that has a .git subdirectory but is NOT a valid repo (e.g. an
+    interrupted git clone that wrote .git/ but nothing else) must be re-cloned
+    with reset=False.
+
+    This reproduces the user crash: previously reset=False returned early on
+    any existing dest, silently reusing a broken .git directory and causing
+    every subsequent git command to die with "fatal: not a git repository"."""
+    dest = tmp_path / "ws" / "session-broken"
+    # Simulate an interrupted clone: directory + empty .git subdir, no objects.
+    dest.mkdir(parents=True)
+    (dest / ".git").mkdir()
+
+    asyncio.run(runner._pre_clone("owner/proj", source_repo["base"], dest,
+                                  reset=False))
+
+    # The broken dir was nuked and replaced with a real checkout.
+    assert (dest / ".git").is_dir()
+    assert (dest / "a.txt").exists()
+    assert not (dest / "b.txt").exists()
+    assert _git(dest, "rev-parse", "HEAD") == source_repo["base"]
+
+
+def test_pre_clone_half_git_reset_true_reclones(source_repo, tmp_path):
+    """Same broken-.git scenario with reset=True also re-clones (not just
+    skips or crashes on the git reset --hard on a broken repo)."""
+    dest = tmp_path / "ws" / "session-broken-reset"
+    dest.mkdir(parents=True)
+    (dest / ".git").mkdir()
+
+    asyncio.run(runner._pre_clone("owner/proj", source_repo["base"], dest,
+                                  reset=True))
+
+    assert (dest / ".git").is_dir()
+    assert (dest / "a.txt").exists()
+    assert _git(dest, "rev-parse", "HEAD") == source_repo["base"]
+
+
+# ---------- valid repo + reset=True where reset fails → re-clone ----------
+
+
+def test_pre_clone_reset_fails_falls_through_to_reclone(source_repo, tmp_path,
+                                                         monkeypatch):
+    """If git reset --hard raises RuntimeError on a valid-looking repo (e.g.
+    missing pack objects), _pre_clone must fall through to rmtree + fresh
+    clone rather than propagating the error or returning the dirty checkout.
+
+    We monkeypatch runner._run_git so that reset --hard raises but all other
+    git subcommands (clone, checkout, rev-parse) are forwarded to the REAL
+    implementation."""
+    dest = tmp_path / "ws" / "session-reset-fails"
+
+    # First do a real clone so dest is a valid repo.
+    asyncio.run(runner._pre_clone("owner/proj", source_repo["base"], dest))
+    assert _git(dest, "rev-parse", "HEAD") == source_repo["base"]
+
+    # Dirty the workspace so we can confirm it gets cleaned up.
+    (dest / "agent_artifact.py").write_text("print('leftover')\n")
+    (dest / "a.txt").write_text("agent modified\n")
+
+    # Intercept _run_git: raise on reset --hard; pass everything else through.
+    real_run_git = runner._run_git
+
+    async def _selective_run_git(args):
+        if "reset" in args and "--hard" in args:
+            raise RuntimeError("simulated: missing pack objects")
+        return await real_run_git(args)
+
+    monkeypatch.setattr(runner, "_run_git", _selective_run_git)
+
+    asyncio.run(runner._pre_clone("owner/proj", source_repo["base"], dest,
+                                  reset=True))
+
+    # After the fallthrough re-clone, dest must be a clean checkout.
+    assert (dest / ".git").is_dir()
+    assert (dest / "a.txt").read_text() == "one\n"           # restored
+    assert not (dest / "agent_artifact.py").exists()          # untracked removed
+    assert _git(dest, "rev-parse", "HEAD") == source_repo["base"]
+
+
+# ---------- _is_valid_repo direct tests ----------
+
+
+def test_is_valid_repo_true_for_real_clone(source_repo, tmp_path):
+    """_is_valid_repo returns True for a properly cloned repository."""
+    dest = tmp_path / "ws" / "session-valid"
+    asyncio.run(runner._pre_clone("owner/proj", source_repo["base"], dest))
+    assert asyncio.run(runner._is_valid_repo(dest)) is True
+
+
+def test_is_valid_repo_false_for_empty_git_subdir(tmp_path):
+    """_is_valid_repo returns False for a directory that has a .git subdir
+    but is not a real git repo (half-written clone)."""
+    dest = tmp_path / "broken"
+    dest.mkdir()
+    (dest / ".git").mkdir()
+    assert asyncio.run(runner._is_valid_repo(dest)) is False
+
+
+def test_is_valid_repo_false_for_nonexistent_path(tmp_path):
+    """_is_valid_repo returns False for a path that does not exist at all."""
+    dest = tmp_path / "does_not_exist"
+    assert asyncio.run(runner._is_valid_repo(dest)) is False
+
+
 # ---------- unreachable URL raises ----------
 
 

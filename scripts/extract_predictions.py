@@ -144,7 +144,11 @@ def main() -> int:
 
     workspace_root = args.workspace_root
     if workspace_root is None:
-        workspace_root = Path(config["config"]["workspace_root"])
+        # config.json records the RAW yaml value; the runner normalizes it
+        # with expanduser().resolve() before cloning. Mirror that here or a
+        # relative / ~-prefixed workspace_root makes every ws.is_dir() fail
+        # ("workspace missing" -> empty patches across the board).
+        workspace_root = Path(config["config"]["workspace_root"]).expanduser().resolve()
 
     base_commits: dict[str, str] = {}
     if not args.head_as_base:

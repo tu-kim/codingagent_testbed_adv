@@ -99,28 +99,52 @@ def _repo_url(repo: str) -> str:
     return f"https://github.com/{repo}.git"
 
 
+async def _is_valid_repo(dest: Path) -> bool:
+    """True iff <dest> is a checkout git itself accepts.
+
+    `(dest / ".git").is_dir()` is NOT enough: an interrupted clone can
+    leave a .git directory whose contents are incomplete, and every
+    subsequent git command then dies with "fatal: not a git repository".
+    Ask git directly instead."""
+    try:
+        await _run_git(["git", "-C", str(dest), "rev-parse", "--git-dir"])
+        return True
+    except RuntimeError:
+        return False
+
+
 async def _pre_clone(repo: str, base_commit: str, dest: Path,
                      *, reset: bool = False) -> None:
     """Prepare <dest> at <repo>@<base_commit>. Fail-fast.
 
     Direct network clone, retried with exponential backoff
     (_run_git_retry) to ride out transient network failures. Idempotent:
-    an existing checkout is a no-op (reset=False) so retrying a partially
-    failed pre-clone pass only re-clones what's missing.
+    an existing VALID checkout is a no-op (reset=False) so retrying a
+    partially failed pre-clone pass only re-clones what's missing. A
+    broken checkout (interrupted clone, half-written .git) is detected
+    via `git rev-parse --git-dir` -- not just a .git presence check --
+    and nuked + re-cloned in BOTH modes.
 
     With reset=True, an existing valid checkout is wiped back to
-    base_commit (git reset --hard + git clean -fdx) instead of re-cloned.
-    Required for reproducible-workspace mode (same instance_id → same dir
-    across runs) -- otherwise prior agent-loop artifacts leak in.
-    With reset=False (legacy), an existing dest is reused untouched."""
+    base_commit (git reset --hard + git clean -fdx) instead of re-cloned;
+    if even the reset fails (repo valid enough for rev-parse but missing
+    objects), it falls through to a full re-clone. Required for
+    reproducible-workspace mode (same instance_id → same dir across runs)
+    -- otherwise prior agent-loop artifacts leak in.
+    With reset=False (legacy), an existing valid dest is reused untouched."""
     if dest.exists():
-        if not reset:
-            return
-        if (dest / ".git").is_dir():
-            await _run_git(["git", "-C", str(dest), "reset", "--hard", "--quiet", base_commit])
-            await _run_git(["git", "-C", str(dest), "clean", "-fdxq"])
-            return
-        # Existed but not a usable git repo (interrupted clone). Re-create.
+        if await _is_valid_repo(dest):
+            if not reset:
+                return
+            try:
+                await _run_git(["git", "-C", str(dest), "reset", "--hard", "--quiet", base_commit])
+                await _run_git(["git", "-C", str(dest), "clean", "-fdxq"])
+                return
+            except RuntimeError:
+                # Valid-looking repo that still can't reset (missing
+                # objects, corrupt index). Fall through to re-clone.
+                pass
+        # Broken / unresettable checkout: nuke and re-clone fresh.
         import shutil
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -237,7 +261,10 @@ async def pre_clone_run(
     means everything is ready.
     """
     samples = swebench.load_samples(split, seed, num_samples)
-    workspace_root = Path(cfg.workspace_root)
+    # expanduser+resolve: a relative workspace_root in testbed.yaml would
+    # otherwise anchor git -C / OpenCode ?directory= on whatever CWD the
+    # process happens to run from ("fatal: not a git repository ...").
+    workspace_root = Path(cfg.workspace_root).expanduser().resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
 
     manifest = workspace_manifest_path(workspace_root, split, seed, num_samples)
@@ -456,7 +483,12 @@ async def run(
     samples = swebench.load_samples(split, seed, num_samples)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    workspace_root = Path(cfg.workspace_root)
+    # expanduser+resolve: a relative workspace_root in testbed.yaml would
+    # otherwise anchor git -C / OpenCode ?directory= on whatever CWD the
+    # process happens to run from ("fatal: not a git repository ...").
+    # Must match pre_clone_run's normalization or the manifest lookup and
+    # the pre-cloned checkouts land in different places.
+    workspace_root = Path(cfg.workspace_root).expanduser().resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
 
     # Preferred path: `python -m testbed pre-clone` already cloned every
