@@ -108,10 +108,10 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 
 ```bash
 # Recommended (conservative two-step): do ALL git work first, then run.
-# pre-clone warms the unique-repo cache AND clones every task workspace,
-# exits 1 if anything failed (re-running retries only the failures), and
-# leaves a manifest that `run` picks up -- the workload itself performs
-# zero clones, so a flaky network cannot fail tasks mid-run.
+# pre-clone clones every task workspace (retried network clones), exits 1
+# if anything failed (re-running retries only the failures), and leaves a
+# manifest that `run` picks up -- the workload itself performs zero
+# clones, so a flaky network cannot fail tasks mid-run.
 # Use the SAME --split/--num-samples/--seed (and --reset-workspace, if any)
 # on both commands: sample selection is deterministic, so they match.
 .venv/bin/python -m testbed pre-clone --split lite --num-samples 20 --seed 42 \
@@ -120,7 +120,7 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
      --out results/run1
 ```
 
-(Without a prior `pre-clone`, `run` still warms the cache and pre-clones all workspaces itself at startup — but failures there only warn and fall back to per-task clones; the standalone `pre-clone` gives a hard exit-1 gate to verify everything is ready before any task fires. The manifest is single-use: run `pre-clone` again before the next run.)
+(Without a prior `pre-clone`, `run` still pre-clones all workspaces itself at startup — but failures there only warn and fall back to per-task clones; the standalone `pre-clone` gives a hard exit-1 gate to verify everything is ready before any task fires. The manifest is single-use: run `pre-clone` again before the next run.)
 
 `run` flags (defaults in parentheses):
 
@@ -134,9 +134,7 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 | `--task-timeout-s` | `300` | per-task cap on the agent loop; `<=0` disables |
 | `--reset-workspace` | off | deterministic per-instance workspace dir, reset to `base_commit` each task |
 | `--sequential` | off | strictly one request at a time; bypasses Poisson |
-| `--repo-cache` / `--no-repo-cache` | on | pre-clone each unique repo once into `<workspace_root>/.repo-cache`, then clone tasks locally from it (avoids GitHub rate-limit clone failures) |
-| `--repo-cache-dir` | `<workspace_root>/.repo-cache` | override cache location |
-| `--pre-clone-workspaces` / `--no-pre-clone-workspaces` | on | clone **every task workspace** before the workload starts (after the cache warm) — zero clones mid-run, so a flaky network can't fail tasks at arrival time; failures are listed and retried at task start |
+| `--pre-clone-workspaces` / `--no-pre-clone-workspaces` | on | clone **every task workspace** before the workload starts — zero clones mid-run, so a flaky network can't fail tasks at arrival time; failures are listed and retried at task start |
 | `--router` | `""` | label recorded in `config.json` only (does NOT change routing) |
 | `--out` | required | output directory |
 

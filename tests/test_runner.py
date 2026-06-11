@@ -72,17 +72,10 @@ _SAMPLE = {
 @pytest.fixture(autouse=True)
 def _stub_pre_clone(monkeypatch):
     async def _ok(repo: str, base_commit: str, dest: Path, *,
-                  reset: bool = False, cache_dir=None) -> None:
+                  reset: bool = False) -> None:
         return None
 
     monkeypatch.setattr(runner, "_pre_clone", _ok)
-
-    # run() warms the repo cache before the task loop; stub it so the
-    # run-level tests never shell out to real git / the network.
-    async def _warm(samples, cache_dir, **kw):
-        return {}
-
-    monkeypatch.setattr(runner, "warm_repo_cache", _warm)
 
 
 async def test_happy_path_records_success_and_messages(tmp_path: Path):
@@ -144,7 +137,7 @@ async def test_reset_workspace_forwards_reset_kwarg_to_pre_clone(monkeypatch, tm
     the dir name is stable but the workspace state from the prior agent
     run isn't cleaned, defeating the reproducibility purpose."""
     seen: list[bool] = []
-    async def _spy(repo, base, dest, *, reset=False, cache_dir=None):
+    async def _spy(repo, base, dest, *, reset=False):
         seen.append(reset)
     monkeypatch.setattr(runner, "_pre_clone", _spy)
     client = _FakeClient()
@@ -154,23 +147,8 @@ async def test_reset_workspace_forwards_reset_kwarg_to_pre_clone(monkeypatch, tm
     assert seen == [True, False]
 
 
-async def test_run_one_forwards_repo_cache_dir_to_pre_clone(monkeypatch, tmp_path: Path):
-    """The cache dir must reach _pre_clone so the per-task clone copies
-    from the warmed cache instead of hitting the network."""
-    seen: list = []
-    async def _spy(repo, base, dest, *, reset=False, cache_dir=None):
-        seen.append(cache_dir)
-    monkeypatch.setattr(runner, "_pre_clone", _spy)
-    client = _FakeClient()
-    sem = asyncio.Semaphore(1)
-    cache = tmp_path / "cache"
-    await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, repo_cache_dir=cache)
-    await _run_one(client, _SAMPLE, 0.0, tmp_path, sem)   # default None
-    assert seen == [cache, None]
-
-
 async def test_clone_failure_marks_clone_stage(monkeypatch, tmp_path: Path):
-    async def _boom(repo, base, dest, *, reset=False, cache_dir=None):
+    async def _boom(repo, base, dest, *, reset=False):
         raise RuntimeError("git clone failed: network")
 
     monkeypatch.setattr(runner, "_pre_clone", _boom)
@@ -747,24 +725,23 @@ def test_directory_for_two_calls_differ():
 
 async def test_prepare_workspaces_clones_all_samples(monkeypatch, tmp_path: Path):
     """Every sample must be cloned with dest=workspace_root/directories[iid]
-    and the correct reset/cache_dir kwargs forwarded to _pre_clone."""
+    and the correct reset kwarg forwarded to _pre_clone."""
     samples = [
         {**_SAMPLE, "instance_id": "iid_a", "repo": "org/repo-a", "base_commit": "aaa"},
         {**_SAMPLE, "instance_id": "iid_b", "repo": "org/repo-b", "base_commit": "bbb"},
     ]
     directories = {"iid_a": "session-iid_a", "iid_b": "session-iid_b"}
-    cache = tmp_path / "cache"
     calls: list[dict] = []
 
-    async def _recording(repo, base_commit, dest, *, reset=False, cache_dir=None):
+    async def _recording(repo, base_commit, dest, *, reset=False):
         calls.append({"repo": repo, "base_commit": base_commit,
-                      "dest": dest, "reset": reset, "cache_dir": cache_dir})
+                      "dest": dest, "reset": reset})
 
     monkeypatch.setattr(runner, "_pre_clone", _recording)
 
     failures = await prepare_workspaces(
         samples, directories, tmp_path,
-        reset_workspace=True, cache_dir=cache, concurrency=2,
+        reset_workspace=True, concurrency=2,
     )
 
     assert failures == {}
@@ -775,13 +752,11 @@ async def test_prepare_workspaces_clones_all_samples(monkeypatch, tmp_path: Path
     assert call_a["base_commit"] == "aaa"
     assert call_a["dest"] == tmp_path / "session-iid_a"
     assert call_a["reset"] is True
-    assert call_a["cache_dir"] == cache
 
     call_b = by_iid["repo-b"]
     assert call_b["base_commit"] == "bbb"
     assert call_b["dest"] == tmp_path / "session-iid_b"
     assert call_b["reset"] is True
-    assert call_b["cache_dir"] == cache
 
 
 async def test_prepare_workspaces_collects_failures_without_raising(monkeypatch, tmp_path: Path):
@@ -793,7 +768,7 @@ async def test_prepare_workspaces_collects_failures_without_raising(monkeypatch,
     ]
     directories = {"ok_task": "session-ok_task", "bad_task": "session-bad_task"}
 
-    async def _selective(repo, base_commit, dest, *, reset=False, cache_dir=None):
+    async def _selective(repo, base_commit, dest, *, reset=False):
         if "bad_task" in str(dest):
             raise RuntimeError("git clone exploded")
 
@@ -856,7 +831,7 @@ async def test_run_pre_clone_workspaces_clones_before_session(
     cfg = _minimal_cfg(str(tmp_path / "ws"))
     events: list[str] = []
 
-    async def _recording_clone(repo, base_commit, dest, *, reset=False, cache_dir=None):
+    async def _recording_clone(repo, base_commit, dest, *, reset=False):
         iid = str(dest).split("/")[-1].replace("session-", "")
         events.append(f"clone:{iid}")
 
@@ -938,7 +913,7 @@ async def test_run_pre_clone_workspaces_false_skips_batch_phase(
     cfg = _minimal_cfg(str(tmp_path / "ws"))
     clone_calls: list[str] = []
 
-    async def _recording_clone(repo, base_commit, dest, *, reset=False, cache_dir=None):
+    async def _recording_clone(repo, base_commit, dest, *, reset=False):
         clone_calls.append(str(dest).split("/")[-1])
 
     monkeypatch.setattr(runner, "_pre_clone", _recording_clone)
@@ -1063,7 +1038,6 @@ async def test_pre_clone_run_writes_manifest_with_correct_keys(monkeypatch, tmp_
         num_samples=2,
         seed=42,
         reset_workspace=False,
-        repo_cache=False,
     )
 
     assert failures == {}
@@ -1087,7 +1061,7 @@ async def test_pre_clone_run_directories_cover_all_samples(monkeypatch, tmp_path
     monkeypatch.setattr(runner.swebench, "load_samples", lambda *a, **kw: _SAMPLES_TWO)
 
     await pre_clone_run(cfg, split="lite", num_samples=2, seed=42,
-                        reset_workspace=False, repo_cache=False)
+                        reset_workspace=False)
 
     manifest = workspace_manifest_path(workspace, "lite", 42, 2)
     data = json.loads(manifest.read_text())
@@ -1119,7 +1093,7 @@ async def test_pre_clone_run_resume_reuses_existing_directory_names(monkeypatch,
     manifest.write_text(json.dumps(prior))
 
     await pre_clone_run(cfg, split="lite", num_samples=2, seed=42,
-                        reset_workspace=False, repo_cache=False)
+                        reset_workspace=False)
 
     data = json.loads(manifest.read_text())
     # The custom name for iid_a must be preserved.
@@ -1153,7 +1127,7 @@ async def test_pre_clone_run_reset_workspace_mismatch_ignores_prior_manifest(
     manifest.write_text(json.dumps(prior))
 
     await pre_clone_run(cfg, split="lite", num_samples=2, seed=42,
-                        reset_workspace=False, repo_cache=False)
+                        reset_workspace=False)
 
     data = json.loads(manifest.read_text())
     # The reset-mode stable names must NOT be reused.
@@ -1173,7 +1147,7 @@ async def test_pre_clone_run_propagates_failures_and_still_writes_manifest(
     cfg = _minimal_cfg(str(workspace))
     monkeypatch.setattr(runner.swebench, "load_samples", lambda *a, **kw: _SAMPLES_TWO)
 
-    async def _boom_for_b(repo, base_commit, dest, *, reset=False, cache_dir=None):
+    async def _boom_for_b(repo, base_commit, dest, *, reset=False):
         if "iid_b" in str(dest):
             raise RuntimeError("git clone network error")
 
@@ -1181,7 +1155,7 @@ async def test_pre_clone_run_propagates_failures_and_still_writes_manifest(
 
     failures = await pre_clone_run(
         cfg, split="lite", num_samples=2, seed=42,
-        reset_workspace=False, repo_cache=False,
+        reset_workspace=False,
     )
 
     assert "iid_b" in failures
@@ -1230,14 +1204,6 @@ async def test_run_uses_manifest_directories_and_deletes_manifest(
     manifest.write_text(json.dumps(manifest_data))
     manifest_path_str = str(manifest)
 
-    warm_calls: list[int] = []
-
-    async def _no_warm(samples, cache_dir, **kw):
-        warm_calls.append(1)
-        return {}
-
-    monkeypatch.setattr(runner, "warm_repo_cache", _no_warm)
-
     fake_client = _FakeClient()
     with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
         with patch.object(runner.swebench, "load_samples", return_value=samples):
@@ -1261,9 +1227,6 @@ async def test_run_uses_manifest_directories_and_deletes_manifest(
     # config.json must record the manifest path that was consumed.
     config_json = json.loads((tmp_path / "out" / "config.json").read_text())
     assert config_json["workspace_manifest"] == manifest_path_str
-
-    # warm_repo_cache must NOT have been called (manifest path skips it).
-    assert warm_calls == [], "warm_repo_cache must not be called when manifest is used"
 
 
 @pytest.mark.asyncio
@@ -1420,11 +1383,13 @@ async def test_run_ignores_corrupt_manifest(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_run_with_manifest_does_not_call_warm_repo_cache(
+async def test_run_with_manifest_skips_batch_pre_clone_phase(
     monkeypatch, tmp_path: Path
 ):
-    """When a valid manifest is consumed, warm_repo_cache must NOT be called
-    (the manifest path skips the inline warm+prepare phase entirely)."""
+    """When a valid manifest is consumed, prepare_workspaces must NOT be
+    called before tasks -- the manifest already guarantees workspaces exist.
+    _pre_clone is still invoked per-task inside _run_one (for the
+    no-op / reset path) but no batch-phase cloning happens."""
     monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
     cfg = _minimal_cfg(str(tmp_path / "ws"))
     workspace = Path(cfg.workspace_root)
@@ -1437,13 +1402,14 @@ async def test_run_with_manifest_does_not_call_warm_repo_cache(
         "directories": {"iid_z": "session-iid_z-abc12345"},
     }))
 
-    warm_calls: list[int] = []
+    prepare_calls: list[int] = []
+    original_prepare = runner.prepare_workspaces
 
-    async def _spy_warm(samples, cache_dir, **kw):
-        warm_calls.append(1)
-        return {}
+    async def _spy_prepare(*args, **kwargs):
+        prepare_calls.append(1)
+        return await original_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "warm_repo_cache", _spy_warm)
+    monkeypatch.setattr(runner, "prepare_workspaces", _spy_prepare)
 
     fake_client = _FakeClient()
     with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
@@ -1457,4 +1423,4 @@ async def test_run_with_manifest_does_not_call_warm_repo_cache(
                         task_timeout_s=None, pre_clone_workspaces=True,
                     )
 
-    assert warm_calls == [], "warm_repo_cache must not be called when manifest is consumed"
+    assert prepare_calls == [], "prepare_workspaces must not be called when manifest is consumed"

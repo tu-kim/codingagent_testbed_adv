@@ -9,7 +9,6 @@ import statistics
 import sys
 import time
 import uuid
-from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -96,72 +95,18 @@ async def _run_git_retry(args: list[str], *, retries: int = 3,
 
 def _repo_url(repo: str) -> str:
     """GitHub HTTPS URL for a SWE-bench `repo` field (e.g. 'django/django').
-    Factored out so tests can point the cache at a local file:// repo."""
+    Factored out so tests can point clones at a local file:// repo."""
     return f"https://github.com/{repo}.git"
 
 
-def _repo_cache_path(cache_dir: Path, repo: str) -> Path:
-    return cache_dir / repo.replace("/", "__")
-
-
-async def _ensure_repo_cached(repo: str, base_commits: set[str],
-                              cache_dir: Path) -> Path | None:
-    """Ensure a full clone of `repo` exists in the cache and contains every
-    needed base_commit. Returns the cache path, or None on failure (caller
-    then falls back to a direct per-task clone). Network ops are retried."""
-    cache = _repo_cache_path(cache_dir, repo)
-    try:
-        if not (cache / ".git").is_dir():
-            if cache.exists():
-                import shutil
-                shutil.rmtree(cache)
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            await _run_git_retry(["git", "clone", "--quiet", _repo_url(repo), str(cache)])
-        missing = []
-        for c in base_commits:
-            try:
-                await _run_git(["git", "-C", str(cache), "cat-file", "-e", f"{c}^{{commit}}"])
-            except RuntimeError:
-                missing.append(c)
-        if missing:
-            # A shallow/old clone may lack some base_commits; pull full history.
-            await _run_git_retry(["git", "-C", str(cache), "fetch", "--quiet", "origin"])
-        return cache
-    except RuntimeError:
-        return None
-
-
-async def warm_repo_cache(samples: list[dict[str, Any]], cache_dir: Path,
-                          *, concurrency: int = 4) -> dict[str, Path]:
-    """Pre-clone every UNIQUE repo once into the cache before the workload
-    starts. SWE-bench draws many samples from the same repos, so this turns
-    N per-task network clones into U (unique-repo) clones and removes the
-    rate-limit / bandwidth pressure that makes mid-run clones flaky.
-    Returns {repo: cache_path} for repos that cached successfully; repos
-    absent from the map fall back to a direct per-task clone."""
-    by_repo: dict[str, set[str]] = defaultdict(set)
-    for s in samples:
-        by_repo[s["repo"]].add(s["base_commit"])
-    sem = asyncio.Semaphore(concurrency)
-    results: dict[str, Path] = {}
-
-    async def _one(repo: str, commits: set[str]) -> None:
-        async with sem:
-            path = await _ensure_repo_cached(repo, commits, cache_dir)
-            if path is not None:
-                results[repo] = path
-
-    await asyncio.gather(*(_one(r, c) for r, c in by_repo.items()))
-    return results
-
-
 async def _pre_clone(repo: str, base_commit: str, dest: Path,
-                     *, reset: bool = False, cache_dir: Path | None = None) -> None:
+                     *, reset: bool = False) -> None:
     """Prepare <dest> at <repo>@<base_commit>. Fail-fast.
 
-    Clone source: if `cache_dir` holds a cached clone of `repo`, copy from
-    it LOCALLY (git clone --local -- no network, immune to rate limits);
-    otherwise fall back to a direct (retried) network clone.
+    Direct network clone, retried with exponential backoff
+    (_run_git_retry) to ride out transient network failures. Idempotent:
+    an existing checkout is a no-op (reset=False) so retrying a partially
+    failed pre-clone pass only re-clones what's missing.
 
     With reset=True, an existing valid checkout is wiped back to
     base_commit (git reset --hard + git clean -fdx) instead of re-cloned.
@@ -180,13 +125,6 @@ async def _pre_clone(repo: str, base_commit: str, dest: Path,
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    cache = _repo_cache_path(cache_dir, repo) if cache_dir is not None else None
-    if cache is not None and (cache / ".git").is_dir():
-        # Local clone from the warmed cache -- no network. Hardlinks the
-        # (immutable) object store, so it's fast and cheap on disk.
-        await _run_git(["git", "clone", "--quiet", "--local", str(cache), str(dest)])
-        await _run_git(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
-        return
     await _run_git_retry(["git", "clone", "--quiet", _repo_url(repo), str(dest)])
     await _run_git(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
 
@@ -226,19 +164,15 @@ async def prepare_workspaces(
     workspace_root: Path,
     *,
     reset_workspace: bool = False,
-    cache_dir: Path | None = None,
     concurrency: int = 8,
 ) -> dict[str, str]:
     """Clone EVERY task workspace up front, before the workload starts.
 
-    The repo cache (warm_repo_cache) removes the per-task NETWORK clone,
-    but each task still does a local `git clone --local` + checkout at its
-    arrival time -- and on a flaky network any cache-miss fallback hits
-    GitHub mid-run. Pre-cloning all workspaces here moves every clone
-    (local or fallback-network, both retried) BEFORE the first request, so
-    the workload phase performs zero clones: `_pre_clone` at task time
-    sees the existing checkout and returns immediately (or, with
-    reset_workspace=True, just resets it -- still no clone).
+    Moves every (retried) network clone BEFORE the first request, so the
+    workload phase performs zero clones: `_pre_clone` at task time sees
+    the existing checkout and returns immediately (or, with
+    reset_workspace=True, just resets it -- still no clone). On a flaky
+    network nothing can fail a task at arrival time.
 
     Returns {instance_id: error_msg} for workspaces that could NOT be
     prepared; those tasks retry the clone at their arrival (legacy path)
@@ -256,7 +190,7 @@ async def prepare_workspaces(
         async with sem:
             try:
                 await _pre_clone(sample["repo"], sample["base_commit"], dest,
-                                 reset=reset_workspace, cache_dir=cache_dir)
+                                 reset=reset_workspace)
             except Exception as exc:  # noqa: BLE001 -- collected, not fatal here
                 failures[iid] = f"{type(exc).__name__}: {exc}"
             done += 1
@@ -284,12 +218,10 @@ async def pre_clone_run(
     num_samples: int,
     seed: int,
     reset_workspace: bool = False,
-    repo_cache: bool = True,
-    repo_cache_dir: str | None = None,
     concurrency: int = 8,
 ) -> dict[str, str]:
     """Standalone conservative prepare step (`python -m testbed pre-clone`):
-    warm the repo cache, clone EVERY task workspace, write the manifest.
+    clone EVERY task workspace, write the manifest.
 
     Run this before `run` with the SAME (--split, --num-samples, --seed,
     --reset-workspace). `run` then finds the manifest, reuses the exact
@@ -307,17 +239,6 @@ async def pre_clone_run(
     samples = swebench.load_samples(split, seed, num_samples)
     workspace_root = Path(cfg.workspace_root)
     workspace_root.mkdir(parents=True, exist_ok=True)
-
-    cache_dir: Path | None = None
-    if repo_cache:
-        cache_dir = (Path(repo_cache_dir) if repo_cache_dir
-                     else workspace_root / ".repo-cache")
-        n_repos = len({s["repo"] for s in samples})
-        print(f"warming repo cache: {n_repos} unique repos → {cache_dir}",
-              file=sys.stderr, flush=True)
-        cached = await warm_repo_cache(samples, cache_dir)
-        print(f"repo cache ready: {len(cached)}/{n_repos} repos",
-              file=sys.stderr, flush=True)
 
     manifest = workspace_manifest_path(workspace_root, split, seed, num_samples)
     directories: dict[str, str] = {}
@@ -338,8 +259,7 @@ async def pre_clone_run(
           file=sys.stderr, flush=True)
     failures = await prepare_workspaces(
         samples, directories, workspace_root,
-        reset_workspace=reset_workspace, cache_dir=cache_dir,
-        concurrency=concurrency,
+        reset_workspace=reset_workspace, concurrency=concurrency,
     )
 
     manifest.write_text(json.dumps({
@@ -360,7 +280,6 @@ async def _run_one(
     sem: asyncio.Semaphore,
     task_timeout_s: float | None = None,
     reset_workspace: bool = False,
-    repo_cache_dir: Path | None = None,
     directory: str | None = None,
 ) -> TaskRecord:
     instance_id = sample["instance_id"]
@@ -380,7 +299,7 @@ async def _run_one(
         # Stage 1: clone.
         try:
             await _pre_clone(sample["repo"], sample["base_commit"], dest,
-                             reset=reset_workspace, cache_dir=repo_cache_dir)
+                             reset=reset_workspace)
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,
@@ -516,8 +435,6 @@ async def run(
     task_timeout_s: float | None = None,
     reset_workspace: bool = False,
     sequential: bool = False,
-    repo_cache: bool = True,
-    repo_cache_dir: str | None = None,
     pre_clone_workspaces: bool = True,
 ) -> None:
     """Drive `num_samples` SWE-bench tasks.
@@ -541,14 +458,6 @@ async def run(
     out_dir.mkdir(parents=True, exist_ok=True)
     workspace_root = Path(cfg.workspace_root)
     workspace_root.mkdir(parents=True, exist_ok=True)
-
-    # cache_dir is always resolved (even when the workspaces were prepared
-    # by `pre-clone`) so per-task clone RETRIES still copy locally from the
-    # cache instead of hitting the network.
-    cache_dir: Path | None = None
-    if repo_cache:
-        cache_dir = (Path(repo_cache_dir) if repo_cache_dir
-                     else workspace_root / ".repo-cache")
 
     # Preferred path: `python -m testbed pre-clone` already cloned every
     # workspace and left a manifest for this exact (split, seed, n).
@@ -585,23 +494,10 @@ async def run(
                       file=sys.stderr, flush=True)
 
     if directories is None:
-        # No usable manifest: warm the repo cache (de-duplicates the network
-        # fetches: N tasks -> U unique repos) and clone all workspaces
-        # inline, before the first request fires.
-        if cache_dir is not None:
-            n_repos = len({s["repo"] for s in samples})
-            print(f"warming repo cache: {n_repos} unique repos → {cache_dir}",
-                  file=sys.stderr, flush=True)
-            cached = await warm_repo_cache(samples, cache_dir)
-            if len(cached) < n_repos:
-                print(f"  {n_repos - len(cached)} repo(s) failed to cache -- those "
-                      f"tasks fall back to direct clone", file=sys.stderr, flush=True)
-            print(f"repo cache ready: {len(cached)}/{n_repos} repos",
-                  file=sys.stderr, flush=True)
-
-        # Workspace directory names are assigned UP FRONT (not inside
-        # _run_one) so every task workspace can be cloned before the first
-        # request fires.
+        # No usable manifest: clone all workspaces inline, before the
+        # first request fires. Workspace directory names are assigned UP
+        # FRONT (not inside _run_one) so every task workspace can be
+        # cloned before the first request fires.
         directories = {s["instance_id"]: _directory_for(s["instance_id"], reset_workspace)
                        for s in samples}
 
@@ -610,7 +506,7 @@ async def run(
                   file=sys.stderr, flush=True)
             clone_failures = await prepare_workspaces(
                 samples, directories, workspace_root,
-                reset_workspace=reset_workspace, cache_dir=cache_dir,
+                reset_workspace=reset_workspace,
             )
             if clone_failures:
                 print(f"  {len(clone_failures)} workspace(s) FAILED to pre-clone "
@@ -641,8 +537,6 @@ async def run(
         "task_timeout_s": task_timeout_s,
         "reset_workspace": reset_workspace,
         "sequential": sequential,
-        "repo_cache": repo_cache,
-        "repo_cache_dir": str(cache_dir) if cache_dir else None,
         "pre_clone_workspaces": pre_clone_workspaces,
         "workspace_manifest": manifest_used,
         "router": router_label,
@@ -681,7 +575,6 @@ async def run(
                         sem,
                         task_timeout_s=task_timeout_s,
                         reset_workspace=reset_workspace,
-                        repo_cache_dir=cache_dir,
                         directory=directories[sample["instance_id"]],
                     )
                     trace_fh.write(rec.to_jsonl())
@@ -702,7 +595,6 @@ async def run(
                                 sem,
                                 task_timeout_s=task_timeout_s,
                                 reset_workspace=reset_workspace,
-                                repo_cache_dir=cache_dir,
                                 directory=directories[samples[i]["instance_id"]],
                             )
                         )

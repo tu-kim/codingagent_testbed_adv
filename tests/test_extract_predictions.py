@@ -38,7 +38,7 @@ def mod():
 
 
 # ---------------------------------------------------------------------------
-# Minimal git helper (same env-scrub convention as test_repo_cache.py)
+# Minimal git helper (same env-scrub convention as test_pre_clone_git.py)
 # ---------------------------------------------------------------------------
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:

@@ -38,15 +38,13 @@ def _make_pre_clone_stub(failures: dict | None = None):
     recorded: list[dict] = []
 
     async def _stub(cfg, *, split, num_samples, seed, reset_workspace,
-                    repo_cache, repo_cache_dir, concurrency):
+                    concurrency):
         recorded.append({
             "cfg": cfg,
             "split": split,
             "num_samples": num_samples,
             "seed": seed,
             "reset_workspace": reset_workspace,
-            "repo_cache": repo_cache,
-            "repo_cache_dir": repo_cache_dir,
             "concurrency": concurrency,
         })
         return failures
@@ -163,34 +161,19 @@ def test_default_concurrency_is_8(monkeypatch, tmp_path):
     assert recorded[0]["concurrency"] == 8
 
 
-def test_repo_cache_dir_forwarded_as_str(monkeypatch, tmp_path):
-    """--repo-cache-dir is forwarded to pre_clone_run as a str (not Path)."""
-    override = tmp_path / "my-cache"
-    _, recorded = _invoke(["--repo-cache-dir", str(override)], monkeypatch, tmp_path)
+def test_repo_cache_flag_rejected_as_unknown_option(monkeypatch, tmp_path):
+    """--repo-cache was removed from the pre-clone command; invoking it must
+    be rejected by Click as an unrecognised option (exit code 2)."""
+    stub, _ = _make_pre_clone_stub()
+    monkeypatch.setattr("testbed.cli.config_mod.load",
+                        lambda *a, **kw: _make_cfg(str(tmp_path / "ws")))
+    monkeypatch.setattr("testbed.cli.runner_mod.pre_clone_run", stub)
 
-    assert recorded[0]["repo_cache_dir"] == str(override)
-    assert isinstance(recorded[0]["repo_cache_dir"], str)
-
-
-def test_no_repo_cache_flag_forwarded(monkeypatch, tmp_path):
-    """--no-repo-cache sets repo_cache=False on pre_clone_run."""
-    _, recorded = _invoke(["--no-repo-cache"], monkeypatch, tmp_path)
-
-    assert recorded[0]["repo_cache"] is False
-
-
-def test_repo_cache_default_true(monkeypatch, tmp_path):
-    """Repo cache is enabled by default."""
-    _, recorded = _invoke([], monkeypatch, tmp_path)
-
-    assert recorded[0]["repo_cache"] is True
-
-
-def test_repo_cache_dir_none_when_not_specified(monkeypatch, tmp_path):
-    """Without --repo-cache-dir, repo_cache_dir is None (let runner use default)."""
-    _, recorded = _invoke([], monkeypatch, tmp_path)
-
-    assert recorded[0]["repo_cache_dir"] is None
+    cli_runner = CliRunner(mix_stderr=False)
+    result = cli_runner.invoke(main, ["pre-clone", "--repo-cache"],
+                               catch_exceptions=False)
+    assert result.exit_code == 2
+    assert "no such option" in (result.output + (result.stderr or "")).lower()
 
 
 def test_split_forwarded(monkeypatch, tmp_path):

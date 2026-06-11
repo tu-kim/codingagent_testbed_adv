@@ -68,33 +68,15 @@ def main() -> None:
     ),
 )
 @click.option(
-    "--repo-cache/--no-repo-cache",
-    default=True,
-    show_default=True,
-    help=(
-        "Pre-clone each unique SWE-bench repo ONCE into a local cache "
-        "(<workspace_root>/.repo-cache) before the run, then make each "
-        "task clone locally from the cache instead of hitting GitHub. "
-        "Removes the rate-limit / bandwidth clone failures you get when "
-        "many tasks clone the same repos concurrently. --no-repo-cache "
-        "reverts to a direct network clone per task."
-    ),
-)
-@click.option("--repo-cache-dir", default=None,
-              type=click.Path(file_okay=False, path_type=Path),
-              help="Override the repo cache location (default "
-                   "<workspace_root>/.repo-cache).")
-@click.option(
     "--pre-clone-workspaces/--no-pre-clone-workspaces",
     default=True,
     show_default=True,
     help=(
-        "Clone EVERY task workspace before the workload starts (after the "
-        "repo-cache warm), so zero clones happen mid-run -- on a flaky "
-        "network this removes clone failures entirely. Workspaces that "
-        "still fail to pre-clone are retried at their task's arrival. "
-        "--no-pre-clone-workspaces reverts to cloning each workspace at "
-        "task arrival time."
+        "Clone EVERY task workspace before the workload starts, so zero "
+        "clones happen mid-run -- on a flaky network this removes clone "
+        "failures entirely. Workspaces that still fail to pre-clone are "
+        "retried at their task's arrival. --no-pre-clone-workspaces "
+        "reverts to cloning each workspace at task arrival time."
     ),
 )
 @click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
@@ -109,8 +91,6 @@ def run_cmd(
     router: str,
     reset_workspace: bool,
     sequential: bool,
-    repo_cache: bool,
-    repo_cache_dir: Path | None,
     pre_clone_workspaces: bool,
     out: Path,
     config_path: Path | None,
@@ -130,8 +110,6 @@ def run_cmd(
             task_timeout_s=task_timeout_s if task_timeout_s > 0 else None,
             reset_workspace=reset_workspace,
             sequential=sequential,
-            repo_cache=repo_cache,
-            repo_cache_dir=str(repo_cache_dir) if repo_cache_dir else None,
             pre_clone_workspaces=pre_clone_workspaces,
         )
     )
@@ -147,13 +125,6 @@ def run_cmd(
                    "is ignored by `run`).")
 @click.option("--concurrency", default=8, show_default=True, type=int,
               help="Concurrent workspace clones.")
-@click.option("--repo-cache/--no-repo-cache", default=True, show_default=True,
-              help="Warm + use the unique-repo cache (network fetches drop "
-                   "from N tasks to U unique repos).")
-@click.option("--repo-cache-dir", default=None,
-              type=click.Path(file_okay=False, path_type=Path),
-              help="Override the repo cache location (default "
-                   "<workspace_root>/.repo-cache).")
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
 def pre_clone_cmd(
     split: str,
@@ -161,17 +132,14 @@ def pre_clone_cmd(
     seed: int,
     reset_workspace: bool,
     concurrency: int,
-    repo_cache: bool,
-    repo_cache_dir: Path | None,
     config_path: Path | None,
 ) -> None:
     """Clone ALL task workspaces for an upcoming run, before starting it.
 
     Conservative two-step flow for flaky networks: do every git operation
     here, verify everything is ready, THEN start the workload (which does
-    zero cloning). Internally warms the unique-repo cache first, clones
-    each workspace locally from it, and writes a manifest that `run`
-    consumes to reuse the exact same directories:
+    zero cloning). Writes a manifest that `run` consumes to reuse the
+    exact same directories:
 
         python -m testbed pre-clone --split lite --num-samples 300 --seed 42 \\
           && python -m testbed run --split lite --num-samples 300 --seed 42 --out results/run1
@@ -190,8 +158,6 @@ def pre_clone_cmd(
             num_samples=num_samples,
             seed=seed,
             reset_workspace=reset_workspace,
-            repo_cache=repo_cache,
-            repo_cache_dir=str(repo_cache_dir) if repo_cache_dir else None,
             concurrency=concurrency,
         )
     )
