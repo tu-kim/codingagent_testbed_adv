@@ -81,6 +81,7 @@ deploy/testbed.sh logs <component>        # tail -F logs/<component>.log
 ```
 
 - `up`/`down` with no target = `all` = **workers + frontend + opencode** (in order / reverse).
+- `up opencode` launches with `OPENCODE_CLIENT=server`, which **disables the interactive `question` tool**. In a headless run nobody can answer it, so a `question` call would block the agent loop until `--task-timeout-s` and waste the task. Leave this in place for unattended runs.
 - `monitor` and `scrape_metrics` are **optional** — never part of `all`, bring up/down separately. `monitor` **must be started with `sudo`** (needs root for DCGM GPU access); `scrape_metrics` does not. See §6.
 - etcd + NATS are external prerequisites; `up etcd` / `up nats` are single-node conveniences.
 - All PID + log files live under `./logs/`.
@@ -106,10 +107,17 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 ## 4. Running a workload
 
 ```bash
-.venv/bin/python -m testbed run \
-  --split lite --num-samples 20 --qps 0.5 --seed 42 \
-  --out results/run1
+# Recommended: pre-warm the repo cache first (same split/num-samples/seed as
+# the run -- sample selection is deterministic, so the repo set matches).
+# Exits 1 if any repo failed, so it gates the run: no network clones (and no
+# mid-run clone failures) once it passes.
+.venv/bin/python -m testbed warm-cache --split lite --num-samples 20 --seed 42 \
+&& .venv/bin/python -m testbed run \
+     --split lite --num-samples 20 --qps 0.5 --seed 42 \
+     --out results/run1
 ```
+
+(`run` also warms the cache itself at startup, but a failed warm there only warns on stderr and falls back to per-task network clones — running `warm-cache` first gives a hard exit-1 gate so you can verify the cache is complete before any task fires.)
 
 `run` flags (defaults in parentheses):
 
@@ -125,6 +133,7 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 | `--sequential` | off | strictly one request at a time; bypasses Poisson |
 | `--repo-cache` / `--no-repo-cache` | on | pre-clone each unique repo once into `<workspace_root>/.repo-cache`, then clone tasks locally from it (avoids GitHub rate-limit clone failures) |
 | `--repo-cache-dir` | `<workspace_root>/.repo-cache` | override cache location |
+| `--pre-clone-workspaces` / `--no-pre-clone-workspaces` | on | clone **every task workspace** before the workload starts (after the cache warm) — zero clones mid-run, so a flaky network can't fail tasks at arrival time; failures are listed and retried at task start |
 | `--router` | `""` | label recorded in `config.json` only (does NOT change routing) |
 | `--out` | required | output directory |
 
@@ -205,6 +214,20 @@ sudo deploy/testbed.sh down monitor
 - `monitor` — DCGM GPU + psutil sampler; **must be run with `sudo`** (root for DCGM). Set `monitor.dcgm_py` in `testbed.yaml` to the Python with DCGM bindings (read from yaml so sudo's env-strip doesn't lose it).
 
 OpenCode profiling is ENV-gated: launch opencode with `OPENCODE_PROFILE=1` (per-session NDJSON lands in `<workspace_root>/profiles/`). Aggregate with `scripts/aggregate_profiles.sh <workspace_root>`.
+
+### Correctness evaluation (true resolve/fail)
+
+`trace.jsonl`'s `success` is only HTTP-level ("the agent loop completed") — it does **not** mean the fix is correct. To judge real SWE-bench resolution, score the run with the official evaluation harness:
+
+```bash
+pip install swebench                       # official harness; needs Docker on the host
+scripts/evaluate_predictions.sh --run results/run1 --max-workers 8
+scripts/analyze_eval_results.py --run results/run1 --csv results/run1/eval_per_instance.csv
+```
+
+- `extract_predictions.py` — turns each task workspace into a `model_patch` (git diff vs `base_commit`, junk like `__pycache__` excluded) → `<run>/predictions.jsonl`. Failed tasks get an empty patch (counted unresolved). Invoked automatically by `evaluate_predictions.sh`.
+- `evaluate_predictions.sh` — runs `python -m swebench.harness.run_evaluation` (per-instance Docker images, runs each instance's FAIL_TO_PASS + PASS_TO_PASS tests). Report lands at `<run>/<model>.<run_id>.json`.
+- `analyze_eval_results.py` — joins the report with `trace.jsonl`: per-instance verdict (`resolved`/`unresolved`/`empty_patch`/`error`) next to HTTP status + RTT, plus `resolve_rate_all` and `resolve_rate_http_ok` (isolates "agent finished but fix is wrong" from infra failures).
 
 Utilities: `jsonl_to_json.py` (NDJSON→JSON), `trim_idle_tail.py`, `sse_chunk_timing.py` (single-stream chunk timing), `view_trace.sh`.
 
