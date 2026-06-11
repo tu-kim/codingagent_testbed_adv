@@ -16,7 +16,9 @@ from testbed.runner import (
     _env_truthy,
     _run_one,
     _summary,
+    pre_clone_run,
     prepare_workspaces,
+    workspace_manifest_path,
 )
 
 
@@ -1013,3 +1015,446 @@ async def test_run_config_json_pre_clone_workspaces_false(monkeypatch, tmp_path:
 
     config_json = json.loads((tmp_path / "out" / "config.json").read_text())
     assert config_json["pre_clone_workspaces"] is False
+
+
+# ---------------------------------------------------------------------------
+# workspace_manifest_path
+# ---------------------------------------------------------------------------
+
+def test_workspace_manifest_path_format(tmp_path: Path):
+    """Manifest path = workspace_root / '.workspaces-<split>-s<seed>-n<n>.json'."""
+    p = workspace_manifest_path(tmp_path, "lite", 42, 10)
+    assert p == tmp_path / ".workspaces-lite-s42-n10.json"
+
+
+def test_workspace_manifest_path_split_seed_n_vary():
+    """Different (split, seed, n) triples produce different paths — no cross-run collision."""
+    from pathlib import Path as _Path
+    root = _Path("/tmp/ws")
+    p1 = workspace_manifest_path(root, "lite", 42, 10)
+    p2 = workspace_manifest_path(root, "verified", 42, 10)
+    p3 = workspace_manifest_path(root, "lite", 99, 10)
+    p4 = workspace_manifest_path(root, "lite", 42, 20)
+    assert len({str(p1), str(p2), str(p3), str(p4)}) == 4
+
+
+# ---------------------------------------------------------------------------
+# pre_clone_run
+# ---------------------------------------------------------------------------
+
+_SAMPLES_TWO = [
+    {**_SAMPLE, "instance_id": "iid_a"},
+    {**_SAMPLE, "instance_id": "iid_b"},
+]
+
+
+@pytest.mark.asyncio
+async def test_pre_clone_run_writes_manifest_with_correct_keys(monkeypatch, tmp_path: Path):
+    """pre_clone_run must write a manifest JSON containing split, seed,
+    num_samples, reset_workspace, and a directories dict covering all samples."""
+    workspace = tmp_path / "ws"
+    cfg = _minimal_cfg(str(workspace))
+
+    monkeypatch.setattr(runner.swebench, "load_samples", lambda *a, **kw: _SAMPLES_TWO)
+
+    failures = await pre_clone_run(
+        cfg,
+        split="lite",
+        num_samples=2,
+        seed=42,
+        reset_workspace=False,
+        repo_cache=False,
+    )
+
+    assert failures == {}
+    manifest = workspace_manifest_path(workspace, "lite", 42, 2)
+    assert manifest.exists()
+    data = json.loads(manifest.read_text())
+    assert data["split"] == "lite"
+    assert data["seed"] == 42
+    assert data["num_samples"] == 2
+    assert data["reset_workspace"] is False
+    # Both iids must appear in directories.
+    assert "iid_a" in data["directories"]
+    assert "iid_b" in data["directories"]
+
+
+@pytest.mark.asyncio
+async def test_pre_clone_run_directories_cover_all_samples(monkeypatch, tmp_path: Path):
+    """Each sample's instance_id gets a distinct directory name in the manifest."""
+    workspace = tmp_path / "ws"
+    cfg = _minimal_cfg(str(workspace))
+    monkeypatch.setattr(runner.swebench, "load_samples", lambda *a, **kw: _SAMPLES_TWO)
+
+    await pre_clone_run(cfg, split="lite", num_samples=2, seed=42,
+                        reset_workspace=False, repo_cache=False)
+
+    manifest = workspace_manifest_path(workspace, "lite", 42, 2)
+    data = json.loads(manifest.read_text())
+    dirs = data["directories"]
+    assert dirs["iid_a"] != dirs["iid_b"]
+
+
+@pytest.mark.asyncio
+async def test_pre_clone_run_resume_reuses_existing_directory_names(monkeypatch, tmp_path: Path):
+    """If a manifest already exists with matching reset_workspace flag, the
+    previously assigned directory names are preserved (resume semantics)."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True)
+    cfg = _minimal_cfg(str(workspace))
+    monkeypatch.setattr(runner.swebench, "load_samples", lambda *a, **kw: _SAMPLES_TWO)
+
+    # Pre-seed a manifest with a custom directory name for iid_a.
+    manifest = workspace_manifest_path(workspace, "lite", 42, 2)
+    prior = {
+        "split": "lite",
+        "seed": 42,
+        "num_samples": 2,
+        "reset_workspace": False,
+        "directories": {
+            "iid_a": "session-iid_a-custom0001",
+            # iid_b intentionally absent — will be assigned fresh.
+        },
+    }
+    manifest.write_text(json.dumps(prior))
+
+    await pre_clone_run(cfg, split="lite", num_samples=2, seed=42,
+                        reset_workspace=False, repo_cache=False)
+
+    data = json.loads(manifest.read_text())
+    # The custom name for iid_a must be preserved.
+    assert data["directories"]["iid_a"] == "session-iid_a-custom0001"
+    # iid_b was missing from prior; it must have been assigned now.
+    assert "iid_b" in data["directories"]
+
+
+@pytest.mark.asyncio
+async def test_pre_clone_run_reset_workspace_mismatch_ignores_prior_manifest(
+    monkeypatch, tmp_path: Path
+):
+    """A prior manifest with reset_workspace=True is NOT resumed when the
+    current call uses reset_workspace=False — fresh names are assigned."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True)
+    cfg = _minimal_cfg(str(workspace))
+    monkeypatch.setattr(runner.swebench, "load_samples", lambda *a, **kw: _SAMPLES_TWO)
+
+    manifest = workspace_manifest_path(workspace, "lite", 42, 2)
+    prior = {
+        "split": "lite",
+        "seed": 42,
+        "num_samples": 2,
+        "reset_workspace": True,   # mismatch: current call uses False
+        "directories": {
+            "iid_a": "session-iid_a",   # stable reset-mode name
+            "iid_b": "session-iid_b",
+        },
+    }
+    manifest.write_text(json.dumps(prior))
+
+    await pre_clone_run(cfg, split="lite", num_samples=2, seed=42,
+                        reset_workspace=False, repo_cache=False)
+
+    data = json.loads(manifest.read_text())
+    # The reset-mode stable names must NOT be reused.
+    assert data["directories"]["iid_a"] != "session-iid_a"
+    assert data["directories"]["iid_b"] != "session-iid_b"
+    # The written manifest records the correct flag.
+    assert data["reset_workspace"] is False
+
+
+@pytest.mark.asyncio
+async def test_pre_clone_run_propagates_failures_and_still_writes_manifest(
+    monkeypatch, tmp_path: Path
+):
+    """A failing _pre_clone (for one iid) is returned in the failures dict
+    AND the manifest is still written so a subsequent re-run can resume."""
+    workspace = tmp_path / "ws"
+    cfg = _minimal_cfg(str(workspace))
+    monkeypatch.setattr(runner.swebench, "load_samples", lambda *a, **kw: _SAMPLES_TWO)
+
+    async def _boom_for_b(repo, base_commit, dest, *, reset=False, cache_dir=None):
+        if "iid_b" in str(dest):
+            raise RuntimeError("git clone network error")
+
+    monkeypatch.setattr(runner, "_pre_clone", _boom_for_b)
+
+    failures = await pre_clone_run(
+        cfg, split="lite", num_samples=2, seed=42,
+        reset_workspace=False, repo_cache=False,
+    )
+
+    assert "iid_b" in failures
+    assert "iid_a" not in failures
+
+    # Manifest must still exist so a retry can resume.
+    manifest = workspace_manifest_path(workspace, "lite", 42, 2)
+    assert manifest.exists()
+    data = json.loads(manifest.read_text())
+    assert "iid_a" in data["directories"]
+    assert "iid_b" in data["directories"]
+
+
+# ---------------------------------------------------------------------------
+# run() manifest consumption
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_uses_manifest_directories_and_deletes_manifest(
+    monkeypatch, tmp_path: Path
+):
+    """When a valid manifest exists for (split,seed,n) and reset_workspace
+    matches, run() MUST use those exact directory names in trace records,
+    delete the manifest, and record config.json['workspace_manifest']."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    workspace = Path(cfg.workspace_root)
+    workspace.mkdir(parents=True)
+
+    samples = [
+        {**_SAMPLE, "instance_id": "iid_a"},
+        {**_SAMPLE, "instance_id": "iid_b"},
+    ]
+
+    manifest = workspace_manifest_path(workspace, "lite", 42, 2)
+    manifest_data = {
+        "split": "lite",
+        "seed": 42,
+        "num_samples": 2,
+        "reset_workspace": False,
+        "directories": {
+            "iid_a": "session-iid_a-manifest0a",
+            "iid_b": "session-iid_b-manifest0b",
+        },
+    }
+    manifest.write_text(json.dumps(manifest_data))
+    manifest_path_str = str(manifest)
+
+    warm_calls: list[int] = []
+
+    async def _no_warm(samples, cache_dir, **kw):
+        warm_calls.append(1)
+        return {}
+
+    monkeypatch.setattr(runner, "warm_repo_cache", _no_warm)
+
+    fake_client = _FakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=2, qps=1.0, seed=42,
+                max_in_flight=2, out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+                reset_workspace=False, pre_clone_workspaces=True,
+            )
+
+    # Manifest must have been consumed (deleted).
+    assert not manifest.exists(), "manifest must be deleted after consumption"
+
+    # Trace records must use the manifest-supplied directory names.
+    trace = [json.loads(l) for l in (tmp_path / "out" / "trace.jsonl").read_text().splitlines()]
+    dirs = {t["instance_id"]: t["directory"] for t in trace}
+    assert dirs["iid_a"] == "session-iid_a-manifest0a"
+    assert dirs["iid_b"] == "session-iid_b-manifest0b"
+
+    # config.json must record the manifest path that was consumed.
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["workspace_manifest"] == manifest_path_str
+
+    # warm_repo_cache must NOT have been called (manifest path skips it).
+    assert warm_calls == [], "warm_repo_cache must not be called when manifest is used"
+
+
+@pytest.mark.asyncio
+async def test_run_manifest_null_when_no_manifest_exists(monkeypatch, tmp_path: Path):
+    """When no manifest file is present, config.json['workspace_manifest'] is null."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+
+    fake_client = _FakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite", num_samples=1, qps=1.0, seed=42,
+                        max_in_flight=1, out_dir=tmp_path / "out", router_label="",
+                        task_timeout_s=None, pre_clone_workspaces=True,
+                    )
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["workspace_manifest"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_ignores_manifest_when_reset_workspace_mismatches(
+    monkeypatch, tmp_path: Path
+):
+    """Manifest built with reset_workspace=True is ignored by a run with
+    reset_workspace=False. Fresh uuid-suffixed dirs are assigned, and the
+    manifest file is NOT deleted."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    workspace = Path(cfg.workspace_root)
+    workspace.mkdir(parents=True)
+
+    samples = [{**_SAMPLE, "instance_id": "iid_a"}]
+
+    manifest = workspace_manifest_path(workspace, "lite", 42, 1)
+    manifest_data = {
+        "split": "lite",
+        "seed": 42,
+        "num_samples": 1,
+        "reset_workspace": True,     # mismatch with run's reset_workspace=False
+        "directories": {"iid_a": "session-iid_a"},
+    }
+    manifest.write_text(json.dumps(manifest_data))
+
+    fake_client = _FakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite", num_samples=1, qps=1.0, seed=42,
+                        max_in_flight=1, out_dir=tmp_path / "out", router_label="",
+                        task_timeout_s=None,
+                        reset_workspace=False, pre_clone_workspaces=True,
+                    )
+
+    # Manifest must NOT have been deleted.
+    assert manifest.exists(), "mismatched manifest must not be deleted"
+
+    # The trace directory must NOT be the manifest's reset-mode stable name.
+    trace = [json.loads(l) for l in (tmp_path / "out" / "trace.jsonl").read_text().splitlines()]
+    assert trace[0]["directory"] != "session-iid_a"
+
+    # config.json workspace_manifest must be null (manifest was ignored).
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["workspace_manifest"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_ignores_manifest_when_coverage_incomplete(
+    monkeypatch, tmp_path: Path
+):
+    """A manifest that doesn't cover all sample iids is ignored;
+    fresh dirs are assigned and the manifest file is NOT deleted."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    workspace = Path(cfg.workspace_root)
+    workspace.mkdir(parents=True)
+
+    samples = [
+        {**_SAMPLE, "instance_id": "iid_a"},
+        {**_SAMPLE, "instance_id": "iid_b"},
+    ]
+
+    manifest = workspace_manifest_path(workspace, "lite", 42, 2)
+    # Only covers iid_a — missing iid_b.
+    manifest_data = {
+        "split": "lite",
+        "seed": 42,
+        "num_samples": 2,
+        "reset_workspace": False,
+        "directories": {"iid_a": "session-iid_a-manifest"},
+    }
+    manifest.write_text(json.dumps(manifest_data))
+
+    fake_client = _FakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=2, qps=1.0, seed=42,
+                max_in_flight=2, out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+                reset_workspace=False, pre_clone_workspaces=True,
+            )
+
+    # Incomplete manifest must NOT be deleted.
+    assert manifest.exists(), "incomplete manifest must not be deleted"
+
+    # The manifest's stale directory for iid_a must NOT be used
+    # (fresh uuid-suffixed dirs assigned instead).
+    trace = [json.loads(l) for l in (tmp_path / "out" / "trace.jsonl").read_text().splitlines()]
+    dirs = {t["instance_id"]: t["directory"] for t in trace}
+    assert dirs["iid_a"] != "session-iid_a-manifest"
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["workspace_manifest"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_ignores_corrupt_manifest(monkeypatch, tmp_path: Path):
+    """A manifest with corrupt JSON is ignored; fresh dirs assigned,
+    manifest NOT deleted, config.json['workspace_manifest'] is null."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    workspace = Path(cfg.workspace_root)
+    workspace.mkdir(parents=True)
+
+    manifest = workspace_manifest_path(workspace, "lite", 42, 1)
+    manifest.write_text("{this is not valid JSON{{{{")
+
+    fake_client = _FakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite", num_samples=1, qps=1.0, seed=42,
+                        max_in_flight=1, out_dir=tmp_path / "out", router_label="",
+                        task_timeout_s=None, pre_clone_workspaces=True,
+                    )
+
+    # Corrupt manifest must remain on disk (not silently deleted).
+    assert manifest.exists(), "corrupt manifest must not be deleted"
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["workspace_manifest"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_with_manifest_does_not_call_warm_repo_cache(
+    monkeypatch, tmp_path: Path
+):
+    """When a valid manifest is consumed, warm_repo_cache must NOT be called
+    (the manifest path skips the inline warm+prepare phase entirely)."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    workspace = Path(cfg.workspace_root)
+    workspace.mkdir(parents=True)
+
+    samples = [{**_SAMPLE, "instance_id": "iid_z"}]
+    manifest = workspace_manifest_path(workspace, "lite", 42, 1)
+    manifest.write_text(json.dumps({
+        "split": "lite", "seed": 42, "num_samples": 1, "reset_workspace": False,
+        "directories": {"iid_z": "session-iid_z-abc12345"},
+    }))
+
+    warm_calls: list[int] = []
+
+    async def _spy_warm(samples, cache_dir, **kw):
+        warm_calls.append(1)
+        return {}
+
+    monkeypatch.setattr(runner, "warm_repo_cache", _spy_warm)
+
+    fake_client = _FakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite", num_samples=1, qps=1.0, seed=42,
+                        max_in_flight=1, out_dir=tmp_path / "out", router_label="",
+                        task_timeout_s=None, pre_clone_workspaces=True,
+                    )
+
+    assert warm_calls == [], "warm_repo_cache must not be called when manifest is consumed"

@@ -137,61 +137,71 @@ def run_cmd(
     )
 
 
-@main.command("warm-cache")
+@main.command("pre-clone")
 @click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
 @click.option("--num-samples", default=10, show_default=True, type=int)
 @click.option("--seed", default=42, show_default=True, type=int)
-@click.option("--concurrency", default=4, show_default=True, type=int,
-              help="Concurrent network clones while warming.")
+@click.option("--reset-workspace", is_flag=True, default=False,
+              help="Must match the upcoming run's --reset-workspace "
+                   "(controls workspace dir naming; a mismatched manifest "
+                   "is ignored by `run`).")
+@click.option("--concurrency", default=8, show_default=True, type=int,
+              help="Concurrent workspace clones.")
+@click.option("--repo-cache/--no-repo-cache", default=True, show_default=True,
+              help="Warm + use the unique-repo cache (network fetches drop "
+                   "from N tasks to U unique repos).")
 @click.option("--repo-cache-dir", default=None,
               type=click.Path(file_okay=False, path_type=Path),
               help="Override the repo cache location (default "
                    "<workspace_root>/.repo-cache).")
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
-def warm_cache_cmd(
+def pre_clone_cmd(
     split: str,
     num_samples: int,
     seed: int,
+    reset_workspace: bool,
     concurrency: int,
+    repo_cache: bool,
     repo_cache_dir: Path | None,
     config_path: Path | None,
 ) -> None:
-    """Pre-clone every unique repo for an upcoming run into the local cache.
+    """Clone ALL task workspaces for an upcoming run, before starting it.
 
-    Run this BEFORE `run` (with the SAME --split/--num-samples/--seed --
-    sample selection is deterministic, so the repo set matches exactly).
-    `run` re-checks the cache at startup, finds it warm, and skips straight
-    to local clones -- zero network clones during the workload, zero
-    mid-run clone failures.
+    Conservative two-step flow for flaky networks: do every git operation
+    here, verify everything is ready, THEN start the workload (which does
+    zero cloning). Internally warms the unique-repo cache first, clones
+    each workspace locally from it, and writes a manifest that `run`
+    consumes to reuse the exact same directories:
 
-    Exits 1 if any repo failed to cache, so it can gate the run:
+        python -m testbed pre-clone --split lite --num-samples 300 --seed 42 \\
+          && python -m testbed run --split lite --num-samples 300 --seed 42 --out results/run1
 
-        python -m testbed warm-cache --split lite --num-samples 20 --seed 42 \\
-          && python -m testbed run --split lite --num-samples 20 --seed 42 --out results/run1
+    Use the SAME --split/--num-samples/--seed (sample selection is
+    deterministic) and the same --reset-workspace as the run.
+
+    Resumable: re-running retries only the workspaces that failed.
+    Exits 1 if any workspace could not be prepared.
     """
     cfg = config_mod.load(config_path)
-    samples = swebench.load_samples(split, seed, num_samples)
-    cache_dir = repo_cache_dir or Path(cfg.workspace_root) / ".repo-cache"
-
-    repos = sorted({s["repo"] for s in samples})
-    click.echo(f"warming {len(repos)} unique repos -> {cache_dir}")
-    cached = asyncio.run(
-        runner_mod.warm_repo_cache(samples, cache_dir, concurrency=concurrency)
-    )
-
-    failed = [r for r in repos if r not in cached]
-    for repo in repos:
-        status = "ok" if repo in cached else "FAILED"
-        click.echo(f"  {repo:<40} {status}")
-    click.echo(f"cached {len(cached)}/{len(repos)} repos")
-    if failed:
-        click.echo(
-            "some repos failed to cache; re-run warm-cache (transient "
-            "network errors are retried, but persistent failures need "
-            "investigation) or the run will fall back to per-task network "
-            "clones for: " + ", ".join(failed),
-            err=True,
+    failures = asyncio.run(
+        runner_mod.pre_clone_run(
+            cfg,
+            split=split,
+            num_samples=num_samples,
+            seed=seed,
+            reset_workspace=reset_workspace,
+            repo_cache=repo_cache,
+            repo_cache_dir=str(repo_cache_dir) if repo_cache_dir else None,
+            concurrency=concurrency,
         )
+    )
+    ready = num_samples - len(failures)
+    click.echo(f"workspaces ready: {ready}/{num_samples}")
+    if failures:
+        click.echo("FAILED workspaces (re-run pre-clone to retry just these):",
+                   err=True)
+        for iid, msg in sorted(failures.items()):
+            click.echo(f"  {iid}: {msg}", err=True)
         raise SystemExit(1)
 
 

@@ -268,6 +268,90 @@ async def prepare_workspaces(
     return failures
 
 
+def workspace_manifest_path(workspace_root: Path, split: str, seed: int,
+                            num_samples: int) -> Path:
+    """Manifest written by `pre-clone` and consumed (single-use) by `run`.
+
+    Keyed by the deterministic sample-selection tuple so a run only picks
+    up workspaces prepared for exactly its sample set."""
+    return workspace_root / f".workspaces-{split}-s{seed}-n{num_samples}.json"
+
+
+async def pre_clone_run(
+    cfg: TestbedCfg,
+    *,
+    split: str,
+    num_samples: int,
+    seed: int,
+    reset_workspace: bool = False,
+    repo_cache: bool = True,
+    repo_cache_dir: str | None = None,
+    concurrency: int = 8,
+) -> dict[str, str]:
+    """Standalone conservative prepare step (`python -m testbed pre-clone`):
+    warm the repo cache, clone EVERY task workspace, write the manifest.
+
+    Run this before `run` with the SAME (--split, --num-samples, --seed,
+    --reset-workspace). `run` then finds the manifest, reuses the exact
+    workspace directories, and skips its own clone phase entirely -- the
+    workload performs zero git operations over the network.
+
+    Resumable: if a manifest already exists for this (split, seed, n), the
+    previously assigned directory names are reused, so re-running after a
+    flaky-network partial failure retries ONLY the missing workspaces
+    (`_pre_clone` is a no-op on an existing checkout).
+
+    Returns {instance_id: error_msg} for workspaces that failed; empty
+    means everything is ready.
+    """
+    samples = swebench.load_samples(split, seed, num_samples)
+    workspace_root = Path(cfg.workspace_root)
+    workspace_root.mkdir(parents=True, exist_ok=True)
+
+    cache_dir: Path | None = None
+    if repo_cache:
+        cache_dir = (Path(repo_cache_dir) if repo_cache_dir
+                     else workspace_root / ".repo-cache")
+        n_repos = len({s["repo"] for s in samples})
+        print(f"warming repo cache: {n_repos} unique repos → {cache_dir}",
+              file=sys.stderr, flush=True)
+        cached = await warm_repo_cache(samples, cache_dir)
+        print(f"repo cache ready: {len(cached)}/{n_repos} repos",
+              file=sys.stderr, flush=True)
+
+    manifest = workspace_manifest_path(workspace_root, split, seed, num_samples)
+    directories: dict[str, str] = {}
+    if manifest.exists():
+        try:
+            prior = json.loads(manifest.read_text())
+            if prior.get("reset_workspace") == reset_workspace:
+                directories = dict(prior.get("directories", {}))
+                print(f"resuming from existing manifest: {manifest}",
+                      file=sys.stderr, flush=True)
+        except (json.JSONDecodeError, AttributeError):
+            pass  # corrupt manifest -- assign fresh below
+    for s in samples:
+        directories.setdefault(s["instance_id"],
+                               _directory_for(s["instance_id"], reset_workspace))
+
+    print(f"pre-cloning {len(samples)} workspaces → {workspace_root}",
+          file=sys.stderr, flush=True)
+    failures = await prepare_workspaces(
+        samples, directories, workspace_root,
+        reset_workspace=reset_workspace, cache_dir=cache_dir,
+        concurrency=concurrency,
+    )
+
+    manifest.write_text(json.dumps({
+        "split": split,
+        "seed": seed,
+        "num_samples": num_samples,
+        "reset_workspace": reset_workspace,
+        "directories": directories,
+    }, indent=2) + "\n")
+    return failures
+
+
 async def _run_one(
     client: OpenCodeClient,
     sample: dict[str, Any],
@@ -458,46 +542,83 @@ async def run(
     workspace_root = Path(cfg.workspace_root)
     workspace_root.mkdir(parents=True, exist_ok=True)
 
-    # Pre-clone each unique repo once into a local cache BEFORE firing any
-    # task. Per-task clones then copy from the cache locally (no network),
-    # which removes the GitHub rate-limiting / bandwidth pressure that
-    # makes mid-run clones fail when many tasks clone the same repos.
+    # cache_dir is always resolved (even when the workspaces were prepared
+    # by `pre-clone`) so per-task clone RETRIES still copy locally from the
+    # cache instead of hitting the network.
     cache_dir: Path | None = None
     if repo_cache:
         cache_dir = (Path(repo_cache_dir) if repo_cache_dir
                      else workspace_root / ".repo-cache")
-        n_repos = len({s["repo"] for s in samples})
-        print(f"warming repo cache: {n_repos} unique repos → {cache_dir}",
-              file=sys.stderr, flush=True)
-        cached = await warm_repo_cache(samples, cache_dir)
-        if len(cached) < n_repos:
-            print(f"  {n_repos - len(cached)} repo(s) failed to cache -- those "
-                  f"tasks fall back to direct clone", file=sys.stderr, flush=True)
-        print(f"repo cache ready: {len(cached)}/{n_repos} repos", file=sys.stderr, flush=True)
 
-    # Workspace directory names are assigned UP FRONT (not inside _run_one)
-    # so every task workspace can be cloned before the first request fires.
-    directories = {s["instance_id"]: _directory_for(s["instance_id"], reset_workspace)
-                   for s in samples}
-
-    # Clone ALL task workspaces before starting the workload. The repo
-    # cache above de-duplicates the network fetches; this step does the
-    # remaining per-task clone+checkout (local, from the cache) for every
-    # sample -- so on a flaky network nothing is left to clone mid-run.
+    # Preferred path: `python -m testbed pre-clone` already cloned every
+    # workspace and left a manifest for this exact (split, seed, n).
+    # Consume it (single-use: a later run must NOT silently reuse dirty
+    # non-reset workspaces) and skip all cloning here -- the workload then
+    # starts with zero git/network work.
+    directories: dict[str, str] | None = None
+    manifest_used: str | None = None
     if pre_clone_workspaces:
-        print(f"pre-cloning {len(samples)} workspaces → {workspace_root}",
-              file=sys.stderr, flush=True)
-        clone_failures = await prepare_workspaces(
-            samples, directories, workspace_root,
-            reset_workspace=reset_workspace, cache_dir=cache_dir,
-        )
-        if clone_failures:
-            print(f"  {len(clone_failures)} workspace(s) FAILED to pre-clone "
-                  f"(will retry at task start):", file=sys.stderr, flush=True)
-            for iid, msg in sorted(clone_failures.items()):
-                print(f"    {iid}: {msg}", file=sys.stderr, flush=True)
-        print(f"workspaces ready: {len(samples) - len(clone_failures)}/{len(samples)}",
-              file=sys.stderr, flush=True)
+        manifest = workspace_manifest_path(workspace_root, split, seed, num_samples)
+        if manifest.exists():
+            try:
+                data = json.loads(manifest.read_text())
+            except json.JSONDecodeError:
+                data = None
+                print(f"ignoring corrupt workspace manifest: {manifest}",
+                      file=sys.stderr, flush=True)
+            wanted = {s["instance_id"] for s in samples}
+            if data is not None and data.get("reset_workspace") != reset_workspace:
+                print(f"ignoring workspace manifest {manifest}: it was built "
+                      f"with reset_workspace={data.get('reset_workspace')} but "
+                      f"this run uses {reset_workspace}",
+                      file=sys.stderr, flush=True)
+            elif data is not None and wanted <= set(data.get("directories", {})):
+                directories = {iid: data["directories"][iid] for iid in wanted}
+                manifest_used = str(manifest)
+                manifest.unlink()
+                print(f"using pre-cloned workspaces from {manifest} "
+                      f"(manifest consumed -- run `pre-clone` again before the "
+                      f"next run)", file=sys.stderr, flush=True)
+            elif data is not None:
+                print(f"ignoring workspace manifest {manifest}: it does not "
+                      f"cover all {len(wanted)} sample(s)",
+                      file=sys.stderr, flush=True)
+
+    if directories is None:
+        # No usable manifest: warm the repo cache (de-duplicates the network
+        # fetches: N tasks -> U unique repos) and clone all workspaces
+        # inline, before the first request fires.
+        if cache_dir is not None:
+            n_repos = len({s["repo"] for s in samples})
+            print(f"warming repo cache: {n_repos} unique repos → {cache_dir}",
+                  file=sys.stderr, flush=True)
+            cached = await warm_repo_cache(samples, cache_dir)
+            if len(cached) < n_repos:
+                print(f"  {n_repos - len(cached)} repo(s) failed to cache -- those "
+                      f"tasks fall back to direct clone", file=sys.stderr, flush=True)
+            print(f"repo cache ready: {len(cached)}/{n_repos} repos",
+                  file=sys.stderr, flush=True)
+
+        # Workspace directory names are assigned UP FRONT (not inside
+        # _run_one) so every task workspace can be cloned before the first
+        # request fires.
+        directories = {s["instance_id"]: _directory_for(s["instance_id"], reset_workspace)
+                       for s in samples}
+
+        if pre_clone_workspaces:
+            print(f"pre-cloning {len(samples)} workspaces → {workspace_root}",
+                  file=sys.stderr, flush=True)
+            clone_failures = await prepare_workspaces(
+                samples, directories, workspace_root,
+                reset_workspace=reset_workspace, cache_dir=cache_dir,
+            )
+            if clone_failures:
+                print(f"  {len(clone_failures)} workspace(s) FAILED to pre-clone "
+                      f"(will retry at task start):", file=sys.stderr, flush=True)
+                for iid, msg in sorted(clone_failures.items()):
+                    print(f"    {iid}: {msg}", file=sys.stderr, flush=True)
+            print(f"workspaces ready: {len(samples) - len(clone_failures)}/{len(samples)}",
+                  file=sys.stderr, flush=True)
 
     # OpenCode profiling state is ENV-gated and resolved outside testbed.yaml
     # (deploy/testbed.sh up_opencode injects OPENCODE_PROFILE_DIR into the
@@ -523,6 +644,7 @@ async def run(
         "repo_cache": repo_cache,
         "repo_cache_dir": str(cache_dir) if cache_dir else None,
         "pre_clone_workspaces": pre_clone_workspaces,
+        "workspace_manifest": manifest_used,
         "router": router_label,
         "model": cfg.model.model_dump(mode="json"),
         "config": resolved_snapshot(cfg),

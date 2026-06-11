@@ -107,17 +107,20 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 ## 4. Running a workload
 
 ```bash
-# Recommended: pre-warm the repo cache first (same split/num-samples/seed as
-# the run -- sample selection is deterministic, so the repo set matches).
-# Exits 1 if any repo failed, so it gates the run: no network clones (and no
-# mid-run clone failures) once it passes.
-.venv/bin/python -m testbed warm-cache --split lite --num-samples 20 --seed 42 \
+# Recommended (conservative two-step): do ALL git work first, then run.
+# pre-clone warms the unique-repo cache AND clones every task workspace,
+# exits 1 if anything failed (re-running retries only the failures), and
+# leaves a manifest that `run` picks up -- the workload itself performs
+# zero clones, so a flaky network cannot fail tasks mid-run.
+# Use the SAME --split/--num-samples/--seed (and --reset-workspace, if any)
+# on both commands: sample selection is deterministic, so they match.
+.venv/bin/python -m testbed pre-clone --split lite --num-samples 20 --seed 42 \
 && .venv/bin/python -m testbed run \
      --split lite --num-samples 20 --qps 0.5 --seed 42 \
      --out results/run1
 ```
 
-(`run` also warms the cache itself at startup, but a failed warm there only warns on stderr and falls back to per-task network clones — running `warm-cache` first gives a hard exit-1 gate so you can verify the cache is complete before any task fires.)
+(Without a prior `pre-clone`, `run` still warms the cache and pre-clones all workspaces itself at startup — but failures there only warn and fall back to per-task clones; the standalone `pre-clone` gives a hard exit-1 gate to verify everything is ready before any task fires. The manifest is single-use: run `pre-clone` again before the next run.)
 
 `run` flags (defaults in parentheses):
 
