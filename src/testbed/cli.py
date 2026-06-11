@@ -84,6 +84,19 @@ def main() -> None:
               type=click.Path(file_okay=False, path_type=Path),
               help="Override the repo cache location (default "
                    "<workspace_root>/.repo-cache).")
+@click.option(
+    "--pre-clone-workspaces/--no-pre-clone-workspaces",
+    default=True,
+    show_default=True,
+    help=(
+        "Clone EVERY task workspace before the workload starts (after the "
+        "repo-cache warm), so zero clones happen mid-run -- on a flaky "
+        "network this removes clone failures entirely. Workspaces that "
+        "still fail to pre-clone are retried at their task's arrival. "
+        "--no-pre-clone-workspaces reverts to cloning each workspace at "
+        "task arrival time."
+    ),
+)
 @click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
 def run_cmd(
@@ -98,6 +111,7 @@ def run_cmd(
     sequential: bool,
     repo_cache: bool,
     repo_cache_dir: Path | None,
+    pre_clone_workspaces: bool,
     out: Path,
     config_path: Path | None,
 ) -> None:
@@ -118,8 +132,67 @@ def run_cmd(
             sequential=sequential,
             repo_cache=repo_cache,
             repo_cache_dir=str(repo_cache_dir) if repo_cache_dir else None,
+            pre_clone_workspaces=pre_clone_workspaces,
         )
     )
+
+
+@main.command("warm-cache")
+@click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
+@click.option("--num-samples", default=10, show_default=True, type=int)
+@click.option("--seed", default=42, show_default=True, type=int)
+@click.option("--concurrency", default=4, show_default=True, type=int,
+              help="Concurrent network clones while warming.")
+@click.option("--repo-cache-dir", default=None,
+              type=click.Path(file_okay=False, path_type=Path),
+              help="Override the repo cache location (default "
+                   "<workspace_root>/.repo-cache).")
+@click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
+def warm_cache_cmd(
+    split: str,
+    num_samples: int,
+    seed: int,
+    concurrency: int,
+    repo_cache_dir: Path | None,
+    config_path: Path | None,
+) -> None:
+    """Pre-clone every unique repo for an upcoming run into the local cache.
+
+    Run this BEFORE `run` (with the SAME --split/--num-samples/--seed --
+    sample selection is deterministic, so the repo set matches exactly).
+    `run` re-checks the cache at startup, finds it warm, and skips straight
+    to local clones -- zero network clones during the workload, zero
+    mid-run clone failures.
+
+    Exits 1 if any repo failed to cache, so it can gate the run:
+
+        python -m testbed warm-cache --split lite --num-samples 20 --seed 42 \\
+          && python -m testbed run --split lite --num-samples 20 --seed 42 --out results/run1
+    """
+    cfg = config_mod.load(config_path)
+    samples = swebench.load_samples(split, seed, num_samples)
+    cache_dir = repo_cache_dir or Path(cfg.workspace_root) / ".repo-cache"
+
+    repos = sorted({s["repo"] for s in samples})
+    click.echo(f"warming {len(repos)} unique repos -> {cache_dir}")
+    cached = asyncio.run(
+        runner_mod.warm_repo_cache(samples, cache_dir, concurrency=concurrency)
+    )
+
+    failed = [r for r in repos if r not in cached]
+    for repo in repos:
+        status = "ok" if repo in cached else "FAILED"
+        click.echo(f"  {repo:<40} {status}")
+    click.echo(f"cached {len(cached)}/{len(repos)} repos")
+    if failed:
+        click.echo(
+            "some repos failed to cache; re-run warm-cache (transient "
+            "network errors are retried, but persistent failures need "
+            "investigation) or the run will fall back to per-task network "
+            "clones for: " + ", ".join(failed),
+            err=True,
+        )
+        raise SystemExit(1)
 
 
 @main.command("smoke")

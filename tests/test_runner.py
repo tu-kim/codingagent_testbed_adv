@@ -10,7 +10,14 @@ from unittest.mock import patch
 import pytest
 
 from testbed import runner
-from testbed.runner import TaskRecord, _env_truthy, _run_one, _summary
+from testbed.runner import (
+    TaskRecord,
+    _directory_for,
+    _env_truthy,
+    _run_one,
+    _summary,
+    prepare_workspaces,
+)
 
 
 class _FakeClient:
@@ -704,3 +711,305 @@ async def test_run_progress_marks_failed_task(monkeypatch, tmp_path, capsys):
     err = capsys.readouterr().err
     assert "FAIL:session" in err          # create_session failure → stage "session"
     assert "done. 1 tasks, 0 ok / 1 fail" in err
+
+
+# ---------------------------------------------------------------------------
+# _directory_for
+# ---------------------------------------------------------------------------
+
+def test_directory_for_reset_returns_stable_name():
+    """reset_workspace=True → exact 'session-<iid>', no uuid suffix."""
+    name = _directory_for("django__django-1", reset_workspace=True)
+    assert name == "session-django__django-1"
+
+
+def test_directory_for_no_reset_has_8hex_suffix():
+    """reset_workspace=False → 'session-<iid>-<8hexchars>' shape."""
+    name = _directory_for("django__django-1", reset_workspace=False)
+    assert name.startswith("session-django__django-1-")
+    suffix = name[len("session-django__django-1-"):]
+    assert len(suffix) == 8
+    assert all(c in "0123456789abcdef" for c in suffix)
+
+
+def test_directory_for_two_calls_differ():
+    """Two non-reset calls for the same iid must produce distinct names."""
+    a = _directory_for("django__django-1", reset_workspace=False)
+    b = _directory_for("django__django-1", reset_workspace=False)
+    assert a != b
+
+
+# ---------------------------------------------------------------------------
+# prepare_workspaces
+# ---------------------------------------------------------------------------
+
+async def test_prepare_workspaces_clones_all_samples(monkeypatch, tmp_path: Path):
+    """Every sample must be cloned with dest=workspace_root/directories[iid]
+    and the correct reset/cache_dir kwargs forwarded to _pre_clone."""
+    samples = [
+        {**_SAMPLE, "instance_id": "iid_a", "repo": "org/repo-a", "base_commit": "aaa"},
+        {**_SAMPLE, "instance_id": "iid_b", "repo": "org/repo-b", "base_commit": "bbb"},
+    ]
+    directories = {"iid_a": "session-iid_a", "iid_b": "session-iid_b"}
+    cache = tmp_path / "cache"
+    calls: list[dict] = []
+
+    async def _recording(repo, base_commit, dest, *, reset=False, cache_dir=None):
+        calls.append({"repo": repo, "base_commit": base_commit,
+                      "dest": dest, "reset": reset, "cache_dir": cache_dir})
+
+    monkeypatch.setattr(runner, "_pre_clone", _recording)
+
+    failures = await prepare_workspaces(
+        samples, directories, tmp_path,
+        reset_workspace=True, cache_dir=cache, concurrency=2,
+    )
+
+    assert failures == {}
+    assert len(calls) == 2
+    by_iid = {c["repo"].split("/")[1]: c for c in calls}   # "repo-a" / "repo-b"
+
+    call_a = by_iid["repo-a"]
+    assert call_a["base_commit"] == "aaa"
+    assert call_a["dest"] == tmp_path / "session-iid_a"
+    assert call_a["reset"] is True
+    assert call_a["cache_dir"] == cache
+
+    call_b = by_iid["repo-b"]
+    assert call_b["base_commit"] == "bbb"
+    assert call_b["dest"] == tmp_path / "session-iid_b"
+    assert call_b["reset"] is True
+    assert call_b["cache_dir"] == cache
+
+
+async def test_prepare_workspaces_collects_failures_without_raising(monkeypatch, tmp_path: Path):
+    """A _pre_clone failure for one iid is recorded in the returned dict;
+    other samples succeed; no exception propagates out of prepare_workspaces."""
+    samples = [
+        {**_SAMPLE, "instance_id": "ok_task"},
+        {**_SAMPLE, "instance_id": "bad_task"},
+    ]
+    directories = {"ok_task": "session-ok_task", "bad_task": "session-bad_task"}
+
+    async def _selective(repo, base_commit, dest, *, reset=False, cache_dir=None):
+        if "bad_task" in str(dest):
+            raise RuntimeError("git clone exploded")
+
+    monkeypatch.setattr(runner, "_pre_clone", _selective)
+
+    failures = await prepare_workspaces(samples, directories, tmp_path)
+
+    assert set(failures.keys()) == {"bad_task"}
+    assert "RuntimeError" in failures["bad_task"]
+    assert "git clone exploded" in failures["bad_task"]
+    # ok_task must NOT appear in failures
+    assert "ok_task" not in failures
+
+
+# ---------------------------------------------------------------------------
+# _run_one with explicit directory= kwarg
+# ---------------------------------------------------------------------------
+
+async def test_run_one_explicit_directory_used_verbatim(tmp_path: Path):
+    """When directory= is supplied to _run_one, the TaskRecord.directory
+    must be exactly that value — not a freshly generated uuid-suffixed name."""
+    client = _FakeClient()
+    sem = asyncio.Semaphore(1)
+    rec = await _run_one(
+        client, _SAMPLE, 0.0, tmp_path, sem,
+        directory="session-django__django-1-cafebabe",
+    )
+    assert rec.directory == "session-django__django-1-cafebabe"
+    # The absolute path sent to OpenCode must be derived from that name.
+    assert client.create_calls[0] == str(tmp_path / "session-django__django-1-cafebabe")
+
+
+async def test_run_one_explicit_directory_none_falls_back_to_directory_for(tmp_path: Path):
+    """directory=None (default) must produce a name via _directory_for
+    (i.e. the session-<iid>-<uuid8> prefix form)."""
+    client = _FakeClient()
+    sem = asyncio.Semaphore(1)
+    rec = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, directory=None)
+    assert rec.directory.startswith("session-django__django-1-")
+    suffix = rec.directory[len("session-django__django-1-"):]
+    assert len(suffix) == 8
+
+
+# ---------------------------------------------------------------------------
+# run() pre_clone_workspaces=True — call ordering and directory stability
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_pre_clone_workspaces_clones_before_session(
+    monkeypatch, tmp_path: Path
+):
+    """With pre_clone_workspaces=True, ALL _pre_clone calls from prepare_workspaces
+    must complete before the first create_session call fires. Verified via a
+    shared event log that records 'clone:<iid>' and 'create:<iid>' in order."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    samples = [
+        {**_SAMPLE, "instance_id": "task_a"},
+        {**_SAMPLE, "instance_id": "task_b"},
+    ]
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    events: list[str] = []
+
+    async def _recording_clone(repo, base_commit, dest, *, reset=False, cache_dir=None):
+        iid = str(dest).split("/")[-1].replace("session-", "")
+        events.append(f"clone:{iid}")
+
+    monkeypatch.setattr(runner, "_pre_clone", _recording_clone)
+
+    class _EventFakeClient(_FakeClient):
+        async def create_session(self, directory: str) -> str:
+            iid = directory.split("/")[-1].replace("session-", "")
+            events.append(f"create:{iid}")
+            return "ses_test"
+
+    fake_client = _EventFakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=2, qps=1.0, seed=42,
+                max_in_flight=2, out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+                pre_clone_workspaces=True,
+            )
+
+    # All clone events must precede all create events.
+    clone_indices = [i for i, e in enumerate(events) if e.startswith("clone:")]
+    create_indices = [i for i, e in enumerate(events) if e.startswith("create:")]
+    assert clone_indices, "no clone events recorded"
+    assert create_indices, "no create events recorded"
+    assert max(clone_indices) < min(create_indices), (
+        f"some clone happened after first create — events: {events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_pre_clone_workspaces_trace_directories_match_pre_assigned(
+    monkeypatch, tmp_path: Path
+):
+    """With pre_clone_workspaces=True and reset_workspace=True, trace records'
+    directory values are the stable 'session-<iid>' names assigned up front
+    (not freshly generated uuid-suffixed names per task)."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    samples = [
+        {**_SAMPLE, "instance_id": "task_a"},
+        {**_SAMPLE, "instance_id": "task_b"},
+    ]
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    fake_client = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=2, qps=1.0, seed=42,
+                max_in_flight=2, out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+                reset_workspace=True, pre_clone_workspaces=True,
+            )
+
+    trace = [json.loads(l) for l in (tmp_path / "out" / "trace.jsonl").read_text().splitlines()]
+    dirs_by_iid = {t["instance_id"]: t["directory"] for t in trace}
+    assert dirs_by_iid["task_a"] == "session-task_a"
+    assert dirs_by_iid["task_b"] == "session-task_b"
+
+
+# ---------------------------------------------------------------------------
+# run() pre_clone_workspaces=False — _pre_clone called per-task, not in batch
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_pre_clone_workspaces_false_skips_batch_phase(
+    monkeypatch, tmp_path: Path
+):
+    """With pre_clone_workspaces=False, prepare_workspaces must NOT be called.
+    _pre_clone is still called exactly once per task inside _run_one."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    samples = [
+        {**_SAMPLE, "instance_id": "task_a"},
+        {**_SAMPLE, "instance_id": "task_b"},
+    ]
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    clone_calls: list[str] = []
+
+    async def _recording_clone(repo, base_commit, dest, *, reset=False, cache_dir=None):
+        clone_calls.append(str(dest).split("/")[-1])
+
+    monkeypatch.setattr(runner, "_pre_clone", _recording_clone)
+
+    prepare_ws_calls: list[int] = []
+    original_prepare = runner.prepare_workspaces
+
+    async def _spy_prepare(*args, **kwargs):
+        prepare_ws_calls.append(1)
+        return await original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "prepare_workspaces", _spy_prepare)
+
+    fake_client = _FakeClient()
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=samples):
+            await runner.run(
+                cfg,
+                split="lite", num_samples=2, qps=1.0, seed=42,
+                max_in_flight=2, out_dir=tmp_path / "out", router_label="",
+                task_timeout_s=None, sequential=True,
+                pre_clone_workspaces=False,
+            )
+
+    # prepare_workspaces must NOT have been called.
+    assert prepare_ws_calls == [], "prepare_workspaces must not be called when pre_clone_workspaces=False"
+    # _pre_clone IS called once per task (from _run_one).
+    assert len(clone_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# config.json records pre_clone_workspaces flag
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_config_json_pre_clone_workspaces_true(monkeypatch, tmp_path: Path):
+    """pre_clone_workspaces=True must be recorded in config.json."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    fake_client = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite", num_samples=1, qps=1.0, seed=42,
+                        max_in_flight=1, out_dir=tmp_path / "out", router_label="",
+                        task_timeout_s=None, pre_clone_workspaces=True,
+                    )
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["pre_clone_workspaces"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_config_json_pre_clone_workspaces_false(monkeypatch, tmp_path: Path):
+    """pre_clone_workspaces=False must be recorded in config.json."""
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    cfg = _minimal_cfg(str(tmp_path / "ws"))
+    fake_client = _FakeClient()
+
+    with patch.object(runner, "OpenCodeClient", return_value=_FakeClientCtx(fake_client)):
+        with patch.object(runner.swebench, "load_samples", return_value=[_SAMPLE]):
+            with patch.object(runner.poisson, "arrival_offsets", return_value=[0.0]):
+                with patch.object(runner.poisson, "arrivals", _fake_arrivals([0])):
+                    await runner.run(
+                        cfg,
+                        split="lite", num_samples=1, qps=1.0, seed=42,
+                        max_in_flight=1, out_dir=tmp_path / "out", router_label="",
+                        task_timeout_s=None, pre_clone_workspaces=False,
+                    )
+
+    config_json = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert config_json["pre_clone_workspaces"] is False

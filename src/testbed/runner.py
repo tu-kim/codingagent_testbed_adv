@@ -207,6 +207,67 @@ async def _try_list_partial(client: OpenCodeClient, session_id: str,
         return []
 
 
+def _directory_for(instance_id: str, reset_workspace: bool) -> str:
+    """Workspace folder NAME for a task (not the OpenCode session id).
+
+    reset_workspace=True: drop the uuid suffix so the same instance_id
+    always lands at the same absolute path. Combined with _pre_clone's
+    reset, this makes opencode's system prompt -- which embeds the
+    working directory -- byte-identical across reruns of the same
+    sample (key prerequisite for agent-loop reproducibility)."""
+    if reset_workspace:
+        return f"session-{instance_id}"
+    return f"session-{instance_id}-{uuid.uuid4().hex[:8]}"
+
+
+async def prepare_workspaces(
+    samples: list[dict[str, Any]],
+    directories: dict[str, str],
+    workspace_root: Path,
+    *,
+    reset_workspace: bool = False,
+    cache_dir: Path | None = None,
+    concurrency: int = 8,
+) -> dict[str, str]:
+    """Clone EVERY task workspace up front, before the workload starts.
+
+    The repo cache (warm_repo_cache) removes the per-task NETWORK clone,
+    but each task still does a local `git clone --local` + checkout at its
+    arrival time -- and on a flaky network any cache-miss fallback hits
+    GitHub mid-run. Pre-cloning all workspaces here moves every clone
+    (local or fallback-network, both retried) BEFORE the first request, so
+    the workload phase performs zero clones: `_pre_clone` at task time
+    sees the existing checkout and returns immediately (or, with
+    reset_workspace=True, just resets it -- still no clone).
+
+    Returns {instance_id: error_msg} for workspaces that could NOT be
+    prepared; those tasks retry the clone at their arrival (legacy path)
+    and fail-fast into an error.stage="clone" TaskRecord if it still fails.
+    """
+    sem = asyncio.Semaphore(concurrency)
+    failures: dict[str, str] = {}
+    done = 0
+    total = len(samples)
+
+    async def _one(sample: dict[str, Any]) -> None:
+        nonlocal done
+        iid = sample["instance_id"]
+        dest = workspace_root / directories[iid]
+        async with sem:
+            try:
+                await _pre_clone(sample["repo"], sample["base_commit"], dest,
+                                 reset=reset_workspace, cache_dir=cache_dir)
+            except Exception as exc:  # noqa: BLE001 -- collected, not fatal here
+                failures[iid] = f"{type(exc).__name__}: {exc}"
+            done += 1
+            if done % 25 == 0 or done == total:
+                print(f"  workspaces: {done}/{total} prepared",
+                      file=sys.stderr, flush=True)
+
+    await asyncio.gather(*(_one(s) for s in samples))
+    return failures
+
+
 async def _run_one(
     client: OpenCodeClient,
     sample: dict[str, Any],
@@ -216,17 +277,14 @@ async def _run_one(
     task_timeout_s: float | None = None,
     reset_workspace: bool = False,
     repo_cache_dir: Path | None = None,
+    directory: str | None = None,
 ) -> TaskRecord:
     instance_id = sample["instance_id"]
-    # reset_workspace=True: drop the uuid suffix so the same instance_id
-    # always lands at the same absolute path. Combined with _pre_clone's
-    # reset, this makes opencode's system prompt -- which embeds the
-    # working directory -- byte-identical across reruns of the same
-    # sample (key prerequisite for agent-loop reproducibility).
-    if reset_workspace:
-        directory = f"session-{instance_id}"
-    else:
-        directory = f"session-{instance_id}-{uuid.uuid4().hex[:8]}"
+    # run() pre-assigns directory names so it can pre-clone all workspaces
+    # before the workload starts; smoke (cli.py) passes None and gets the
+    # same name _directory_for would have produced inside run().
+    if directory is None:
+        directory = _directory_for(instance_id, reset_workspace)
     dest = workspace_root / directory
     # OpenCode's InstanceMiddleware resolves `?directory=` via `path.resolve()`
     # against its own CWD (opencode/packages/opencode/src/server/routes/instance/middleware.ts).
@@ -376,6 +434,7 @@ async def run(
     sequential: bool = False,
     repo_cache: bool = True,
     repo_cache_dir: str | None = None,
+    pre_clone_workspaces: bool = True,
 ) -> None:
     """Drive `num_samples` SWE-bench tasks.
 
@@ -416,6 +475,30 @@ async def run(
                   f"tasks fall back to direct clone", file=sys.stderr, flush=True)
         print(f"repo cache ready: {len(cached)}/{n_repos} repos", file=sys.stderr, flush=True)
 
+    # Workspace directory names are assigned UP FRONT (not inside _run_one)
+    # so every task workspace can be cloned before the first request fires.
+    directories = {s["instance_id"]: _directory_for(s["instance_id"], reset_workspace)
+                   for s in samples}
+
+    # Clone ALL task workspaces before starting the workload. The repo
+    # cache above de-duplicates the network fetches; this step does the
+    # remaining per-task clone+checkout (local, from the cache) for every
+    # sample -- so on a flaky network nothing is left to clone mid-run.
+    if pre_clone_workspaces:
+        print(f"pre-cloning {len(samples)} workspaces → {workspace_root}",
+              file=sys.stderr, flush=True)
+        clone_failures = await prepare_workspaces(
+            samples, directories, workspace_root,
+            reset_workspace=reset_workspace, cache_dir=cache_dir,
+        )
+        if clone_failures:
+            print(f"  {len(clone_failures)} workspace(s) FAILED to pre-clone "
+                  f"(will retry at task start):", file=sys.stderr, flush=True)
+            for iid, msg in sorted(clone_failures.items()):
+                print(f"    {iid}: {msg}", file=sys.stderr, flush=True)
+        print(f"workspaces ready: {len(samples) - len(clone_failures)}/{len(samples)}",
+              file=sys.stderr, flush=True)
+
     # OpenCode profiling state is ENV-gated and resolved outside testbed.yaml
     # (deploy/testbed.sh up_opencode injects OPENCODE_PROFILE_DIR into the
     # OpenCode child env). Capture whatever is visible on the runner-side
@@ -439,6 +522,7 @@ async def run(
         "sequential": sequential,
         "repo_cache": repo_cache,
         "repo_cache_dir": str(cache_dir) if cache_dir else None,
+        "pre_clone_workspaces": pre_clone_workspaces,
         "router": router_label,
         "model": cfg.model.model_dump(mode="json"),
         "config": resolved_snapshot(cfg),
@@ -476,6 +560,7 @@ async def run(
                         task_timeout_s=task_timeout_s,
                         reset_workspace=reset_workspace,
                         repo_cache_dir=cache_dir,
+                        directory=directories[sample["instance_id"]],
                     )
                     trace_fh.write(rec.to_jsonl())
                     trace_fh.flush()
@@ -496,6 +581,7 @@ async def run(
                                 task_timeout_s=task_timeout_s,
                                 reset_workspace=reset_workspace,
                                 repo_cache_dir=cache_dir,
+                                directory=directories[samples[i]["instance_id"]],
                             )
                         )
                     )
