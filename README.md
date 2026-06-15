@@ -216,6 +216,8 @@ sudo deploy/testbed.sh down monitor
 
 OpenCode profiling is ENV-gated: launch opencode with `OPENCODE_PROFILE=1` (per-session NDJSON lands in `<workspace_root>/profiles/`). Aggregate with `scripts/aggregate_profiles.sh <workspace_root>`.
 
+**Engine-prompt capture** is a separate ENV-gated option: bring up workers with `DYN_PROMPT_DUMP=1 deploy/testbed.sh up workers` to dump the **exact prompt the vLLM engine receives** each request — the frontend's chat-template-applied token_ids, detokenized to text — as NDJSON to `<workspace_root>/prompts/prompt-<pid>.jsonl` (one record per request: `request_id`, `role` prefill|decode, `num_prompt_tokens`, `prompt_text`). This is distinct from `OPENCODE_PROFILE`, which snapshots OpenCode's **pre-chat-template** wire messages. Optional knobs: `DYN_PROMPT_DUMP_TOKENS=1` to also dump raw token ids, `DYN_PROMPT_DUMP_TEXT=0` to skip detokenization. Needs `dynamo-prompt-dump.patch` applied. **Adds hot-path latency — use for prompt capture, not timing runs.**
+
 ### Correctness evaluation (true resolve/fail)
 
 `trace.jsonl`'s `success` is only HTTP-level ("the agent loop completed") — it does **not** mean the fix is correct. To judge real SWE-bench resolution, score the run with the official evaluation harness:
@@ -245,6 +247,7 @@ scripts/apply_dynamo_patches.sh   [--check|--revert]   # dynamo-*.patch
 
 - `opencode-profile.patch` — ENV-gated step-event profiler (`OPENCODE_PROFILE=1`).
 - `dynamo-scheduling-log.patch` — per-request scheduler queue-wait logged to the worker log (`SCHED_DELAY ...`), read by `analyze_worker_scheduling.py` / `analyze_request_wait.py`. **Python-only — no cargo rebuild**, just restart workers after applying.
+- `dynamo-prompt-dump.patch` — ENV-gated (`DYN_PROMPT_DUMP=1`) dump of the exact prompt handed to the vLLM engine per request (chat-template-applied token_ids, detokenized) → `<workspace_root>/prompts/prompt-<pid>.jsonl`. **Python-only — no cargo rebuild.** Adds hot-path latency; prompt-capture runs only.
 
 ---
 

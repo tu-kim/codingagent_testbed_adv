@@ -1,0 +1,136 @@
+diff --git a/components/src/dynamo/vllm/handlers.py b/components/src/dynamo/vllm/handlers.py
+index 85c1cbe347..5ace661314 100644
+--- a/components/src/dynamo/vllm/handlers.py
++++ b/components/src/dynamo/vllm/handlers.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import asyncio
++import json
+ import logging
+ import os
+ import tempfile
+@@ -72,6 +73,35 @@ configure_dynamo_logging()
+ logger = logging.getLogger(__name__)
+ 
+ 
++# TESTBED INSTRUMENTATION (deploy/patches/dynamo-prompt-dump.patch).
++# Opt-in capture of the EXACT prompt handed to the vLLM engine per request
++# -- the token_ids the Dynamo frontend produced AFTER applying the chat
++# template, reconstructed back to text by detokenizing them. See
++# BaseWorkerHandler._dump_engine_prompt. Read once at import; when disabled
++# every dump call costs one boolean check on the hot path.
++def _envflag(name: str, default: str = "") -> bool:
++    return os.environ.get(name, default).strip().lower() not in ("", "0", "false", "no")
++
++
++_PROMPT_DUMP_ENABLED = _envflag("DYN_PROMPT_DUMP")
++_PROMPT_DUMP_DIR = os.environ.get("DYN_PROMPT_DUMP_DIR", "/tmp/dynamo-prompt-dump")
++_PROMPT_DUMP_TEXT = _envflag("DYN_PROMPT_DUMP_TEXT", "1")  # detokenized prompt; default on
++_PROMPT_DUMP_TOKENS = _envflag("DYN_PROMPT_DUMP_TOKENS")  # raw token_ids; default off (large)
++_prompt_dump_fh = None  # lazily opened append handle, one file per worker PROCESS
++
++
++def _prompt_dump_file():
++    """One line-buffered append file per worker process: prompt-<pid>.jsonl.
++    Per-PID names keep concurrent prefill/decode workers on one host from
++    clobbering each other's dumps."""
++    global _prompt_dump_fh
++    if _prompt_dump_fh is None:
++        os.makedirs(_PROMPT_DUMP_DIR, exist_ok=True)
++        path = os.path.join(_PROMPT_DUMP_DIR, f"prompt-{os.getpid()}.jsonl")
++        _prompt_dump_fh = open(path, "a", buffering=1)
++    return _prompt_dump_fh
++
++
+ class _DeferredAbort:
+     """Defers engine_client.abort(request_id) until the first engine output.
+ 
+@@ -1522,6 +1552,63 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
+         prompt = TokensPrompt(**prompt_kwargs)
+         return prompt, embedding_sequence_length, None
+ 
++    def _dump_engine_prompt(self, prompt, request_id: str, role: str) -> None:
++        """TESTBED INSTRUMENTATION (deploy/patches/dynamo-prompt-dump.patch).
++
++        Dump the EXACT prompt this worker hands to the vLLM engine for one
++        request -- i.e. what engine_client.generate() receives AFTER the
++        Dynamo frontend applied the model's chat template and tokenized.
++        The frontend ships the worker token_ids (a TokensPrompt); this
++        reconstructs the templated prompt the model actually sees by
++        detokenizing them (DYN_PROMPT_DUMP_TEXT, default on) and/or dumps
++        the raw ids (DYN_PROMPT_DUMP_TOKENS, default off). This is the
++        prompt as the ENGINE sees it -- not OpenCode's wire `messages`
++        array (pre-template) nor a vLLM re-render.
++
++        One NDJSON record per request to
++        <DYN_PROMPT_DUMP_DIR>/prompt-<pid>.jsonl. `role` is prefill|decode
++        so PD-disaggregated workers tag their own copy (both roles receive
++        the same token_ids; filter to prefill for the canonical prompt).
++
++        Gated by DYN_PROMPT_DUMP; a full no-op otherwise (one bool check on
++        the hot path). NOTE: detokenizing + serializing a multi-thousand
++        token prompt per request adds real hot-path latency and synchronous
++        file I/O -- enable for prompt-capture runs only, NOT alongside
++        timing-sensitive profile/scheduling measurements."""
++        if not _PROMPT_DUMP_ENABLED:
++            return
++        try:
++            token_ids = None
++            prompt_text = None
++            if isinstance(prompt, dict):
++                token_ids = prompt.get("prompt_token_ids")
++                prompt_text = prompt.get("prompt")  # TextPrompt path: text already in hand
++            rec: Dict[str, Any] = {
++                "ts": time.time(),
++                "request_id": request_id,
++                "role": role,
++                "num_prompt_tokens": len(token_ids) if token_ids is not None else None,
++            }
++            if _PROMPT_DUMP_TEXT:
++                if prompt_text is not None:
++                    rec["prompt_text"] = prompt_text
++                elif token_ids is not None:
++                    tok = getattr(self.engine_client, "tokenizer", None)
++                    if tok is not None:
++                        try:
++                            rec["prompt_text"] = tok.decode(token_ids)
++                        except Exception as e:  # detokenize must never break generate
++                            rec["prompt_text"] = None
++                            rec["decode_error"] = str(e)
++                    else:
++                        rec["prompt_text"] = None
++                        rec["decode_error"] = "no tokenizer on engine_client"
++            if _PROMPT_DUMP_TOKENS and token_ids is not None:
++                rec["prompt_token_ids"] = list(token_ids)
++            _prompt_dump_file().write(json.dumps(rec) + "\n")
++        except Exception as e:  # instrumentation must never break the agent loop
++            logger.warning("prompt dump failed for %s: %s", request_id, e)
++
+     @staticmethod
+     def _build_completion_usage(
+         request_output: RequestOutput,
+@@ -1682,6 +1769,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
+                 request_id,
+                 lora_request,
+             )
++            self._dump_engine_prompt(prompt, request_id, "decode")
+             gen = self.engine_client.generate(
+                 prompt,
+                 sampling_params,
+@@ -1991,6 +2079,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
+ 
+         async with self._abort_monitor(context, request_id):
+             try:
++                self._dump_engine_prompt(prompt, request_id, "decode")
+                 gen = self.engine_client.generate(
+                     prompt,
+                     sampling_params,
+@@ -2180,6 +2269,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
+ 
+         async with self._abort_monitor(context, request_id, is_prefill=True):
+             try:
++                self._dump_engine_prompt(prompt, request_id, "prefill")
+                 gen = self.engine_client.generate(
+                     prompt,
+                     sampling_params,

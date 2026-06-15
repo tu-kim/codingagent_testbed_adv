@@ -241,6 +241,32 @@ spawn_worker() {
     sys_env=("DYN_SYSTEM_HOST=0.0.0.0" "DYN_SYSTEM_PORT=$sys_port")
   fi
 
+  # ENV-gated engine-prompt capture (deploy/patches/dynamo-prompt-dump.patch).
+  # When DYN_PROMPT_DUMP is truthy, each worker dumps the EXACT prompt it
+  # hands to the vLLM engine -- the chat-template-applied token_ids the
+  # frontend produced, detokenized back to text -- as NDJSON to
+  # <workspace_root>/prompts/prompt-<pid>.jsonl, one record per request.
+  # This is the prompt as the ENGINE sees it, distinct from OPENCODE_PROFILE
+  # (which snapshots OpenCode's pre-template wire messages). Forcing a single
+  # shared dir collects every prefill+decode worker's file in one place.
+  # NOTE: detokenizing every prompt adds hot-path latency -- do NOT combine
+  # with timing-sensitive profile/scheduling runs.
+  local -a prompt_dump_envs=()
+  local prompt_dump_enabled="${DYN_PROMPT_DUMP:-}"
+  if [[ -n "$prompt_dump_enabled" && "$prompt_dump_enabled" != "0" && "$prompt_dump_enabled" != "false" ]]; then
+    local ws_root prompt_dir
+    ws_root=$(cfg_get .workspace_root)
+    prompt_dir="${DYN_PROMPT_DUMP_DIR:-${ws_root}/prompts}"
+    mkdir -p "$prompt_dir"
+    prompt_dump_envs+=(
+      "DYN_PROMPT_DUMP=$prompt_dump_enabled"
+      "DYN_PROMPT_DUMP_DIR=$prompt_dir"
+    )
+    [[ -n "${DYN_PROMPT_DUMP_TEXT:-}" ]] && prompt_dump_envs+=("DYN_PROMPT_DUMP_TEXT=$DYN_PROMPT_DUMP_TEXT")
+    [[ -n "${DYN_PROMPT_DUMP_TOKENS:-}" ]] && prompt_dump_envs+=("DYN_PROMPT_DUMP_TOKENS=$DYN_PROMPT_DUMP_TOKENS")
+    echo "vllm-${name}: engine-prompt dump enabled, DYN_PROMPT_DUMP_DIR=$prompt_dir"
+  fi
+
   # `${arr[@]+"${arr[@]}"}` guards against unbound-array errors when
   # the array is empty under `set -u` (bash <4.4 quirk; harmless on
   # newer bash but kept for consistency with the rest of the script).
@@ -251,6 +277,7 @@ spawn_worker() {
     "NATS_SERVER=$nats_url" \
     "ETCD_ENDPOINTS=$etcd_endpoints" \
     ${sys_env[@]+"${sys_env[@]}"} \
+    ${prompt_dump_envs[@]+"${prompt_dump_envs[@]}"} \
     -- \
     python -m dynamo.vllm \
       --model "$model_name" \
