@@ -67,16 +67,38 @@ def _asst_primer() -> str:
     return "<|im_start|>assistant\n"
 
 
-def _main_prompt(issue_body: str, tool_responses: list[str] = ()) -> str:
-    """Build a minimal main-agent prompt with the wrapper sentinel + an issue."""
-    user_block = _user_msg(
-        f"{WRAPPER}\n\n# Issue\n{issue_body}"
+def _asst_msg(body: str) -> str:
+    """A completed assistant turn (with IM_END)."""
+    return f"<|im_start|>assistant\n{body}\n{IM_END}"
+
+
+def _base_prompt(issue_body: str) -> str:
+    """Initial turn prompt: user message with wrapper sentinel + assistant primer."""
+    return _user_msg(f"{WRAPPER}\n\n# Issue\n{issue_body}") + "\n" + _asst_primer()
+
+
+def _extend_prompt(prev_prompt: str, generation: str, tool_response_block: str) -> str:
+    """Simulate the engine: append generation+IM_END, tool_response user msg,
+    new assistant primer.  prev_prompt IS a strict prefix of the returned value.
+
+    This mirrors the real dynamo dump format where each turn's prompt_text is
+    the cumulative chat history up to (and including) the new assistant primer,
+    so turn N's prompt_text is always a true prefix of turn N+1's prompt_text.
+    """
+    return (
+        prev_prompt
+        + generation
+        + IM_END
+        + "\n"
+        + _user_msg(f"<tool_response>\n{tool_response_block}\n</tool_response>")
+        + "\n"
+        + _asst_primer()
     )
-    msgs = [user_block]
-    for tr in tool_responses:
-        msgs.append(_user_msg(tr))
-    msgs.append(_asst_primer())
-    return "\n".join(msgs)
+
+
+def _finalize_prompt(prev_prompt: str, generation: str) -> str:
+    """Last turn: append generation+IM_END (no next tool response)."""
+    return prev_prompt + generation + IM_END
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -397,6 +419,100 @@ def test_ground_truth_from_next_determinism(mod):
 
 
 # ---------------------------------------------------------------------------
+# chain_links
+# ---------------------------------------------------------------------------
+
+def test_chain_links_empty_list(mod):
+    """Empty input -> empty pred/succ lists."""
+    pred, succ = mod.chain_links([])
+    assert pred == []
+    assert succ == []
+
+
+def test_chain_links_single_prompt(mod):
+    """Single prompt -> pred=[None], succ=[None] (no self-link)."""
+    pred, succ = mod.chain_links(["ABCDE"])
+    assert pred == [None]
+    assert succ == [None]
+
+
+def test_chain_links_linear_chain(mod):
+    """p0 < p1 < p2 (each a strict prefix of the next) -> pred=[None,0,1] succ=[1,2,None]."""
+    p0 = "ABC"
+    p1 = "ABCDE"
+    p2 = "ABCDEFGH"
+    pred, succ = mod.chain_links([p0, p1, p2])
+    assert pred == [None, 0, 1], f"pred={pred}"
+    assert succ == [1, 2, None], f"succ={succ}"
+
+
+def test_chain_links_linear_chain_determinism(mod):
+    """Same input always yields identical (pred, succ)."""
+    prompts = ["X", "XY", "XYZ"]
+    r1 = mod.chain_links(prompts)
+    r2 = mod.chain_links(prompts)
+    assert r1 == r2
+
+
+def test_chain_links_branch(mod):
+    """p1 base; p2 and p2b both strictly extend p1 but not each other.
+
+    pred: p2->p1 (idx 0), p2b->p1 (idx 0).
+    succ: p1 -> the SHORTEST extending prompt = p2 (shorter len).
+    p2 and p2b are leaves (succ=None).
+    """
+    p1 = "ABC"
+    p2 = "ABCDE"    # len 5 -- shorter extension
+    p2b = "ABCXYZ"  # len 6 -- longer extension, NOT a prefix of p2
+    # Order: p1=idx0, p2=idx1, p2b=idx2
+    pred, succ = mod.chain_links([p1, p2, p2b])
+    # pred
+    assert pred[0] is None, f"pred[p1]={pred[0]}"
+    assert pred[1] == 0,    f"pred[p2]={pred[1]}"  # p1 is pred of p2
+    assert pred[2] == 0,    f"pred[p2b]={pred[2]}" # p1 is pred of p2b
+    # succ[p1] = shorter of {p2,p2b} = p2 (idx 1)
+    assert succ[0] == 1,    f"succ[p1]={succ[0]}"
+    # p2 and p2b have no successors
+    assert succ[1] is None, f"succ[p2]={succ[1]}"
+    assert succ[2] is None, f"succ[p2b]={succ[2]}"
+
+
+def test_chain_links_unrelated_prompts(mod):
+    """Prompts that share no prefix relationship -> all pred/succ None."""
+    pred, succ = mod.chain_links(["ABC", "XYZ", "PQR"])
+    assert pred == [None, None, None]
+    assert succ == [None, None, None]
+
+
+def test_chain_links_equal_length_distinct_are_siblings(mod):
+    """Equal-length distinct prompts are not linked (neither is a strict prefix of the other)."""
+    pred, succ = mod.chain_links(["ABCDE", "VWXYZ"])
+    assert pred == [None, None]
+    assert succ == [None, None]
+
+
+def test_chain_links_pred_is_longest_prefix(mod):
+    """When multiple shorter prompts are prefixes of p, pred picks the LONGEST one."""
+    # p0="A", p1="ABC", p2="ABCDE" -- p2 startswith p0 AND p1; pred[p2] must be p1 (longest)
+    p0 = "A"
+    p1 = "ABC"
+    p2 = "ABCDE"
+    pred, succ = mod.chain_links([p0, p1, p2])
+    # pred[2] must be 1 (p1, the longest prefix), not 0 (p0)
+    assert pred[2] == 1, f"pred[p2]={pred[2]}, expected 1 (p1 is longest prefix)"
+
+
+def test_chain_links_succ_is_shortest_extension(mod):
+    """When multiple longer prompts extend p, succ picks the SHORTEST one."""
+    p0 = "AB"
+    p1 = "ABCD"    # len 4 -- shorter extension
+    p2 = "ABCDEFG" # len 7 -- longer extension
+    pred, succ = mod.chain_links([p0, p1, p2])
+    # succ[0] must be 1 (p1, shortest extension)
+    assert succ[0] == 1, f"succ[p0]={succ[0]}, expected 1 (p1 is shortest extension)"
+
+
+# ---------------------------------------------------------------------------
 # decompose
 # ---------------------------------------------------------------------------
 
@@ -656,82 +772,123 @@ def test_load_records_empty_dir(mod, tmp_path):
 
 # ---------------------------------------------------------------------------
 # Integration: synthetic trace -> main() end-to-end (text-only, no --model)
+#
+# Scenario design (reality-based: each turn's prompt = prev + gen + IM_END + ...):
+#
+# Run 1 (4 turns):
+#   turn 0 (t0):      wrapper + issue, NO file reads -- no suite
+#   turn 1 (t1):      t0 + gen0 + foo.py tool response + primer
+#                     -> new read: foo.py -- SUITE read_001
+#   turn 2 (t2_run1): t1 + gen1 + bar.py tool response + primer
+#                     -> new read: bar.py (foo already in pred) -- SUITE read_002
+#   turn 3 (t3_run1): t2_run1 + gen2 + IM_END  [final, provides gt for read_002]
+#
+# Run 2 (diverges after t1, re-reads foo.py with same content):
+#   turn 0 (t0):      IDENTICAL to run1 t0 -> deduped to one record (prefill kept)
+#   turn 1 (t1):      IDENTICAL to run1 t1 -> deduped to one record (prefill kept)
+#   turn 2 (t2_run2): t1 + gen1_run2 + foo.py (again, same sha) + primer
+#                     -> foo.py's content_sha already in 'seen' -> DEDUP SKIP
+#   turn 3 (t3_run2): t2_run2 + gen2_run2 + IM_END  [final]
+#
+# Each turn has BOTH a prefill and a decode record (same prompt_text, different
+# request_id) to exercise twin dedup: decode twins must be dropped, leaving only
+# the prefill record.
+#
+# Expected suites: exactly 2 (foo.py from run1-t1, bar.py from run1-t2).
+# read_002 must have n_file_segments == 2 (cumulative: foo + bar in the prompt).
+# ground_truth for read_001 = gen1 (what the model said after reading foo.py).
+# ground_truth for read_002 = gen2_run1 (what the model said after reading bar.py).
 # ---------------------------------------------------------------------------
-#
-# Scenario:
-#   - One title turn (NO wrapper sentinel) -> filtered out by is_main_turn
-#   - One SWE-bench sample with 4 main turns (turns 0-3 after filtering):
-#       turn 0 (t=1.0): wrapper + issue, NO file reads yet
-#       turn 1 (t=2.0): wrapper + issue, reads foo.py -> suite read_001 written;
-#                       ground truth extracted from diff to turn 2
-#       turn 2 (t=3.0): wrapper + issue, foo.py ALREADY in prev_blocks_sha so
-#                       bar.py is the only "new" block -> suite read_002 written;
-#                       ground truth extracted from diff to turn 3
-#       turn 3 (t=4.0): final turn (no new reads) -> provides ground truth for
-#                       suite read_002; no suite of its own
-#
-# Note on dedup mechanics: the `prev_blocks_sha` set tracks what was present in
-# the PREVIOUS turn's full block set (not cumulative). `seen` tracks
-# content_sha keys across suites and prevents a second suite if the same sha
-# reappears after disappearing.  In this scenario foo.py has the same sha in
-# turns 1 and 2, so prev_blocks_sha already filters it from new_blocks at turn
-# 2 — the `seen` check is never triggered.
 
-def _build_synthetic_dump(tmp_path: Path) -> tuple[Path, str]:
-    """Build a prompt-*.jsonl file with the synthetic trace and return (dir, issue).
+def _build_twin_dump(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """Build a prompt-*.jsonl with prefill+decode twins across two runs.
 
-    The trace has a title turn (filtered) plus 4 main turns.  Turn 1 reads
-    foo.py; turn 2 reads foo.py + bar.py (foo already in prev set, so only
-    bar is new); turn 3 is a no-read follow-up that provides the ground truth
-    for suite read_002.
+    Returns (prompts_dir, gt_foo, gt_bar, issue).
     """
     issue = "The frobnicate function raises ValueError on empty input."
+    foo_block_str = _file_block(
+        "/repo/foo.py", ["def frobnicate(x):", "    return x * 2"],
+        note="End of file - total 2 lines"
+    )
+    bar_block_str = _file_block(
+        "/repo/bar.py", ["def helper():", "    pass"],
+        note="End of file - total 2 lines"
+    )
 
-    foo_block = _file_block("/repo/foo.py", ["def frobnicate(x):", "    return x * 2"],
-                            note="End of file - total 2 lines")
-    foo_tr = _tool_response(foo_block)
+    # Cumulative prompts (real dynamo dump format):
+    t0 = _base_prompt(issue)
+    gen0 = (
+        "Let me read foo.py.\n"
+        '<tool_call>{"name":"read","input":{"path":"/repo/foo.py"}}</tool_call>'
+    )
+    t1 = _extend_prompt(t0, gen0, foo_block_str)
 
-    bar_block = _file_block("/repo/bar.py", ["def helper():", "    pass"],
-                            note="End of file - total 2 lines")
-    bar_tr = _tool_response(bar_block)
+    # Run 1 turn 2: reads bar.py
+    gen1_run1 = (
+        "Now let me read bar.py.\n"
+        '<tool_call>{"name":"read","input":{"path":"/repo/bar.py"}}</tool_call>'
+    )
+    t2_run1 = _extend_prompt(t1, gen1_run1, bar_block_str)
 
-    prompt_0 = _main_prompt(issue, [])              # no file reads
-    prompt_1 = _main_prompt(issue, [foo_tr])         # foo.py read
-    prompt_2 = _main_prompt(issue, [foo_tr, bar_tr]) # foo re-read + bar new
-    # prompt_3: same file blocks as prompt_2 but with an extra assistant turn
-    # appended so the delta is non-empty and bar.py's suite isn't skipped.
-    extra_asst = _user_msg("The fix looks correct. Committing now.")
-    prompt_3 = prompt_2 + "\n" + extra_asst         # non-empty delta -> gt survives
+    # Run 1 turn 3: final, provides ground truth for bar suite
+    gen2_run1 = "The fix is clear. Applying the patch now."
+    t3_run1 = _finalize_prompt(t2_run1, gen2_run1)
 
-    # title turn (sub-agent, no wrapper sentinel)
-    title_rec = {"ts": 0.5, "request_id": "title-req",
-                 "prompt_text": "Generate a short title for: " + issue}
+    # Run 2 turn 2: diverges -- re-reads foo.py (SAME content_sha)
+    gen1_run2 = (
+        "Let me re-examine foo.py more carefully.\n"
+        '<tool_call>{"name":"read","input":{"path":"/repo/foo.py"}}</tool_call>'
+    )
+    t2_run2 = _extend_prompt(t1, gen1_run2, foo_block_str)
 
-    records = [
-        title_rec,
-        {"ts": 1.0, "request_id": "req-t0", "prompt_text": prompt_0},
-        {"ts": 2.0, "request_id": "req-t1", "prompt_text": prompt_1},
-        {"ts": 3.0, "request_id": "req-t2", "prompt_text": prompt_2},
-        {"ts": 4.0, "request_id": "req-t3", "prompt_text": prompt_3},
-    ]
+    # Run 2 turn 3: final
+    gen2_run2 = "OK, understood now."
+    t3_run2 = _finalize_prompt(t2_run2, gen2_run2)
+
+    # ground_truth for each suite (what the script will compute):
+    #   foo suite: ground_truth_from_next(t1, t2_run1) -> gen1_run1 (up to IM_END)
+    #   bar suite: ground_truth_from_next(t2_run1, t3_run1) -> gen2_run1 (up to IM_END)
+    gt_foo = gen1_run1
+    gt_bar = gen2_run1
+
+    # Build records: 2 per turn (prefill + decode twin), across both runs.
+    # t0 and t1 are shared (identical prompt_text) -- the dedup must collapse them.
+    def _twin(prompt_text, request_id_base, ts):
+        return [
+            {"prompt_text": prompt_text, "request_id": f"{request_id_base}-p",
+             "role": "prefill", "ts": ts},
+            {"prompt_text": prompt_text, "request_id": f"{request_id_base}-d",
+             "role": "decode",   "ts": ts + 0.001},
+        ]
+
+    records = []
+    # Run 1
+    records += _twin(t0,       "r1-t0", ts=1.0)
+    records += _twin(t1,       "r1-t1", ts=2.0)
+    records += _twin(t2_run1,  "r1-t2", ts=3.0)
+    records += _twin(t3_run1,  "r1-t3", ts=4.0)
+    # Run 2 (t0 and t1 repeat; t2/t3 are distinct)
+    records += _twin(t0,       "r2-t0", ts=5.0)
+    records += _twin(t1,       "r2-t1", ts=6.0)
+    records += _twin(t2_run2,  "r2-t2", ts=7.0)
+    records += _twin(t3_run2,  "r2-t3", ts=8.0)
 
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
     _write_jsonl(prompts_dir / "prompt-001.jsonl", records)
-    return prompts_dir, issue
+    return prompts_dir, gt_foo, gt_bar, issue
 
 
-def test_main_integration_two_suites_written(mod, tmp_path, monkeypatch):
-    """main() writes exactly 2 suites: one for foo.py read, one for bar.py read.
-    The foo.py re-read is deduped (content mode, same sha -> skipped)."""
-    prompts_dir, _issue = _build_synthetic_dump(tmp_path)
+def test_main_integration_exactly_two_suites(mod, tmp_path, monkeypatch):
+    """main() produces exactly 2 suites despite prefill/decode twins and a
+    cross-run foo.py re-read (deduped by content_sha)."""
+    prompts_dir, _gt_foo, _gt_bar, _issue = _build_twin_dump(tmp_path)
     out_dir = tmp_path / "suite_out"
 
     monkeypatch.setattr(sys, "argv", [
         "build_kv_reuse_suite",
         "--prompts", str(prompts_dir),
         "--out", str(out_dir),
-        # no --model -> text-only, no tokenizer
     ])
     rc = mod.main()
     assert rc == 0
@@ -740,93 +897,52 @@ def test_main_integration_two_suites_written(mod, tmp_path, monkeypatch):
     assert len(index) == 2, f"expected 2 suites, got {len(index)}: {index}"
 
 
-def test_main_integration_no_third_suite_for_foo_reread(mod, tmp_path, monkeypatch):
-    """The foo.py re-read in turn 2 must NOT produce a 3rd suite (dedup by content)."""
-    prompts_dir, _issue = _build_synthetic_dump(tmp_path)
+def test_main_integration_correct_file_paths(mod, tmp_path, monkeypatch):
+    """Suites are for /repo/foo.py (first read) and /repo/bar.py (second);
+    the run-2 foo.py re-read does NOT appear as a third suite."""
+    prompts_dir, _gt_foo, _gt_bar, _issue = _build_twin_dump(tmp_path)
     out_dir = tmp_path / "suite_out"
 
     monkeypatch.setattr(sys, "argv", [
-        "build_kv_reuse_suite",
-        "--prompts", str(prompts_dir),
-        "--out", str(out_dir),
+        "build_kv_reuse_suite", "--prompts", str(prompts_dir), "--out", str(out_dir),
     ])
     mod.main()
 
     index = json.loads((out_dir / "index.json").read_text())
-    new_file_paths = [e["new_file_path"] for e in index]
-    # foo.py should appear once (first read); /repo/bar.py should appear once
-    assert new_file_paths.count("/repo/foo.py") == 1
-    assert new_file_paths.count("/repo/bar.py") == 1
+    paths = [e["new_file_path"] for e in index]
+    assert paths.count("/repo/foo.py") == 1, f"foo.py should appear once: {paths}"
+    assert paths.count("/repo/bar.py") == 1, f"bar.py should appear once: {paths}"
 
 
-def test_main_integration_read_002_has_two_file_segments(mod, tmp_path, monkeypatch):
-    """read_002 (bar.py suite) covers the CUMULATIVE prompt with both foo.py and
-    bar.py in it -> n_file_segments == 2 in its manifest."""
-    prompts_dir, _issue = _build_synthetic_dump(tmp_path)
+def test_main_integration_prefill_decode_twins_dont_break_ground_truth(mod, tmp_path, monkeypatch):
+    """With prefill+decode twins in the dump, ground_truth.txt must still be
+    non-empty for both suites (the twin collapse must not lose the successor turn)."""
+    prompts_dir, _gt_foo, _gt_bar, _issue = _build_twin_dump(tmp_path)
     out_dir = tmp_path / "suite_out"
 
     monkeypatch.setattr(sys, "argv", [
-        "build_kv_reuse_suite",
-        "--prompts", str(prompts_dir),
-        "--out", str(out_dir),
+        "build_kv_reuse_suite", "--prompts", str(prompts_dir), "--out", str(out_dir),
     ])
     mod.main()
 
     index = json.loads((out_dir / "index.json").read_text())
-    bar_entry = next(e for e in index if e["new_file_path"] == "/repo/bar.py")
-    assert bar_entry["n_file_segments"] == 2, (
-        f"bar.py suite should have 2 cumulative file segs, got {bar_entry['n_file_segments']}"
-    )
+    for entry in index:
+        gt_path = out_dir / entry["dir"] / "ground_truth.txt"
+        gt_text = gt_path.read_text()
+        assert gt_text.strip(), (
+            f"ground_truth.txt is empty for {entry['new_file_path']} -- "
+            "twin dedup likely consumed the successor turn"
+        )
 
 
 def test_main_integration_ground_truth_contents(mod, tmp_path, monkeypatch):
-    """ground_truth.txt for each suite is the LCP-delta between consecutive prompts.
-
-    Uses a 4-turn trace (same issue as _build_synthetic_dump) so the bar.py
-    suite at turn 2 has a non-identical next turn (turn 3) to supply its gt.
-    """
-    issue = "The frobnicate function raises ValueError on empty input."
-
-    foo_block = _file_block("/repo/foo.py", ["def frobnicate(x):", "    return x * 2"],
-                            note="End of file - total 2 lines")
-    foo_tr = _tool_response(foo_block)
-    bar_block = _file_block("/repo/bar.py", ["def helper():", "    pass"],
-                            note="End of file - total 2 lines")
-    bar_tr = _tool_response(bar_block)
-
-    prompt_0 = _main_prompt(issue, [])
-    prompt_1 = _main_prompt(issue, [foo_tr])
-    prompt_2 = _main_prompt(issue, [foo_tr, bar_tr])
-    extra_asst = _user_msg("The fix looks correct. Committing now.")
-    prompt_3 = prompt_2 + "\n" + extra_asst
-
-    # The script calls: gt for foo suite = ground_truth_from_next(prompt_1, prompt_2)
-    #                   gt for bar suite = ground_truth_from_next(prompt_2, prompt_3)
-    gt_foo = mod.ground_truth_from_next(prompt_1, prompt_2)
-    gt_bar = mod.ground_truth_from_next(prompt_2, prompt_3)
-
-    assert gt_foo is not None and gt_foo.strip() != "", (
-        "ground truth for foo suite (turn 1->2 delta) must be non-empty"
-    )
-    assert gt_bar is not None and gt_bar.strip() != "", (
-        "ground truth for bar suite (turn 2->3 delta) must be non-empty"
-    )
-
-    prompts_dir = tmp_path / "prompts"
-    prompts_dir.mkdir()
-    records = [
-        {"ts": 1.0, "request_id": "r0", "prompt_text": prompt_0},
-        {"ts": 2.0, "request_id": "r1", "prompt_text": prompt_1},
-        {"ts": 3.0, "request_id": "r2", "prompt_text": prompt_2},
-        {"ts": 4.0, "request_id": "r3", "prompt_text": prompt_3},
-    ]
-    _write_jsonl(prompts_dir / "prompt-001.jsonl", records)
+    """ground_truth.txt for each suite contains the correct model generation
+    (the delta between consecutive unique prompts, up to IM_END)."""
+    prompts_dir, gt_foo, gt_bar, _issue = _build_twin_dump(tmp_path)
     out_dir = tmp_path / "suite_out"
 
     monkeypatch.setattr(sys, "argv", [
-        "build_kv_reuse_suite",
-        "--prompts", str(prompts_dir),
-        "--out", str(out_dir),
+        "build_kv_reuse_suite", "--prompts", str(prompts_dir), "--out", str(out_dir),
     ])
     mod.main()
 
@@ -834,29 +950,59 @@ def test_main_integration_ground_truth_contents(mod, tmp_path, monkeypatch):
     foo_entry = next(e for e in index if e["new_file_path"] == "/repo/foo.py")
     bar_entry = next(e for e in index if e["new_file_path"] == "/repo/bar.py")
 
-    foo_written_gt = (out_dir / foo_entry["dir"] / "ground_truth.txt").read_text()
-    bar_written_gt = (out_dir / bar_entry["dir"] / "ground_truth.txt").read_text()
+    written_gt_foo = (out_dir / foo_entry["dir"] / "ground_truth.txt").read_text()
+    written_gt_bar = (out_dir / bar_entry["dir"] / "ground_truth.txt").read_text()
 
-    assert foo_written_gt == gt_foo
-    assert bar_written_gt == gt_bar
+    assert written_gt_foo == gt_foo, (
+        f"foo gt mismatch:\n  got: {repr(written_gt_foo[:80])}\n"
+        f"  want: {repr(gt_foo[:80])}"
+    )
+    assert written_gt_bar == gt_bar, (
+        f"bar gt mismatch:\n  got: {repr(written_gt_bar[:80])}\n"
+        f"  want: {repr(gt_bar[:80])}"
+    )
 
 
-def test_main_integration_title_turn_filtered(mod, tmp_path, monkeypatch):
-    """The title-agent turn (no wrapper sentinel) is NOT included in any suite."""
-    prompts_dir, _issue = _build_synthetic_dump(tmp_path)
+def test_main_integration_read_002_has_two_file_segments(mod, tmp_path, monkeypatch):
+    """read_002 (bar.py suite) covers the CUMULATIVE prompt with both foo.py and
+    bar.py in it -> n_file_segments == 2 in the index entry."""
+    prompts_dir, _gt_foo, _gt_bar, _issue = _build_twin_dump(tmp_path)
     out_dir = tmp_path / "suite_out"
 
     monkeypatch.setattr(sys, "argv", [
-        "build_kv_reuse_suite",
-        "--prompts", str(prompts_dir),
-        "--out", str(out_dir),
+        "build_kv_reuse_suite", "--prompts", str(prompts_dir), "--out", str(out_dir),
+    ])
+    mod.main()
+
+    index = json.loads((out_dir / "index.json").read_text())
+    bar_entry = next(e for e in index if e["new_file_path"] == "/repo/bar.py")
+    assert bar_entry["n_file_segments"] == 2, (
+        f"bar.py suite should have 2 cumulative file segments, got "
+        f"{bar_entry['n_file_segments']}"
+    )
+
+
+def test_main_integration_title_turn_filtered(mod, tmp_path, monkeypatch):
+    """A title-agent turn (no wrapper sentinel) in the dump is NOT included in any suite."""
+    prompts_dir, _gt_foo, _gt_bar, _issue = _build_twin_dump(tmp_path)
+    out_dir = tmp_path / "suite_out"
+
+    # Inject a title-agent record into the existing file
+    existing = (prompts_dir / "prompt-001.jsonl").read_text()
+    title_rec = json.dumps({"ts": 0.1, "request_id": "title-r",
+                            "prompt_text": "Generate a short title for: frobnicate bug."})
+    (prompts_dir / "prompt-001.jsonl").write_text(title_rec + "\n" + existing)
+
+    monkeypatch.setattr(sys, "argv", [
+        "build_kv_reuse_suite", "--prompts", str(prompts_dir), "--out", str(out_dir),
     ])
     rc = mod.main()
     assert rc == 0
 
-    # No suite should have a sample_id derived from the title record
     index = json.loads((out_dir / "index.json").read_text())
-    # There's exactly one sample (the issue), both suites belong to it
+    # Still exactly 2 suites (title turn contributes nothing)
+    assert len(index) == 2
+    # All suites belong to one sample (the issue)
     sample_ids = {e["sample_id"] for e in index}
     assert len(sample_ids) == 1
 
@@ -878,3 +1024,24 @@ def test_main_integration_no_main_turns_returns_1(mod, tmp_path, monkeypatch):
     ])
     rc = mod.main()
     assert rc == 1
+
+
+def test_main_integration_manifest_lineage_index_field(mod, tmp_path, monkeypatch):
+    """manifest.json uses the 'lineage_index' field (not the old 'ts_index')."""
+    prompts_dir, _gt_foo, _gt_bar, _issue = _build_twin_dump(tmp_path)
+    out_dir = tmp_path / "suite_out"
+
+    monkeypatch.setattr(sys, "argv", [
+        "build_kv_reuse_suite", "--prompts", str(prompts_dir), "--out", str(out_dir),
+    ])
+    mod.main()
+
+    index = json.loads((out_dir / "index.json").read_text())
+    for entry in index:
+        manifest = json.loads((out_dir / entry["dir"] / "manifest.json").read_text())
+        assert "lineage_index" in manifest["turn"], (
+            "manifest.turn must have 'lineage_index' (not the old 'ts_index')"
+        )
+        assert "ts_index" not in manifest["turn"], (
+            "manifest.turn must NOT have the old 'ts_index' field"
+        )

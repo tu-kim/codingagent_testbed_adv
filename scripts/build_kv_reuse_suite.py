@@ -188,6 +188,38 @@ def ground_truth_from_next(cur_prompt: str, next_prompt: str) -> str | None:
     return tail[:end] if end != -1 else tail
 
 
+def chain_links(prompts: list[str]):
+    """Reconstruct conversation lineage by prompt-prefix containment.
+
+    The dump can't be trusted in ts order: it carries BOTH the prefill and
+    decode copy of each request (identical prompt) and the prompt dir
+    accumulates across runs. Instead we link turns by the fact that one
+    turn's prompt is a strict prefix of the next turn's prompt.
+
+    Returns (pred, succ) index lists:
+      pred[i] = index of the LONGEST prompt that is a strict prefix of
+                prompts[i] (the immediate predecessor turn), or None.
+      succ[i] = index of the SHORTEST prompt that strictly extends prompts[i]
+                (the immediate next turn), or None.
+    O(n^2) but n = turns per sample (small); startswith short-circuits."""
+    n = len(prompts)
+    pred: list[int | None] = [None] * n
+    succ: list[int | None] = [None] * n
+    for i in range(n):
+        pi = prompts[i]
+        for j in range(n):
+            if i == j:
+                continue
+            pj = prompts[j]
+            if len(pj) < len(pi) and pi.startswith(pj):
+                if pred[i] is None or len(pj) > len(prompts[pred[i]]):
+                    pred[i] = j
+            elif len(pj) > len(pi) and pj.startswith(pi):
+                if succ[i] is None or len(pj) < len(prompts[succ[i]]):
+                    succ[i] = j
+    return pred, succ
+
+
 def decompose(prompt_text: str, blocks: list[dict]) -> list[dict]:
     """Split the prompt at every file BODY into ordered segments:
     seg0, file1, seg1, file2, ..., fileN, segN."""
@@ -290,31 +322,42 @@ def main() -> int:
 
     inst_map = build_instance_map(args.config) if args.config else {}
 
-    # Group by sample (problem_statement), order each by ts.
+    # Group by sample (problem_statement). Within a sample we do NOT trust ts
+    # order: the dump carries both the prefill AND decode copy of each request
+    # (identical prompt) and the prompt dir accumulates across runs. So we
+    # (a) collapse identical prompts (prefer the prefill copy) and (b) link
+    # turns by prompt-prefix lineage (chain_links).
     samples: dict[str, list[dict]] = {}
     for r in records:
         ps = extract_problem_statement(r.get("prompt_text") or "")
         key = ps or "_unknown"
         samples.setdefault(key, []).append(r)
-    for recs in samples.values():
-        recs.sort(key=lambda r: (r.get("ts") or 0))
 
     tok = load_tokenizer(args.model) if args.model else None
     args.out.mkdir(parents=True, exist_ok=True)
     index: list[dict] = []
     n_suites = 0
 
-    for ps, recs in samples.items():
+    for ps, group in samples.items():
         sample_id = inst_map.get(ps) or f"sample-{_sha(ps)[:8]}"
+        # collapse prefill/decode twins + cross-run identical turns
+        uniq: dict[str, dict] = {}
+        for r in group:
+            pt = r.get("prompt_text") or ""
+            prev = uniq.get(pt)
+            if prev is None or (prev.get("role") != "prefill" and r.get("role") == "prefill"):
+                uniq[pt] = r
+        recs = sorted(uniq.values(), key=lambda r: len(r.get("prompt_text") or ""))
+        pred, succ = chain_links([r.get("prompt_text") or "" for r in recs])
+
         seen: set[str] = set()
-        prev_blocks_sha: set[str] = set()
         read_ord = 0
         for ti, rec in enumerate(recs):
             prompt = rec.get("prompt_text") or ""
             blocks = find_file_blocks(prompt)
-            cur_sha = {b["content_sha"] for b in blocks}
-            new_blocks = [b for b in blocks if b["content_sha"] not in prev_blocks_sha]
-            prev_blocks_sha = cur_sha
+            prev_prompt = recs[pred[ti]].get("prompt_text") or "" if pred[ti] is not None else ""
+            prev_sha = {b["content_sha"] for b in find_file_blocks(prev_prompt)}
+            new_blocks = [b for b in blocks if b["content_sha"] not in prev_sha]
             if not new_blocks:
                 continue
             if len(new_blocks) > 1:
@@ -327,11 +370,11 @@ def main() -> int:
                 continue  # re-read of an already-seen file: no duplicate suite
             seen.add(dk)
 
-            if ti + 1 >= len(recs):
-                print(f"warning: {sample_id} read at last turn {ti}: no next "
-                      f"turn for ground truth; skipping suite", file=sys.stderr)
+            if succ[ti] is None:
+                print(f"warning: {sample_id} turn {ti}: no successor turn for "
+                      f"ground truth (last turn of lineage); skipping", file=sys.stderr)
                 continue
-            gt = ground_truth_from_next(prompt, recs[ti + 1].get("prompt_text") or "")
+            gt = ground_truth_from_next(prompt, recs[succ[ti]].get("prompt_text") or "")
             if not gt:
                 print(f"warning: {sample_id} turn {ti}: empty ground truth; skipping",
                       file=sys.stderr)
@@ -379,7 +422,7 @@ def main() -> int:
                     "ts": rec.get("ts"),
                     "num_prompt_tokens": rec.get("num_prompt_tokens"),
                     "n_tokens_encoded": len(offsets) if offsets is not None else None,
-                    "ts_index": ti,
+                    "lineage_index": ti,
                 },
                 "new_file": {
                     "path": new_block["path"],
