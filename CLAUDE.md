@@ -172,7 +172,7 @@ dynamo:
   discovery_backend: etcd         # → --discovery-backend (kubernetes | etcd | file | mem)
   etcd_endpoints: http://127.0.0.1:2379   # → ETCD_ENDPOINTS env on every dynamo process
   nats_url: nats://127.0.0.1:4222         # → NATS_SERVER env (request/event plane, NOT discovery)
-  request_plane: tcp              # → --request-plane (tcp | nats | http)
+  request_plane: tcp              # → --request-plane (tcp | nats)
   event_plane: nats               # → --event-plane (nats | zmq)
 
 opencode:

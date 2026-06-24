@@ -28,7 +28,7 @@ RouterMode = Literal[
     "device-aware-weighted",
 ]
 DiscoveryBackend = Literal["kubernetes", "etcd", "file", "mem"]
-RequestPlane = Literal["tcp", "nats", "http"]
+RequestPlane = Literal["tcp", "nats"]
 EventPlane = Literal["nats", "zmq"]
 KVCacheDtype = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
 # Tool-call parser names registered in dynamo's Rust core. Mirrored from the

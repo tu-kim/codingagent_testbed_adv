@@ -18,8 +18,15 @@ _VLLM_BACKEND_ARGS = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "backe
 _VLLM_MAIN = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "__main__.py"
 _VLLM_CONSTANTS = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "constants.py"
 _VLLM_MAIN_PY = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "main.py"
+# DisaggregationMode moved here in v1.3.x; vllm/constants.py only re-exports it.
+_COMMON_CONSTANTS = _DYNAMO / "components" / "src" / "dynamo" / "common" / "constants.py"
 _RUNTIME_ARGS = (
     _DYNAMO / "components" / "src" / "dynamo" / "common" / "configuration" / "groups" / "runtime_args.py"
+)
+# --router-mode moved out of frontend_args.py into the shared router-args group
+# in v1.3.x (it's still a valid frontend flag at runtime, just declared here).
+_ROUTER_ARGS = (
+    _DYNAMO / "components" / "src" / "dynamo" / "common" / "configuration" / "groups" / "router_args.py"
 )
 _TOOL_PARSER_SRC = (
     _DYNAMO / "lib" / "parsers" / "src" / "tool_calling" / "parsers.rs"
@@ -51,7 +58,6 @@ def test_dynamo_frontend_module_entrypoint_exists():
     [
         "--http-host",
         "--http-port",
-        "--router-mode",
         "--discovery-backend",
         "--request-plane",
         "--event-plane",
@@ -62,6 +68,17 @@ def test_frontend_flag_is_declared_upstream(flag: str):
     assert f'flag_name="{flag}"' in src, (
         f"Dynamo frontend no longer declares {flag!r}. "
         f"deploy/testbed.sh's up_frontend() must change."
+    )
+
+
+def test_router_mode_flag_declared_upstream():
+    """--router-mode moved out of frontend_args.py into the shared router-args
+    group in v1.3.x. It's still passed to the frontend by testbed.sh and valid
+    at runtime; just declared here now."""
+    src = _ROUTER_ARGS.read_text()
+    assert 'flag_name="--router-mode"' in src, (
+        "Dynamo no longer declares --router-mode in router_args.py; "
+        "deploy/testbed.sh's up_frontend() (and this test's path) must change."
     )
 
 
@@ -83,14 +100,14 @@ def test_testbed_sh_passes_each_required_frontend_flag(flag: str):
 
 def test_frontend_router_mode_choices_match_config_enum():
     """testbed.config.RouterMode is the source of truth Python-side; it must
-    be a subset of the choices Dynamo's frontend actually accepts."""
-    src = _FRONTEND_ARGS.read_text()
+    be a subset of the choices Dynamo's router-args group actually accepts."""
+    src = _ROUTER_ARGS.read_text()
     block = re.search(
         r'flag_name="--router-mode".*?choices=\[(.*?)\]',
         src,
         re.DOTALL,
     )
-    assert block, "could not find --router-mode choices block in dynamo frontend_args.py"
+    assert block, "could not find --router-mode choices block in dynamo router_args.py"
     upstream = {m.group(1) for m in re.finditer(r'"([^"]+)"', block.group(1))}
 
     from testbed.config import RouterMode  # type: ignore[attr-defined]
@@ -151,10 +168,10 @@ def test_vllm_disaggregation_mode_flag_exists():
 
 
 def test_vllm_disaggregation_mode_supports_prefill_and_decode():
-    src = _VLLM_CONSTANTS.read_text()
-    # The DisaggregationMode enum must include the values testbed.sh passes:
-    # `prefill` and `decode`. Don't pin the exhaustive set — Dynamo may add
-    # new modes.
+    # DisaggregationMode lives in common/constants.py in v1.3.x (vllm/constants.py
+    # only re-exports it). The enum must include the values testbed.sh passes:
+    # `prefill` and `decode`. Don't pin the exhaustive set — Dynamo may add modes.
+    src = _COMMON_CONSTANTS.read_text()
     assert re.search(r'PREFILL\s*=\s*"prefill"', src)
     assert re.search(r'DECODE\s*=\s*"decode"', src)
 
