@@ -200,7 +200,7 @@ Each worker needs role-specific Dynamo/vLLM args. `testbed.sh` injects these at 
 - `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` plus (if `vllm.tool_call_parser` is non-empty) `--dyn-tool-call-parser <name>`
 - Both roles → `--override-generation-config '<json>'` (if `vllm.override_generation_config` is a non-null dict) so the model's `generation_config.json` defaults are merged with our reproducibility-pinned baseline (see the bullet in "Conventions / gotchas" for the rationale).
 
-The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:647-650` (`if model_type != ModelType.Prefill: runtime_config.tool_call_parser = ...`); applying the parser on prefill is a no-op but a smell.
+The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:723-724` (`if model_type != ModelType.Prefill: runtime_config.tool_call_parser = ...; runtime_config.reasoning_parser = ...`); applying the parser on prefill is a no-op but a smell. Note the **reasoning parser** is set on the same decode-only branch (`runtime_config.reasoning_parser = config.dyn_reasoning_parser`) — the testbed does not yet wire `--dyn-reasoning-parser` (see TODO for MiniMax M3).
 
 ### Discovery vs. NATS
 
@@ -248,7 +248,8 @@ the rationale for each pin:
 | `yq` | apt | `testbed.sh` reads `testbed.yaml` via `yq` (kislyuk's Python yq, jq filters) |
 | `nats-server` | apt | `testbed.sh up nats` single-node convenience (port 4222) |
 | `etcd` / `etcdctl` | tarball v3.5.17 → `/usr/local/bin` | apt etcd is too old; Dynamo's default `--discovery-backend` is etcd |
-| `vllm` | pip `==0.19.0` | matches Dynamo 1.1's vendored AsyncEngineArgs surface; bumping vLLM may break flag pass-through in `dynamo.vllm` |
+| `vllm` | pip `==0.22.1` | matches the `dynamo` submodule pin `v1.3.0-minimax-m3-dev.1`'s vendored AsyncEngineArgs surface; bumping vLLM may break flag pass-through in `dynamo.vllm` (re-run `tests/test_dynamo_interface.py`) |
+| `dynamo` submodule | tag `v1.3.0-minimax-m3-dev.1` | adds the `minimax_m3` tool-call + reasoning parsers (Rust) and targets vLLM 0.22.1. Bumping from v1.1.0 required a **cargo rebuild** of the Rust bindings/parsers, not just the Python patches |
 | `nixl` | pip | KV-transfer connector class vLLM dlopen's when `--kv-transfer-config` selects `NixlConnector` |
 
 If any of these drift (e.g., user upgrades vLLM and `dynamo.vllm` starts rejecting flags), update the pin here AND in the README install block AND re-run `tests/test_dynamo_interface.py` against the new vendored source.
@@ -352,7 +353,7 @@ Both submodules stay pinned at their upstream commits; testbed-owned changes liv
 - `opencode-*.patch` → `scripts/apply_opencode_patches.sh` (opencode submodule)
 - `dynamo-*.patch`   → `scripts/apply_dynamo_patches.sh` (dynamo submodule)
 
-Both scripts take no arg (apply, idempotent), `--check` (report applied/pending), `--revert`. Run after `git submodule update --init`. The dynamo patches are **Python-only** (handlers.py) — no cargo rebuild, just restart workers (`testbed.sh down workers && up workers`) to pick them up.
+Both scripts take no arg (apply, idempotent), `--check` (report applied/pending), `--revert`. Run after `git submodule update --init`. The dynamo patches are **Python-only** (handlers.py) — applying them needs no cargo rebuild, just restart workers (`testbed.sh down workers && up workers`) to pick them up. (Note: a *submodule version bump* itself — e.g. the v1.1.0 → v1.3.0-minimax-m3-dev.1 move — does require a full cargo rebuild of dynamo's Rust core, separate from the patches.)
 
 **`dynamo-scheduling-log.patch`** — adds `BaseWorkerHandler._log_scheduling_delay()` + 3 call sites (decode token/text, prefill) in `dynamo/components/src/dynamo/vllm/handlers.py`. Emits one `SCHED_DELAY request_id=.. role=prefill|decode queue_ms=.. queued_ts=.. scheduled_ts=..` line per request to the worker log, read from vLLM v1's per-request `RequestOutput.metrics.{queued_ts,scheduled_ts}` (the engine scheduler queue-wait = scheduling delay). This is the per-request sink because the value **cannot** ride in-band to the client: the frontend re-serializes `usage` through upstream async-openai types that drop unknown keys, and the `nvext` response block is Rust-only (no Python write path). Parse with `scripts/analyze_worker_scheduling.py --logs logs/` → per-(worker,role) p50/p90/p99. With PD disaggregation the prefill and decode workers each log their own line, so prefill vs decode scheduling delay come out separately. To see queue wait **as a fraction of end-to-end**, `scripts/analyze_request_wait.py --frontend logs/frontend.log --logs logs/` joins the frontend "request completed" line (total elapsed_ms) with the SCHED_DELAY lines by `request_id` (same Context UUID across frontend↔prefill↔decode). Dynamo logs carry NO opencode sessionID (`x-session-affinity` is never surfaced dynamo-side), so per-session needs an external `request_id,session_id` map passed via `--session-map`.
 

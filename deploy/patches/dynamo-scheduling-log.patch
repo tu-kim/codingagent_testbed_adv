@@ -1,10 +1,10 @@
 diff --git a/components/src/dynamo/vllm/handlers.py b/components/src/dynamo/vllm/handlers.py
-index 85c1cbe347..20f7fbe475 100644
+index 07cf85eb07..3135fadcf8 100644
 --- a/components/src/dynamo/vllm/handlers.py
 +++ b/components/src/dynamo/vllm/handlers.py
-@@ -1563,6 +1563,47 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
-             ),
-         }
+@@ -2822,6 +2822,47 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
+         prompt = TokensPrompt(**prompt_kwargs)
+         return prompt, embedding_sequence_length, None
  
 +    @staticmethod
 +    def _log_scheduling_delay(
@@ -48,25 +48,25 @@ index 85c1cbe347..20f7fbe475 100644
 +        )
 +
      @staticmethod
-     def _extract_logprobs(
-         output, num_output_tokens_so_far: int, tokenizer=None
-@@ -1730,6 +1771,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
-                         request_output=res,
-                         embedding_sequence_length=embedding_sequence_length,
-                     )
-+                    BaseWorkerHandler._log_scheduling_delay(res, request_id, "decode")
-                     # Log completion with LoRA info (debug level to avoid log spam)
-                     self._log_with_lora_context(
-                         "Completed token generation for request {request_id}{lora_info}: "
-@@ -2043,6 +2085,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
-                         chunk["usage"] = BaseWorkerHandler._build_completion_usage(
-                             request_output=res,
+     def _build_completion_usage(
+         request_output: RequestOutput,
+@@ -3061,6 +3102,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                          )
+                         if routed_experts is not None:
+                             _attach_routed_experts_engine_data(out, routed_experts)
 +                        BaseWorkerHandler._log_scheduling_delay(res, request_id, "decode")
+                         # Log completion with LoRA info (debug level to avoid log spam)
+                         self._log_with_lora_context(
+                             "Completed token generation for request {request_id}{lora_info}: "
+@@ -3466,6 +3508,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
+                             chunk["usage"] = BaseWorkerHandler._build_completion_usage(
+                                 request_output=res,
+                             )
++                            BaseWorkerHandler._log_scheduling_delay(res, request_id, "decode")
  
-                     yield chunk
- 
-@@ -2216,6 +2259,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
+                         yield chunk
+                         previous_text_per_choice[output_idx] = output.text
+@@ -3649,6 +3692,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                          embedding_sequence_length=embedding_sequence_length,
                      ),
                  }

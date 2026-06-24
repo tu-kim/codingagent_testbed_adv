@@ -21,7 +21,9 @@ _VLLM_MAIN_PY = _DYNAMO / "components" / "src" / "dynamo" / "vllm" / "main.py"
 _RUNTIME_ARGS = (
     _DYNAMO / "components" / "src" / "dynamo" / "common" / "configuration" / "groups" / "runtime_args.py"
 )
-_TOOL_CALLING_DOC = _DYNAMO / "docs" / "agents" / "tool-calling.md"
+_TOOL_PARSER_SRC = (
+    _DYNAMO / "lib" / "parsers" / "src" / "tool_calling" / "parsers.rs"
+)
 _RUNTIME_ENV_NAMES = (
     _DYNAMO / "lib" / "runtime" / "src" / "config" / "environment_names.rs"
 )
@@ -282,21 +284,20 @@ def test_main_py_skips_tool_parser_on_prefill():
 
 
 def test_config_tool_call_parser_literal_matches_dynamo_doc_table():
-    """testbed.config.ToolCallParser is mirrored from
-    dynamo/docs/agents/tool-calling.md. Drift means our pydantic validator
-    rejects parser names that Dynamo actually accepts (or vice versa). The
-    canonical runtime list is dynamo._core.get_tool_parser_names() but that
-    needs the binary; the markdown table is the authoritative offline source."""
-    doc = _TOOL_CALLING_DOC.read_text()
-    # Names appear in a backticked first column: `| \`<name>\` | ... |`.
-    upstream = set(
-        re.findall(r"^\|\s*`([a-z][a-z0-9_]*)`\s*\|", doc, re.MULTILINE)
-    )
-    # Drop any obvious non-parser tokens that may share the column shape
-    # (defensive; we know "default" is a valid parser entry).
+    """testbed.config.ToolCallParser is mirrored from the authoritative
+    `map.insert("<name>", ...)` registrations in
+    dynamo/lib/parsers/src/tool_calling/parsers.rs (canonical runtime truth is
+    dynamo._core.get_tool_parser_names(), which needs the built binary; the Rust
+    map is the offline source -- the docs table proved stale, e.g. omitting
+    minimax_m3 that the runtime accepts). Drift means our pydantic validator
+    rejects parser names Dynamo actually accepts (or vice versa). Only
+    underscore-form names are compared; hyphenated aliases (minimax-m3, ...) are
+    intentionally not mirrored."""
+    src = _TOOL_PARSER_SRC.read_text()
+    upstream = set(re.findall(r'map\.insert\(\s*"([a-z][a-z0-9_]*)"', src))
     assert "qwen3_coder" in upstream, (
-        f"dynamo tool-calling.md no longer lists qwen3_coder; "
-        f"current table values: {sorted(upstream)}"
+        f"parsers.rs no longer registers qwen3_coder; "
+        f"current registered names: {sorted(upstream)}"
     )
 
     from testbed.config import ToolCallParser
@@ -306,7 +307,7 @@ def test_config_tool_call_parser_literal_matches_dynamo_doc_table():
     missing_locally = upstream - ours
     extra_locally = ours - upstream
     assert not missing_locally and not extra_locally, (
-        f"testbed.config.ToolCallParser drifted from dynamo doc table.\n"
+        f"testbed.config.ToolCallParser drifted from dynamo parsers.rs.\n"
         f"  upstream-only: {sorted(missing_locally)}\n"
         f"  ours-only:     {sorted(extra_locally)}\n"
         f"Update src/testbed/config.py:ToolCallParser to match."

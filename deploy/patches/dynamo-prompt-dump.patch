@@ -1,19 +1,20 @@
 diff --git a/components/src/dynamo/vllm/handlers.py b/components/src/dynamo/vllm/handlers.py
-index 85c1cbe347..5ace661314 100644
+index 07cf85eb07..2441799b47 100644
 --- a/components/src/dynamo/vllm/handlers.py
 +++ b/components/src/dynamo/vllm/handlers.py
-@@ -2,6 +2,7 @@
- # SPDX-License-Identifier: Apache-2.0
- 
+@@ -4,6 +4,7 @@
  import asyncio
+ import base64
+ import inspect
 +import json
  import logging
+ import math
  import os
- import tempfile
-@@ -72,6 +73,35 @@ configure_dynamo_logging()
+@@ -119,6 +120,36 @@ DECODED_VARIANT_KEY: Final = "Decoded"
+ configure_dynamo_logging()
  logger = logging.getLogger(__name__)
  
- 
++
 +# TESTBED INSTRUMENTATION (deploy/patches/dynamo-prompt-dump.patch).
 +# Opt-in capture of the EXACT prompt handed to the vLLM engine per request
 +# -- the token_ids the Dynamo frontend produced AFTER applying the chat
@@ -43,12 +44,12 @@ index 85c1cbe347..5ace661314 100644
 +    return _prompt_dump_fh
 +
 +
- class _DeferredAbort:
-     """Defers engine_client.abort(request_id) until the first engine output.
+ _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
+ _DELTA_REQUEST_OUTPUT_KIND = RequestOutputKind.DELTA
  
-@@ -1522,6 +1552,63 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
-         prompt = TokensPrompt(**prompt_kwargs)
-         return prompt, embedding_sequence_length, None
+@@ -2919,6 +2950,63 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
+         else:
+             logger.debug(formatted_message)
  
 +    def _dump_engine_prompt(self, prompt, request_id: str, role: str) -> None:
 +        """TESTBED INSTRUMENTATION (deploy/patches/dynamo-prompt-dump.patch).
@@ -107,10 +108,10 @@ index 85c1cbe347..5ace661314 100644
 +        except Exception as e:  # instrumentation must never break the agent loop
 +            logger.warning("prompt dump failed for %s: %s", request_id, e)
 +
-     @staticmethod
-     def _build_completion_usage(
-         request_output: RequestOutput,
-@@ -1682,6 +1769,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
+     async def generate_tokens(
+         self,
+         prompt,
+@@ -2939,6 +3027,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                  request_id,
                  lora_request,
              )
@@ -118,15 +119,15 @@ index 85c1cbe347..5ace661314 100644
              gen = self.engine_client.generate(
                  prompt,
                  sampling_params,
-@@ -1991,6 +2079,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
- 
-         async with self._abort_monitor(context, request_id):
+@@ -3409,6 +3498,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
+             context, request_id, abort_guard=abort_guard
+         ):
              try:
 +                self._dump_engine_prompt(prompt, request_id, "decode")
                  gen = self.engine_client.generate(
                      prompt,
                      sampling_params,
-@@ -2180,6 +2269,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
+@@ -3607,6 +3697,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
  
          async with self._abort_monitor(context, request_id, is_prefill=True):
              try:

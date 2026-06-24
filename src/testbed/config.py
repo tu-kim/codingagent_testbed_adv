@@ -31,15 +31,21 @@ DiscoveryBackend = Literal["kubernetes", "etcd", "file", "mem"]
 RequestPlane = Literal["tcp", "nats", "http"]
 EventPlane = Literal["nats", "zmq"]
 KVCacheDtype = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
-# Tool-call parser names registered in dynamo's Rust core. Sourced from
-# dynamo/docs/agents/tool-calling.md:38-56 -- canonical truth at runtime is
-# `dynamo._core.get_tool_parser_names()`. tests/test_dynamo_interface.py
-# fails loudly if upstream renames/removes one.
+# Tool-call parser names registered in dynamo's Rust core. Mirrored from the
+# authoritative `map.insert("<name>", ...)` registrations in
+# dynamo/lib/parsers/src/tool_calling/parsers.rs (canonical truth at runtime is
+# `dynamo._core.get_tool_parser_names()`). Only the underscore-form names are
+# listed; hyphenated aliases (minimax-m3, deepseek-v4, ...) are accepted by
+# dynamo but intentionally omitted here. tests/test_dynamo_interface.py fails
+# loudly if this drifts from parsers.rs.
 ToolCallParser = Literal[
     "deepseek_v3",
     "deepseek_v3_1",
     "deepseek_v3_2",
+    "deepseek_v4",
+    "deepseekv4",
     "default",
+    "gemma4",
     "glm47",
     "harmony",
     "hermes",
@@ -47,11 +53,14 @@ ToolCallParser = Literal[
     "kimi_k2",
     "llama3_json",
     "minimax_m2",
+    "minimax_m3",
+    "minimax_m3_nom",
     "mistral",
     "nemotron_deci",
     "nemotron_nano",
     "phi4",
     "pythonic",
+    "qwen25",
     "qwen3_coder",
 ]
 

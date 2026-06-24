@@ -25,10 +25,10 @@ pip install uv
 # convenience for `deploy/testbed.sh up nats`.
 sudo apt install -y yq nats-server
 
-# vLLM pinned to 0.19.0 (matches the AsyncEngineArgs surface vendored Dynamo
-# 1.1 was built against); NIXL is the KV-transfer connector vLLM loads when
-# --kv-transfer-config selects NixlConnector.
-uv pip install vllm==0.19.0
+# vLLM pinned to 0.22.1 (matches the AsyncEngineArgs surface the vendored
+# Dynamo submodule v1.3.0-minimax-m3-dev.1 was built against); NIXL is the
+# KV-transfer connector vLLM loads when --kv-transfer-config selects NixlConnector.
+uv pip install vllm==0.22.1
 uv pip install nixl
 
 # etcd (Dynamo's default --discovery-backend); apt's is too old.
