@@ -24,6 +24,9 @@ _RUNTIME_ARGS = (
 _TOOL_PARSER_SRC = (
     _DYNAMO / "lib" / "parsers" / "src" / "tool_calling" / "parsers.rs"
 )
+_REASONING_PARSER_SRC = (
+    _DYNAMO / "lib" / "parsers" / "src" / "reasoning" / "mod.rs"
+)
 _RUNTIME_ENV_NAMES = (
     _DYNAMO / "lib" / "runtime" / "src" / "config" / "environment_names.rs"
 )
@@ -237,7 +240,7 @@ def test_dyn_tool_call_parser_flag_declared_upstream():
 
 
 def test_testbed_sh_passes_dyn_tool_call_parser_to_decode_only():
-    """Per dynamo/components/src/dynamo/vllm/main.py:647-650, the parser is
+    """Per dynamo/components/src/dynamo/vllm/main.py:722-724, the parser is
     skipped on Prefill workers. testbed.sh must inject --dyn-tool-call-parser
     only when role=decode -- otherwise we either pass it on prefill (harmless
     but lies in the trace) or pass it always (noise). We encode this as
@@ -260,8 +263,8 @@ def test_testbed_sh_passes_dyn_tool_call_parser_to_decode_only():
     assert prefill_block, "spawn_worker no longer has the prefill/else/fi role branch"
     assert "--dyn-tool-call-parser" not in prefill_block.group(1), (
         "--dyn-tool-call-parser leaked into the prefill branch — Dynamo "
-        "ignores it there (main.py:647-650 only sets tool_call_parser when "
-        "model_type != ModelType.Prefill), so its presence is a smell."
+        "ignores it there (main.py:722-724 only sets tool_call_parser when "
+        "worker_type != WorkerType.Prefill), so its presence is a smell."
     )
 
 
@@ -273,13 +276,72 @@ def test_main_py_skips_tool_parser_on_prefill():
     redundant or wrong -- catch the drift here."""
     src = _VLLM_MAIN_PY.read_text()
     assert re.search(
-        r"model_type\s*!=\s*ModelType\.Prefill\s*:\s*\n?\s*runtime_config\.tool_call_parser",
+        r"worker_type\s*!=\s*WorkerType\.Prefill\s*:\s*\n?\s*runtime_config\.tool_call_parser",
         src,
     ), (
         "dynamo/components/src/dynamo/vllm/main.py no longer gates "
-        "tool_call_parser on `model_type != ModelType.Prefill`. "
+        "tool_call_parser on `worker_type != WorkerType.Prefill`. "
         "deploy/testbed.sh's decode-only branch may now be wrong; re-read "
         "the vendored source before editing the test."
+    )
+
+
+def test_dyn_reasoning_parser_flag_declared_upstream():
+    """Dynamo strips in-band reasoning (e.g. MiniMax M3 <mm:think>) via its
+    Rust-side reasoning parsers selected with --dyn-reasoning-parser. If the
+    flag name drifts, decode workers leak reasoning text into agent content."""
+    src = _RUNTIME_ARGS.read_text()
+    assert 'flag_name="--dyn-reasoning-parser"' in src, (
+        "dynamo runtime_args.py no longer declares --dyn-reasoning-parser; "
+        "deploy/testbed.sh's spawn_worker (decode branch) is broken."
+    )
+
+
+def test_testbed_sh_passes_dyn_reasoning_parser_to_decode_only():
+    """Same decode-only invariant as the tool-call parser (main.py:722-724
+    sets reasoning_parser on the `worker_type != WorkerType.Prefill` branch).
+    testbed.sh must inject --dyn-reasoning-parser only on decode workers."""
+    sh = _TESTBED_SH.read_text()
+    assert "--dyn-reasoning-parser" in sh, (
+        "deploy/testbed.sh stopped passing --dyn-reasoning-parser; decode "
+        "workers will leak <think>/<mm:think> reasoning into agent content."
+    )
+    prefill_block = re.search(
+        r'if\s*\[\[\s*"\$role"\s*==\s*"prefill"\s*\]\]\s*;\s*then(.*?)else(.*?)fi',
+        sh,
+        re.DOTALL,
+    )
+    assert prefill_block, "spawn_worker no longer has the prefill/else/fi role branch"
+    assert "--dyn-reasoning-parser" not in prefill_block.group(1), (
+        "--dyn-reasoning-parser leaked into the prefill branch — Dynamo "
+        "only sets reasoning_parser when worker_type != WorkerType.Prefill."
+    )
+
+
+def test_config_reasoning_parser_literal_matches_dynamo():
+    """testbed.config.ReasoningParser mirrors the `map.insert("<name>", ...)`
+    registrations in dynamo/lib/parsers/src/reasoning/mod.rs (canonical runtime
+    truth is dynamo._core.get_reasoning_parser_names()). Drift means our
+    validator rejects reasoning parser names Dynamo accepts (or vice versa).
+    Underscore-form names only; hyphenated aliases are not mirrored."""
+    src = _REASONING_PARSER_SRC.read_text()
+    upstream = set(re.findall(r'map\.insert\(\s*"([a-z][a-z0-9_]*)"', src))
+    assert "minimax_m3" in upstream, (
+        f"reasoning/mod.rs no longer registers minimax_m3; "
+        f"current registered names: {sorted(upstream)}"
+    )
+
+    from testbed.config import ReasoningParser
+    import typing
+
+    ours = set(typing.get_args(ReasoningParser))
+    missing_locally = upstream - ours
+    extra_locally = ours - upstream
+    assert not missing_locally and not extra_locally, (
+        f"testbed.config.ReasoningParser drifted from dynamo reasoning/mod.rs.\n"
+        f"  upstream-only: {sorted(missing_locally)}\n"
+        f"  ours-only:     {sorted(extra_locally)}\n"
+        f"Update src/testbed/config.py:ReasoningParser to match."
     )
 
 

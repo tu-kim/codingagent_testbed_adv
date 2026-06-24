@@ -64,6 +64,37 @@ ToolCallParser = Literal[
     "qwen3_coder",
 ]
 
+# Reasoning parser names registered in dynamo's Rust core. Mirrored from the
+# `map.insert("<name>", ...)` registrations in
+# dynamo/lib/parsers/src/reasoning/mod.rs (canonical truth at runtime is
+# `dynamo._core.get_reasoning_parser_names()`). Underscore-form names only;
+# hyphenated aliases (minimax-m3, deepseek-v4, gemma-4) are accepted by dynamo
+# but omitted here. tests/test_dynamo_interface.py fails loudly on drift.
+ReasoningParser = Literal[
+    "basic",
+    "deepseek_r1",
+    "deepseek_v3",
+    "deepseek_v3_1",
+    "deepseek_v3_2",
+    "deepseek_v4",
+    "deepseekv4",
+    "gemma4",
+    "glm45",
+    "gpt_oss",
+    "granite",
+    "kimi",
+    "kimi_k25",
+    "minimax_append_think",
+    "minimax_m3",
+    "mistral",
+    "nemotron3",
+    "nemotron_deci",
+    "nemotron_nano",
+    "nemotron_v3",
+    "qwen3",
+    "step3",
+]
+
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -162,9 +193,15 @@ class VLLMCfg(_Strict):
     system_port_base: int = 21000
     # Empty string => do not pass --dyn-tool-call-parser (decode worker runs
     # without server-side parsing; agent will receive raw text). Per
-    # dynamo/components/src/dynamo/vllm/main.py:647-650 this is applied to
+    # dynamo/components/src/dynamo/vllm/main.py:723-724 this is applied to
     # decode workers only; prefill workers always skip.
     tool_call_parser: ToolCallParser | Literal[""] = "qwen3_coder"
+    # Empty string => do not pass --dyn-reasoning-parser. Decode-only, same
+    # branch as tool_call_parser (main.py:724). Needed for models that emit
+    # in-band reasoning blocks the frontend must strip (e.g. MiniMax M3's
+    # <mm:think>...</mm:think> => reasoning_parser: minimax_m3). Default off
+    # because most models (e.g. qwen3-coder) emit no separate reasoning span.
+    reasoning_parser: ReasoningParser | Literal[""] = ""
     # Tri-state vLLM toggles forwarded as paired flags
     # (--enable-prefix-caching / --no-enable-prefix-caching). None →
     # don't pass either flag (vLLM v1 default = True for prefix

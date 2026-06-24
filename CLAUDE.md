@@ -132,6 +132,7 @@ vllm:
   kv_connector: NixlConnector     # vLLM kv-transfer connector class name (matches what vLLM expects)
   nixl_port_base: 6000            # rank N → VLLM_NIXL_SIDE_CHANNEL_PORT = base + N*100
   tool_call_parser: qwen3_coder   # → --dyn-tool-call-parser on DECODE workers only ("" disables)
+  reasoning_parser: ""            # → --dyn-reasoning-parser on DECODE workers only ("" disables); minimax_m3 for MiniMax M3
   override_generation_config:     # → --override-generation-config '<json>'; set null/omit to skip (see Conventions/gotchas)
     temperature: 0.0
     top_p: 1.0
@@ -193,14 +194,14 @@ monitor:                          # DCGM GPU + psutil CPU/process sampler (opt-i
 
 There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=0.5`, `seed=42`) live in `cli.py`. CLI flag > env override > yaml default.
 
-### Worker role injection (kv_role + disaggregation_mode + tool_call_parser + override_generation_config)
+### Worker role injection (kv_role + disaggregation_mode + tool_call_parser + reasoning_parser + override_generation_config)
 
 Each worker needs role-specific Dynamo/vLLM args. `testbed.sh` injects these at launch:
 - `prefill_workers[]` → `--disaggregation-mode prefill` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`
-- `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` plus (if `vllm.tool_call_parser` is non-empty) `--dyn-tool-call-parser <name>`
+- `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` plus (if `vllm.tool_call_parser` is non-empty) `--dyn-tool-call-parser <name>` plus (if `vllm.reasoning_parser` is non-empty) `--dyn-reasoning-parser <name>`
 - Both roles → `--override-generation-config '<json>'` (if `vllm.override_generation_config` is a non-null dict) so the model's `generation_config.json` defaults are merged with our reproducibility-pinned baseline (see the bullet in "Conventions / gotchas" for the rationale).
 
-The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:723-724` (`if model_type != ModelType.Prefill: runtime_config.tool_call_parser = ...; runtime_config.reasoning_parser = ...`); applying the parser on prefill is a no-op but a smell. Note the **reasoning parser** is set on the same decode-only branch (`runtime_config.reasoning_parser = config.dyn_reasoning_parser`) — the testbed does not yet wire `--dyn-reasoning-parser` (see TODO for MiniMax M3).
+The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call/reasoning-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:722-724` (`if worker_type != WorkerType.Prefill: runtime_config.tool_call_parser = ...; runtime_config.reasoning_parser = ...`); applying a parser on prefill is a no-op but a smell. The **reasoning parser** (`vllm.reasoning_parser` → `--dyn-reasoning-parser`) rides the same decode-only branch and is wired identically to `tool_call_parser` in `testbed.sh` — needed for models that emit in-band reasoning the frontend must strip (e.g. MiniMax M3's `<mm:think>…</mm:think>` → `reasoning_parser: minimax_m3`).
 
 ### Discovery vs. NATS
 

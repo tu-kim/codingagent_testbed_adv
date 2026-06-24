@@ -87,6 +87,16 @@ vllm:
   #   minimax_m3_nom mistral nemotron_deci nemotron_nano phi4 pythonic qwen25 qwen3_coder
   tool_call_parser: qwen3_coder  # default fits qwen3-coder-30b-a3b; minimax_m3 for MiniMax M3
 
+  # Dynamo's Rust-side reasoning parser, decode-only (same main.py:723-724 branch
+  # as tool_call_parser). Strips in-band reasoning spans so they don't reach the
+  # agent as content -- e.g. MiniMax M3's <mm:think>...</mm:think>. Empty string
+  # = skip the flag (most models, incl. qwen3-coder, need no reasoning parser).
+  # Valid names per dynamo/lib/parsers/src/reasoning/mod.rs:
+  #   basic deepseek_r1 deepseek_v3 deepseek_v3_1 deepseek_v3_2 deepseek_v4
+  #   deepseekv4 gemma4 glm45 gpt_oss granite kimi kimi_k25 minimax_append_think
+  #   minimax_m3 mistral nemotron3 nemotron_deci nemotron_nano nemotron_v3 qwen3 step3
+  reasoning_parser: ""           # set to minimax_m3 for MiniMax M3
+
   # Each worker entry:
   #   host: where this worker is deployed. Default 127.0.0.1.
   #         Doubles as VLLM_NIXL_SIDE_CHANNEL_HOST for that worker.

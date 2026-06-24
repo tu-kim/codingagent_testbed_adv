@@ -141,7 +141,7 @@ spawn_worker() {
   fi
   local kv_cfg="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"$kv_role\"}"
 
-  # --dyn-tool-call-parser is decode-only (dynamo/components/src/dynamo/vllm/main.py:647-650).
+  # --dyn-tool-call-parser is decode-only (dynamo/components/src/dynamo/vllm/main.py:723-724).
   # Empty value => skip the flag entirely.
   local -a tool_parser_args=()
   if [[ "$role" == "decode" ]]; then
@@ -149,6 +149,18 @@ spawn_worker() {
     tool_parser=$(cfg_get '.vllm.tool_call_parser // ""')
     if [[ -n "$tool_parser" ]]; then
       tool_parser_args=(--dyn-tool-call-parser "$tool_parser")
+    fi
+  fi
+
+  # --dyn-reasoning-parser is decode-only too (same main.py:724 branch). Strips
+  # in-band reasoning spans (e.g. MiniMax M3 <mm:think>...</mm:think>) so they
+  # don't reach the agent as content. Empty value => skip the flag.
+  local -a reasoning_parser_args=()
+  if [[ "$role" == "decode" ]]; then
+    local reasoning_parser
+    reasoning_parser=$(cfg_get '.vllm.reasoning_parser // ""')
+    if [[ -n "$reasoning_parser" ]]; then
+      reasoning_parser_args=(--dyn-reasoning-parser "$reasoning_parser")
     fi
   fi
 
@@ -298,6 +310,7 @@ spawn_worker() {
       ${dcar_flag[@]+"${dcar_flag[@]}"} \
       ${oge_flag[@]+"${oge_flag[@]}"} \
       ${tool_parser_args[@]+"${tool_parser_args[@]}"} \
+      ${reasoning_parser_args[@]+"${reasoning_parser_args[@]}"} \
       ${extra_array[@]+"${extra_array[@]}"}
 }
 
