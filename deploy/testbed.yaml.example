@@ -6,7 +6,7 @@
 workspace_root: /tmp/testbed-workspaces
 
 model:
-  name: qwen3-coder-30b-a3b      # HF id or local path; default
+  name: minimax-m2.7             # HF id or local path (set to your MiniMax-M2.7 checkout)
   served_name: local             # OpenCode provider model id used in opencode.json
   # Sampling overrides for ALL primary agents (build / plan / general /
   # title / summary / compaction). temperature=0 + top_p=1.0 = greedy.
@@ -85,7 +85,7 @@ vllm:
   #   deepseek_v3 deepseek_v3_1 deepseek_v3_2 deepseek_v4 deepseekv4 default
   #   gemma4 glm47 harmony hermes jamba kimi_k2 llama3_json minimax_m2 minimax_m3
   #   minimax_m3_nom mistral nemotron_deci nemotron_nano phi4 pythonic qwen25 qwen3_coder
-  tool_call_parser: qwen3_coder  # default fits qwen3-coder-30b-a3b; minimax_m3 for MiniMax M3
+  tool_call_parser: minimax_m2   # MiniMax M2 (<minimax:tool_call> XML); qwen3_coder for Qwen3-Coder
 
   # Dynamo's Rust-side reasoning parser, decode-only (same main.py:723-724 branch
   # as tool_call_parser). Strips in-band reasoning spans so they don't reach the
@@ -95,7 +95,7 @@ vllm:
   #   basic deepseek_r1 deepseek_v3 deepseek_v3_1 deepseek_v3_2 deepseek_v4
   #   deepseekv4 gemma4 glm45 gpt_oss granite kimi kimi_k25 minimax_append_think
   #   minimax_m3 mistral nemotron3 nemotron_deci nemotron_nano nemotron_v3 qwen3 step3
-  reasoning_parser: ""           # set to minimax_m3 for MiniMax M3
+  reasoning_parser: minimax_append_think   # MiniMax M2 <think> reasoning ("" to disable; minimax_m3 for M3)
 
   # Each worker entry:
   #   host: where this worker is deployed. Default 127.0.0.1.
@@ -121,7 +121,7 @@ vllm:
     gpu_memory_utilization: 0.90
     kv_cache_dtype: auto
 
-  extra_args: ""                 # appended to every vLLM serve invocation
+  extra_args: "--trust-remote-code --moe-backend triton"   # appended to every vLLM serve invocation (MiniMax M2 is a custom-code sparse-MoE; text-only, no --enable-multimodal)
 
 dynamo:
   host: 127.0.0.1                # → --http-host on dynamo.frontend
