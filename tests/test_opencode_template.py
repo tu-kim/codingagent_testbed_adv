@@ -137,6 +137,23 @@ def test_rendered_template_accepts_nonzero_sampling():
     assert cfg["agent"]["build"]["top_p"] == 0.9
 
 
+def test_rendered_template_allows_edit_bash_webfetch_permissions():
+    """Headless hang-prevention invariant (sibling to OPENCODE_CLIENT=server
+    for the question tool). opencode's permission evaluate() defaults to
+    "ask" when no rule matches (permission/evaluate.ts), and write/edit/bash/
+    webfetch call ctx.ask(...) which blocks on Deferred.await forever with no
+    human approver -- e.g. a write to /tmp (outside the workspace) hangs the
+    agent loop until --task-timeout-s. The template must pin these to "allow"."""
+    cfg = _render()
+    perm = cfg.get("permission")
+    assert isinstance(perm, dict), "rendered template missing top-level 'permission' block"
+    for key in ("edit", "bash", "webfetch"):
+        assert perm.get(key) == "allow", (
+            f"permission.{key} must be 'allow' to prevent headless approval hangs, "
+            f"got {perm.get(key)!r}"
+        )
+
+
 def test_rendered_template_pins_model_to_provider_slash_served_name():
     cfg = _render(provider_id="dynamo", served_name="local")
     # OpenCode's top-level `model` field is `provider/model` per the schema
