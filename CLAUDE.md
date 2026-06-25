@@ -143,11 +143,15 @@ vllm:
   #   host: where this worker is deployed. Default 127.0.0.1.
   #         Doubles as VLLM_NIXL_SIDE_CHANNEL_HOST for that worker.
   #         Single-node only at present; multi-node SSH spawn is TBD. Keep host=127.0.0.1 until then.
-  #   gpus: comma-separated GPU ids. Must satisfy len(split(',')) == tp * pp.
+  #   gpus: comma-separated GPU ids. Must satisfy len(split(',')) == tp*pp*dp.
+  #   dp:   --data-parallel-size (optional, default 1; emitted only when >1).
+  #   ep:   --enable-expert-parallel (optional, default false). MoE expert
+  #         sharding (e.g. MiniMax M2); EP size = tp*dp, so it's a bare toggle
+  #         and does NOT add GPUs to the tp*pp*dp count.
   prefill_workers:
-    - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1 }
+    - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1, dp: 1, ep: true }
   decode_workers:
-    - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1 }
+    - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1, dp: 1, ep: true }
 
   prefill:
     max_model_len: 32768
@@ -199,6 +203,7 @@ There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=
 Each worker needs role-specific Dynamo/vLLM args. `testbed.sh` injects these at launch:
 - `prefill_workers[]` → `--disaggregation-mode prefill` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`
 - `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` plus (if `vllm.tool_call_parser` is non-empty) `--dyn-tool-call-parser <name>` plus (if `vllm.reasoning_parser` is non-empty) `--dyn-reasoning-parser <name>`
+- Both roles → `--data-parallel-size <dp>` (only when the worker's `dp > 1`) plus `--enable-expert-parallel` (when the worker's `ep: true`). These are per-worker parallelism knobs forwarded straight to `AsyncEngineArgs` (so prefill and decode can differ); EP shards MoE experts across the `tp*dp` ranks without changing the `tp*pp*dp` GPU count.
 - Both roles → `--override-generation-config '<json>'` (if `vllm.override_generation_config` is a non-null dict) so the model's `generation_config.json` defaults are merged with our reproducibility-pinned baseline (see the bullet in "Conventions / gotchas" for the rationale).
 
 The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call/reasoning-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:722-724` (`if worker_type != WorkerType.Prefill: runtime_config.tool_call_parser = ...; runtime_config.reasoning_parser = ...`); applying a parser on prefill is a no-op but a smell. The **reasoning parser** (`vllm.reasoning_parser` → `--dyn-reasoning-parser`) rides the same decode-only branch and is wired identically to `tool_call_parser` in `testbed.sh` — needed for models that emit in-band reasoning the frontend must strip (e.g. MiniMax M3's `<mm:think>…</mm:think>` → `reasoning_parser: minimax_m3`).
@@ -226,10 +231,10 @@ All PID files and component logs are written to **`./logs/`** (created relative 
 
 `up workers` reads `vllm.prefill_workers` / `vllm.decode_workers` from `testbed.yaml`. For each worker, the script:
 
-1. validates `len(split(gpus, ',')) == tp * pp`,
+1. validates `len(split(gpus, ',')) == tp*pp*dp` (and that `dp` is a positive integer),
 2. exports `VLLM_NIXL_SIDE_CHANNEL_HOST=<worker.host>`, `VLLM_NIXL_SIDE_CHANNEL_PORT=<nixl_port_base + rank*100>`, `CUDA_VISIBLE_DEVICES=<gpus>`,
 3. injects role-specific Dynamo args (kv_role / disaggregation_mode — see above),
-4. passes `--max-model-len`, `--max-num-batched-tokens`, `--max-num-seqs`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--kv-transfer-config` (with `kv_connector`), `--override-generation-config` (from `vllm.override_generation_config`, when non-null) plus `vllm.extra_args`,
+4. passes `--tensor-parallel-size <tp>`, `--pipeline-parallel-size <pp>`, `--data-parallel-size <dp>` (only when `dp > 1`), `--enable-expert-parallel` (when `ep: true`), `--max-model-len`, `--max-num-batched-tokens`, `--max-num-seqs`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--kv-transfer-config` (with `kv_connector`), `--override-generation-config` (from `vllm.override_generation_config`, when non-null) plus `vllm.extra_args`,
 5. spawns the worker locally. (Multi-node SSH spawn is TBD; for now keep all worker hosts at 127.0.0.1.)
 
 `up frontend` starts `dynamo.frontend` with `--http-host`, `--http-port`, `--router-mode`, `--discovery-backend`, `--request-plane`, and `--event-plane` from yaml, exporting `NATS_SERVER` and `ETCD_ENDPOINTS` into the child env. Assumes NATS and etcd (or whichever discovery backend is configured) are reachable.
@@ -424,6 +429,7 @@ Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > buil
 - **Two different "prompt" measurement layers — don't conflate them.** (1) The OpenCode **profile** snapshot (`OPENCODE_PROFILE`, `turn.start.{system,messages}`) records the prompt as OpenCode *builds* it: the AI-SDK `messages` array + `system` strings, **before** any chat template — and `OPENCODE_PROFILE_MESSAGES=head` truncates each part to 200 chars. (2) The **engine-prompt dump** (`DYN_PROMPT_DUMP`, `dynamo-prompt-dump.patch`) records the prompt as the **vLLM engine** receives it: the frontend-applied chat-template `token_ids`, detokenized to one flat text string, untruncated. The chat template (role tags, tool-call formatting, BOS/special tokens) is applied **frontend-side in Rust**, so it appears ONLY in layer (2). If the question is "what tokens does the model actually process," it's (2); if it's "what did OpenCode assemble/send," it's (1). They will not match character-for-character.
 - **Each PD worker needs a unique NIXL side-channel port.** vLLM defaults all workers to 5600 and they collide on a single host. `testbed.sh` exports `VLLM_NIXL_SIDE_CHANNEL_HOST` (per worker, from `worker.host`) and `VLLM_NIXL_SIDE_CHANNEL_PORT` (`nixl_port_base + rank*100`). Do not rely on vLLM defaults.
 - **kv_role + disaggregation_mode are derived, not configured.** Workers in `prefill_workers` get `--disaggregation-mode prefill` and `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`; `decode_workers` get the `decode`/`kv_consumer` variant.
+- **EP/DP are per-worker, not global.** Each worker entry can carry `dp` (`--data-parallel-size`, default 1, flag emitted only when `>1`) and `ep` (`--enable-expert-parallel`, default false). EP shards MoE experts across the `tp*dp` ranks (EP size derived by vLLM), so it's a bare toggle that does NOT change the `tp*pp*dp` GPU-count invariant. Both are plain pass-throughs to `AsyncEngineArgs` (`dynamo.vllm` exposes the full vLLM arg surface via `AsyncEngineArgs.add_cli_args(..., async_args_only=False)`).
 - **etcd and NATS are external.** Discovery is etcd by default; NATS is the request/event plane. `testbed.sh up etcd` and `testbed.sh up nats` are single-node conveniences only.
 - **`bun dev` vs `bun run dev`**: `bun dev` is the bun shorthand and `bun run dev` is the explicit form; both invoke the `dev` script from `opencode/package.json`. `--hostname` (not `--host`) is the OpenCode flag — see `opencode/packages/opencode/src/cli/network.ts`.
 - **OpenCode session ids are server-generated** and match `^ses.*` (per the SDK schema). The runner stores them as `session_id` in the trace; `directory` is the runner-chosen workspace folder name.

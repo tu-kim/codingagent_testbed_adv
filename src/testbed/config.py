@@ -156,6 +156,8 @@ class WorkerCfg(_Strict):
     gpus: str
     tp: int
     pp: int
+    dp: int = 1          # --data-parallel-size (1 = off; pairs with ep for MoE)
+    ep: bool = False     # --enable-expert-parallel (MoE expert sharding; EP size = tp*dp)
 
     @field_validator("gpus")
     @classmethod
@@ -168,11 +170,15 @@ class WorkerCfg(_Strict):
         return len([g for g in self.gpus.split(",") if g.strip()])
 
     def validate_against_parallelism(self) -> None:
-        expected = self.tp * self.pp
+        # Total ranks = tp * pp * dp. Expert parallelism (ep) shards MoE
+        # experts across the tp*dp ranks; it does NOT add ranks, so it
+        # doesn't enter the GPU-count equation.
+        expected = self.tp * self.pp * self.dp
         if self.gpu_count() != expected:
             raise ValueError(
                 f"worker {self.name!r}: gpus has {self.gpu_count()} entries "
-                f"but tp*pp = {expected} (gpus={self.gpus!r}, tp={self.tp}, pp={self.pp})"
+                f"but tp*pp*dp = {expected} (gpus={self.gpus!r}, "
+                f"tp={self.tp}, pp={self.pp}, dp={self.dp})"
             )
 
 

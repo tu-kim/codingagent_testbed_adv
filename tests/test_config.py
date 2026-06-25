@@ -61,6 +61,45 @@ def test_gpu_count_validator_rejects_mismatch(tmp_path: Path):
         cfg_mod.load(p, environ={})
 
 
+def test_worker_dp_ep_default_off(tmp_path: Path):
+    # Workers omitting dp/ep get dp=1, ep=False; tp*pp*dp == gpu_count holds.
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
+    w = cfg.vllm.prefill_workers[0]
+    assert w.dp == 1
+    assert w.ep is False
+
+
+def test_worker_dp_widens_gpu_count_requirement(tmp_path: Path):
+    # dp=2 with tp=2 requires 4 gpus; 2 gpus must now be rejected.
+    bad = yaml.safe_load(_BASE_YAML)
+    bad["vllm"]["prefill_workers"][0]["dp"] = 2  # tp*pp*dp = 4, gpus="0,1" = 2
+    p = tmp_path / "bad_dp.yaml"
+    p.write_text(yaml.safe_dump(bad))
+    with pytest.raises(ValidationError):
+        cfg_mod.load(p, environ={})
+
+
+def test_worker_dp_ep_accepted_when_gpu_count_matches(tmp_path: Path):
+    good = yaml.safe_load(_BASE_YAML)
+    good["vllm"]["prefill_workers"][0].update(gpus="0,1,2,3", dp=2, ep=True)
+    p = tmp_path / "good_dp.yaml"
+    p.write_text(yaml.safe_dump(good))
+    cfg = cfg_mod.load(p, environ={})
+    w = cfg.vllm.prefill_workers[0]
+    assert w.dp == 2 and w.ep is True
+
+
+def test_worker_ep_does_not_change_gpu_count(tmp_path: Path):
+    # ep:true is a bare toggle — it must NOT alter the tp*pp*dp invariant,
+    # so tp=2,pp=1,dp=1 still needs exactly 2 gpus with ep enabled.
+    cfg = yaml.safe_load(_BASE_YAML)
+    cfg["vllm"]["prefill_workers"][0]["ep"] = True  # gpus="0,1" still == tp*pp*dp=2
+    p = tmp_path / "ep.yaml"
+    p.write_text(yaml.safe_dump(cfg))
+    loaded = cfg_mod.load(p, environ={})  # must not raise
+    assert loaded.vllm.prefill_workers[0].ep is True
+
+
 def test_router_mode_enum_rejects_unknown(tmp_path: Path):
     env = {"TESTBED__DYNAMO__ROUTER_MODE": "junk"}
     with pytest.raises(ValidationError):

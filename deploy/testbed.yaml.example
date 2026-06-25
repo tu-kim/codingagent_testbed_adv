@@ -101,11 +101,19 @@ vllm:
   #   host: where this worker is deployed. Default 127.0.0.1.
   #         Doubles as VLLM_NIXL_SIDE_CHANNEL_HOST for that worker.
   #         Single-node only at present; multi-node SSH spawn is TBD.
-  #   gpus: comma-separated GPU ids. Must satisfy len(split(',')) == tp * pp.
+  #   gpus: comma-separated GPU ids. Must satisfy len(split(',')) == tp*pp*dp.
+  #   tp:   --tensor-parallel-size.  pp: --pipeline-parallel-size.
+  #   dp:   --data-parallel-size (optional, default 1; only emitted when >1).
+  #   ep:   --enable-expert-parallel (optional, default false). For MoE models
+  #         (e.g. MiniMax M2) it shards experts across the tp*dp ranks. EP size
+  #         is derived by vLLM (= tp*dp), so this is a bare on/off toggle and
+  #         does NOT add GPUs to the tp*pp*dp count. Common MoE recipe: leave
+  #         dp:1 and set ep:true to get tp-way expert parallelism over the same
+  #         GPUs; raise dp for attention data-parallel + wider EP.
   prefill_workers:
-    - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1 }
+    - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1, dp: 1, ep: true }
   decode_workers:
-    - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1 }
+    - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1, dp: 1, ep: true }
 
   prefill:
     max_model_len: 32768

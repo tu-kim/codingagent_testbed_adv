@@ -101,19 +101,44 @@ kill_port() {
 #   $1 role (prefill|decode), $2 entry json (compact), $3 rank
 spawn_worker() {
   local role="$1" entry="$2" rank="$3"
-  local name host gpus tp pp
+  local name host gpus tp pp dp ep
   name=$(echo "$entry" | yq -r '.name')
   host=$(echo "$entry" | yq -r '.host // "127.0.0.1"')
   gpus=$(echo "$entry" | yq -r '.gpus')
   tp=$(echo "$entry" | yq -r '.tp')
   pp=$(echo "$entry" | yq -r '.pp')
+  dp=$(echo "$entry" | yq -r '.dp // 1')
+  ep=$(echo "$entry" | yq -r '.ep // false')
+
+  # dp feeds arithmetic ($((tp*pp*dp))); a non-numeric value (e.g. dp: auto,
+  # or a yaml typo) would be dereferenced as a varname and abort under
+  # `set -u` before any clear message. Validate to a clean return 2 instead.
+  if [[ ! "$dp" =~ ^[0-9]+$ ]] || [[ "$dp" -lt 1 ]]; then
+    echo "worker $name: dp=$dp is not a positive integer" >&2
+    return 2
+  fi
 
   local gpu_count
   gpu_count=$(awk -F, '{print NF}' <<<"$gpus")
-  if [[ "$gpu_count" != "$((tp * pp))" ]]; then
-    echo "worker $name: gpus=$gpus has $gpu_count entries but tp*pp=$((tp * pp))" >&2
+  if [[ "$gpu_count" != "$((tp * pp * dp))" ]]; then
+    echo "worker $name: gpus=$gpus has $gpu_count entries but tp*pp*dp=$((tp * pp * dp))" >&2
     return 2
   fi
+
+  # Parallelism flags forwarded to AsyncEngineArgs.add_cli_args
+  # (dynamo/components/src/dynamo/vllm/args.py:93). --data-parallel-size is
+  # only passed when dp>1 to keep the single-rank path byte-identical and
+  # avoid perturbing dynamo's DP-range handling (llm_engine.py:282-283).
+  # --enable-expert-parallel shards MoE experts across the tp*dp ranks
+  # (e.g. MiniMax M2); vLLM derives EP size, so it's a bare toggle.
+  local -a dp_flag=()
+  if [[ "$dp" -gt 1 ]]; then
+    dp_flag=(--data-parallel-size "$dp")
+  fi
+  local -a ep_flag=()
+  case "$ep" in
+    true) ep_flag=(--enable-expert-parallel) ;;
+  esac
 
   local model_name model_served
   model_name=$(cfg_get .model.name)
@@ -296,6 +321,8 @@ spawn_worker() {
       --served-model-name "$model_served" \
       --tensor-parallel-size "$tp" \
       --pipeline-parallel-size "$pp" \
+      ${dp_flag[@]+"${dp_flag[@]}"} \
+      ${ep_flag[@]+"${ep_flag[@]}"} \
       --max-model-len "$mml" \
       --max-num-batched-tokens "$mnbt" \
       --max-num-seqs "$mns" \
