@@ -137,21 +137,26 @@ def test_rendered_template_accepts_nonzero_sampling():
     assert cfg["agent"]["build"]["top_p"] == 0.9
 
 
-def test_rendered_template_allows_edit_bash_webfetch_permissions():
+def test_rendered_template_permission_is_catchall_allow():
     """Headless hang-prevention invariant (sibling to OPENCODE_CLIENT=server
-    for the question tool). opencode's permission evaluate() defaults to
-    "ask" when no rule matches (permission/evaluate.ts), and write/edit/bash/
-    webfetch call ctx.ask(...) which blocks on Deferred.await forever with no
-    human approver -- e.g. a write to /tmp (outside the workspace) hangs the
-    agent loop until --task-timeout-s. The template must pin these to "allow"."""
+    for the question tool). opencode's permission evaluate() defaults to "ask"
+    when no rule matches; the asking tools block on Deferred.await forever with
+    no human approver. A write to /tmp (outside the workspace) does NOT trigger
+    the `edit` permission first -- write.ts calls assertExternalDirectoryEffect
+    BEFORE the edit ask, which asks `external_directory` (only Truncate.GLOB is
+    allowed by default, not arbitrary /tmp). So allowing just edit/bash/webfetch
+    is insufficient and still hangs. The fix is a catch-all `{"*": "allow"}`
+    that covers every gate (edit, bash, webfetch, external_directory, doom_loop,
+    ...). opencode's Wildcard `*` compiles to `.*` with the dotall flag, so the
+    `*` pattern matches deep external paths with slashes too."""
     cfg = _render()
     perm = cfg.get("permission")
     assert isinstance(perm, dict), "rendered template missing top-level 'permission' block"
-    for key in ("edit", "bash", "webfetch"):
-        assert perm.get(key) == "allow", (
-            f"permission.{key} must be 'allow' to prevent headless approval hangs, "
-            f"got {perm.get(key)!r}"
-        )
+    assert perm.get("*") == "allow", (
+        f"permission must be catch-all {{'*': 'allow'}} to prevent headless "
+        f"approval hangs (incl. external_directory for out-of-tree writes), "
+        f"got {perm!r}"
+    )
 
 
 def test_rendered_template_pins_model_to_provider_slash_served_name():
