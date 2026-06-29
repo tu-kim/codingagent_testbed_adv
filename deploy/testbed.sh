@@ -36,6 +36,25 @@ cfg_get_env() {
   fi
 }
 
+# Tri-state bool toggle: env (TESTBED__$1) > yaml ($2), normalized to
+# canonical lowercase true/false. config.py parses env values through
+# yaml.safe_load (YAML 1.1 booleans: True/yes/on/y, False/no/off/n) and
+# pydantic coerces 1/0 -> bool, so a user could set e.g.
+# TESTBED__VLLM__ENFORCE_EAGER=True and have config.json record `true`.
+# Without this normalization the caller's lowercase-only `case` arms would
+# miss that spelling -> no flag passed -> config.json/worker drift (the
+# exact bug this whole helper-conversion fixes). Anything else (null/"")
+# passes through and stays unmatched downstream -> flag omitted.
+# Usage: case "$(cfg_bool VLLM__ENFORCE_EAGER '.vllm.enforce_eager // ""')" in ...
+cfg_bool() {
+  local v; v=$(cfg_get_env "$1" "$2")
+  case "${v,,}" in
+    y|yes|on|true|1)   printf 'true\n' ;;
+    n|no|off|false|0)  printf 'false\n' ;;
+    *)                 printf '%s\n' "$v" ;;
+  esac
+}
+
 pid_file() { printf '%s/%s.pid' "$LOG_DIR" "$1"; }
 log_file() { printf '%s/%s.log' "$LOG_DIR" "$1"; }
 
@@ -212,13 +231,19 @@ spawn_worker() {
   # 149 (tool_call_parser); `null` and `""` are both unmatched by the
   # true/false case arms so behavior is identical, but the empty-
   # string form keeps grep "// \"\"" able to find every fallback.
+  # cfg_bool (env > yaml, NOT plain cfg_get) so a TESTBED__VLLM__* env
+  # override is honored on the SHELL side too -- config.py already honors it
+  # on the Python side, so without this the run's config.json (Python
+  # snapshot) could record false while the workers actually launched with
+  # vLLM's default True. cfg_bool also normalizes boolean spelling to match
+  # config.py's yaml.safe_load parsing. Same precedence as the rest: env > yaml.
   local -a prefix_flag=()
-  case "$(cfg_get '.vllm.enable_prefix_caching // ""')" in
+  case "$(cfg_bool VLLM__ENABLE_PREFIX_CACHING '.vllm.enable_prefix_caching // ""')" in
     true)  prefix_flag=(--enable-prefix-caching) ;;
     false) prefix_flag=(--no-enable-prefix-caching) ;;
   esac
   local -a chunked_flag=()
-  case "$(cfg_get '.vllm.enable_chunked_prefill // ""')" in
+  case "$(cfg_bool VLLM__ENABLE_CHUNKED_PREFILL '.vllm.enable_chunked_prefill // ""')" in
     true)  chunked_flag=(--enable-chunked-prefill) ;;
     false) chunked_flag=(--no-enable-chunked-prefill) ;;
   esac
@@ -227,12 +252,12 @@ spawn_worker() {
   local seed
   seed=$(cfg_get_env VLLM__SEED '.vllm.seed // 42')
   local -a eager_flag=()
-  case "$(cfg_get '.vllm.enforce_eager // ""')" in
+  case "$(cfg_bool VLLM__ENFORCE_EAGER '.vllm.enforce_eager // ""')" in
     true)  eager_flag=(--enforce-eager) ;;
     false) eager_flag=(--no-enforce-eager) ;;
   esac
   local -a dcar_flag=()
-  case "$(cfg_get '.vllm.disable_custom_all_reduce // ""')" in
+  case "$(cfg_bool VLLM__DISABLE_CUSTOM_ALL_REDUCE '.vllm.disable_custom_all_reduce // ""')" in
     true)  dcar_flag=(--disable-custom-all-reduce) ;;
     # vLLM's flag is `--disable-custom-all-reduce` (boolean store_true);
     # there's no `--no-` partner. Skip the flag to keep custom all-reduce
