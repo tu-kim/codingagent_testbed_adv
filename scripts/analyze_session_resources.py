@@ -354,6 +354,10 @@ def extract_metrics(samples: list[dict],
                 v = float(p["cpu_util_pct"]); _push(metrics, f"process.{name}.cpu_util_pct", v, v, v, 1.0)
             if isinstance(p.get("rss_bytes"), (int, float)) and not isinstance(p["rss_bytes"], bool):
                 v = p["rss_bytes"] / (1 << 30); _push(metrics, f"process.{name}.rss_gib", v, v, v, 1.0)
+            # n_procs = process-tree size summed into cpu/rss (monitor >=
+            # 2026-06; older rows omit it). >1 confirms children were counted.
+            if isinstance(p.get("n_procs"), (int, float)) and not isinstance(p["n_procs"], bool):
+                v = float(p["n_procs"]); _push(metrics, f"process.{name}.n_procs", v, v, v, 1.0)
 
     return metrics
 

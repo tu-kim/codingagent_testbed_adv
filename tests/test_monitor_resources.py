@@ -549,6 +549,9 @@ def test_cpu_sampler_discovers_pids_from_directory(mod, tmp_path, monkeypatch):
         def num_threads(self):
             return 4
 
+        def children(self, recursive=False):
+            return []
+
     fake_psutil.Process.side_effect = FakeProcess
     fake_psutil.NoSuchProcess = Exception
     fake_psutil.AccessDenied = Exception
@@ -573,8 +576,151 @@ def test_cpu_sampler_discovers_pids_from_directory(mod, tmp_path, monkeypatch):
         assert p["cpu_util_pct"] == 42.0
         assert p["rss_bytes"] == 1024 * 1024
         assert p["n_threads"] == 4
+        assert p["n_procs"] == 1   # no children → tree size 1
     assert sample["host"]["n_cores"] == 8
     assert sample["host"]["mem_total_bytes"] == 8 * (1 << 30)
+
+
+def test_cpu_sampler_sums_process_tree(mod, tmp_path, monkeypatch):
+    """The headline fix: cpu/rss/threads are SUMMED over the watched PID
+    plus its recursive children. `bun run dev` (the recorded PID) is an
+    idle launcher; the real opencode server runs in a child that setsid's
+    out -- sampling only the parent reads ~0%. Also pins child warm-up
+    semantics: a child's cpu_percent(interval=None) returns 0.0 on its
+    FIRST sighting (no prior reading to delta against) and the real value
+    only on the NEXT sample, so the cached child object must be reused
+    across samples rather than reconstructed."""
+    fake_psutil = MagicMock()
+    fake_psutil.cpu_percent.return_value = 7.0
+    fake_psutil.cpu_count.return_value = 16
+    fake_psutil.NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+    fake_psutil.AccessDenied = type("AccessDenied", (Exception,), {})
+
+    # cpu_percent warm-up emulation: first call per Process returns 0.0,
+    # subsequent calls return `steady`.
+    class FakeProc:
+        def __init__(self, pid, steady, threads, rss, kids=()):
+            self.pid = pid
+            self._steady = steady
+            self._threads = threads
+            self._rss = rss
+            self._kids = list(kids)
+            self._warmed = False
+
+        def is_running(self): return True
+
+        def cpu_percent(self, interval=None):
+            if not self._warmed:
+                self._warmed = True
+                return 0.0
+            return self._steady
+
+        def oneshot(self):
+            class _Ctx:
+                def __enter__(s): return None
+                def __exit__(s, *a): return False
+            return _Ctx()
+
+        def memory_info(self):
+            m = MagicMock(); m.rss = self._rss; return m
+
+        def num_threads(self): return self._threads
+
+        def children(self, recursive=False):
+            return list(self._kids)
+
+    # child_spec stores the child's parameters so we can manufacture fresh
+    # objects on each parent.children() call.  Real psutil.children() returns
+    # newly-constructed Process objects from the live process table; always
+    # returning the same object would mask a caching-removal regression: the
+    # pre-warmed _warmed flag on the shared object would persist across
+    # samples and the sample-2 assertion (cpu_util_pct==83.0) would pass
+    # even if _tree() dropped its cache entirely.
+    child_spec = dict(pid=1002, steady=80.0, threads=10, rss=200 << 20)
+    parent = FakeProc(1001, steady=3.0, threads=2, rss=50 << 20)
+    # Override children() on the parent instance to return a FRESH FakeProc
+    # on every call.  Without the cache in _tree(), sample 2 would receive a
+    # brand-new _warmed=False object whose cpu_percent() returns 0.0, making
+    # the 83.0 assertion fail and catching the regression.
+    parent.children = lambda recursive=False: [FakeProc(**child_spec)]
+
+    # Parent is warmed at _refresh_pids() (so it returns 3.0 from sample 1);
+    # the child is only discovered inside sample() and warms there.
+    fake_psutil.Process.side_effect = lambda pid: parent
+    mem = MagicMock(); mem.total = 0; mem.used = 0; mem.available = 0
+    fake_psutil.virtual_memory.return_value = mem
+    monkeypatch.setattr(mod, "_import_psutil", lambda: fake_psutil)
+
+    (tmp_path / "opencode.pid").write_text("1001\n")
+    cpu = mod.CpuSampler(tmp_path)
+
+    # Sample 1: child seen for the first time → contributes 0.0 (warm-up),
+    # but rss/threads/n_procs are summed immediately.
+    s1 = next(p for p in cpu.sample()["processes"] if p["name"] == "opencode")
+    assert s1["n_procs"] == 2, "parent + 1 child must both be counted"
+    assert s1["cpu_util_pct"] == pytest.approx(3.0), "child still warming → 0 this sample"
+    assert s1["rss_bytes"] == (50 << 20) + (200 << 20)
+    assert s1["n_threads"] == 12
+
+    # Sample 2: cached child now warmed → its real 80% is summed in.
+    s2 = next(p for p in cpu.sample()["processes"] if p["name"] == "opencode")
+    assert s2["cpu_util_pct"] == pytest.approx(83.0), (
+        "child must be reused across samples so cpu_percent deltas accrue; "
+        "reconstructing it each tick would peg it at 0.0 forever"
+    )
+    assert s2["n_procs"] == 2
+
+
+def test_cpu_sampler_evicts_dead_children_from_cache(mod, tmp_path, monkeypatch):
+    """Per-request child processes churn. A child present in one sample
+    but gone the next must be dropped from the tree (and its cache entry),
+    not keep contributing a stale reading."""
+    fake_psutil = MagicMock()
+    fake_psutil.cpu_percent.return_value = 0.0
+    fake_psutil.cpu_count.return_value = 8
+    fake_psutil.NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+    fake_psutil.AccessDenied = type("AccessDenied", (Exception,), {})
+
+    class FakeProc:
+        def __init__(self, pid, threads=1, rss=0):
+            self.pid = pid
+            self._threads = threads
+            self._rss = rss
+            self.kids = []
+        def is_running(self): return True
+        def cpu_percent(self, interval=None): return 1.0
+        def oneshot(self):
+            class _Ctx:
+                def __enter__(s): return None
+                def __exit__(s, *a): return False
+            return _Ctx()
+        def memory_info(self):
+            m = MagicMock(); m.rss = self._rss; return m
+        def num_threads(self): return self._threads
+        def children(self, recursive=False): return list(self.kids)
+
+    parent = FakeProc(2001)
+    transient = FakeProc(2002)
+    parent.kids = [transient]
+
+    fake_psutil.Process.side_effect = lambda pid: parent
+    mem = MagicMock(); mem.total = 0; mem.used = 0; mem.available = 0
+    fake_psutil.virtual_memory.return_value = mem
+    monkeypatch.setattr(mod, "_import_psutil", lambda: fake_psutil)
+
+    (tmp_path / "opencode.pid").write_text("2001\n")
+    cpu = mod.CpuSampler(tmp_path)
+
+    s1 = next(p for p in cpu.sample()["processes"] if p["name"] == "opencode")
+    assert s1["n_procs"] == 2
+    assert transient.pid in cpu._children[parent.pid], "child should be cached"
+
+    parent.kids = []  # transient child exited
+    s2 = next(p for p in cpu.sample()["processes"] if p["name"] == "opencode")
+    assert s2["n_procs"] == 1, "dead child must drop out of the tree"
+    assert transient.pid not in cpu._children[parent.pid], (
+        "dead child must be evicted from the cache, not linger"
+    )
 
 
 def test_cpu_sampler_drops_pids_when_file_disappears(mod, tmp_path, monkeypatch):
@@ -603,6 +749,8 @@ def test_cpu_sampler_drops_pids_when_file_disappears(mod, tmp_path, monkeypatch)
             m = MagicMock(); m.rss = 0; return m
 
         def num_threads(self): return 1
+
+        def children(self, recursive=False): return []
 
     fake_psutil.Process.side_effect = FakeProcess
     mem = MagicMock(); mem.total = 0; mem.used = 0; mem.available = 0
@@ -653,6 +801,8 @@ def test_cpu_sampler_replaces_dead_process_when_pidfile_unchanged(mod, tmp_path,
             m = MagicMock(); m.rss = 0; return m
 
         def num_threads(self): return 1
+
+        def children(self, recursive=False): return []
 
     fake_psutil.Process.side_effect = FakeProcess
     mem = MagicMock(); mem.total = 0; mem.used = 0; mem.available = 0

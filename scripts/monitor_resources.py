@@ -44,7 +44,14 @@ buffered value rather than a window mean so downstream `last-current
 CPU side (via psutil):
   host        cpu_util_pct, load_1min, n_cores, mem (used / total / available)
   processes[] each watched PID gets cpu_util_pct (0-100 × n_cores when
-              multi-threaded), rss_bytes, n_threads, name (from .pid stem)
+              multi-threaded), rss_bytes, n_threads, n_procs, name (from
+              .pid stem). cpu_util_pct / rss_bytes / n_threads are SUMMED
+              over the whole process TREE (the watched PID + all recursive
+              children), because launchers fork the real worker into a
+              child that setsid's out of the parent (e.g. `bun run dev`
+              spawns the actual opencode server child) -- sampling only the
+              recorded PID then reads ~0%. n_procs is the tree size that
+              contributed to the sum.
 
 PIDs to watch are auto-discovered from `*.pid` files under the
 directory passed to `--pids-from` (testbed.sh writes each component's
@@ -490,6 +497,11 @@ class CpuSampler:
         self._psutil = _import_psutil()
         self._pids_dir = pids_dir
         self._procs: dict[str, "self._psutil.Process"] = {}
+        # Cached recursive-child Process objects, keyed by watched-parent pid
+        # then child pid. Reused across samples so each child's
+        # cpu_percent(interval=None) has a prior reading to delta against --
+        # a freshly-constructed Process always reports 0.0 on its first call.
+        self._children: dict[int, dict[int, "self._psutil.Process"]] = {}
         # warm up cpu_percent so the next call returns real numbers
         self._psutil.cpu_percent(interval=None)
         self._refresh_pids()
@@ -511,12 +523,46 @@ class CpuSampler:
             try:
                 p = self._psutil.Process(pid)
                 p.cpu_percent(interval=None)  # warm up per-process
+                # PID for this name changed (or first sighting) -> the old
+                # parent's child cache is stale.
+                if existing is not None:
+                    self._children.pop(existing.pid, None)
                 self._procs[name] = p
             except (self._psutil.NoSuchProcess, self._psutil.AccessDenied):
                 pass
-        # Drop processes whose .pid file disappeared.
+        # Drop processes whose .pid file disappeared (and their child cache).
         for stale in [n for n in self._procs if n not in seen]:
-            self._procs.pop(stale, None)
+            p = self._procs.pop(stale, None)
+            if p is not None:
+                self._children.pop(p.pid, None)
+
+    def _tree(self, parent) -> list:
+        """The watched parent plus its live recursive children, as Process
+        objects CACHED across samples (keyed by parent pid). Caching is what
+        makes child CPU readings meaningful: cpu_percent(interval=None) is a
+        delta against the object's PREVIOUS call, so the same object must
+        persist. A first-sighted child is cached and included now -- the
+        single cpu_percent() call sample() makes per proc doubles as its
+        warm-up (returns 0.0 this sample, real delta next sample); its
+        rss/threads still count immediately. Dead children are evicted."""
+        procs = [parent]
+        cache = self._children.setdefault(parent.pid, {})
+        try:
+            kids = parent.children(recursive=True)
+        except (self._psutil.NoSuchProcess, self._psutil.AccessDenied):
+            kids = []
+        live: set[int] = set()
+        for k in kids:
+            live.add(k.pid)
+            cached = cache.get(k.pid)
+            if cached is not None and cached.pid == k.pid and cached.is_running():
+                procs.append(cached)
+            else:
+                cache[k.pid] = k   # first sighting: cache + include
+                procs.append(k)
+        for dead in [pid for pid in cache if pid not in live]:
+            cache.pop(dead, None)
+        return procs
 
     def sample(self) -> dict:
         self._refresh_pids()
@@ -531,21 +577,38 @@ class CpuSampler:
         }
         processes: list[dict] = []
         for name in list(self._procs.keys()):
-            p = self._procs[name]
+            parent = self._procs[name]
             try:
-                with p.oneshot():
-                    cpu_pct = p.cpu_percent(interval=None)
-                    rss = p.memory_info().rss
-                    n_threads = p.num_threads()
-                processes.append({
-                    "name": name,
-                    "pid": p.pid,
-                    "cpu_util_pct": cpu_pct,
-                    "rss_bytes": rss,
-                    "n_threads": n_threads,
-                })
+                # Existence/perm check on the parent up front so a dead watched
+                # PID is dropped (and its child cache cleaned) like before.
+                if not parent.is_running():
+                    raise self._psutil.NoSuchProcess(parent.pid)
             except (self._psutil.NoSuchProcess, self._psutil.AccessDenied):
                 self._procs.pop(name, None)
+                self._children.pop(parent.pid, None)
+                continue
+            # Sum cpu/rss/threads over the whole tree (parent + children).
+            cpu_pct = 0.0
+            rss = 0
+            n_threads = 0
+            n_procs = 0
+            for q in self._tree(parent):
+                try:
+                    with q.oneshot():
+                        cpu_pct += q.cpu_percent(interval=None)
+                        rss += q.memory_info().rss
+                        n_threads += q.num_threads()
+                    n_procs += 1
+                except (self._psutil.NoSuchProcess, self._psutil.AccessDenied):
+                    continue  # process vanished mid-walk; just skip it
+            processes.append({
+                "name": name,
+                "pid": parent.pid,
+                "cpu_util_pct": cpu_pct,
+                "rss_bytes": rss,
+                "n_threads": n_threads,
+                "n_procs": n_procs,
+            })
         return {"host": host, "processes": processes}
 
 
