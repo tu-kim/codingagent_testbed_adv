@@ -410,6 +410,8 @@ Anything in `testbed.yaml` can be overridden by a `TESTBED__<section>__<key>` en
 
 Resolution precedence: **CLI flag > `TESTBED__*` env var > `testbed.yaml` > built-in default**.
 
+Worker and model knobs are consumed at component **launch time** (`up workers`, `up opencode`). Setting or changing a `TESTBED__*` env var or editing `testbed.yaml` after a component is already running has no effect until you restart that component (`down workers && up workers`). The env must be present in the shell that invokes `testbed.sh up workers`, not just exported somewhere else.
+
 ## Conventions / gotchas
 
 - **Reproducible sampling targets OUTPUT TEXT, not bit-level intermediate tensors.** The internal floating-point math is allowed to drift across runs as long as the argmax token at each step stays the same. The default recipe in `testbed.yaml` pins JUST what's free (seeds + greedy) and leaves vLLM's throughput optimizations on:

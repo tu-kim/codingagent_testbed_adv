@@ -159,22 +159,36 @@ spawn_worker() {
     true) ep_flag=(--enable-expert-parallel) ;;
   esac
 
+  # All worker knobs read via cfg_get_env (env > yaml) so a TESTBED__* env
+  # override is honored on the SHELL side too -- config.py honors it on the
+  # Python side, so plain cfg_get here would let a run's config.json record
+  # the env value while the worker launched with the yaml value (silent
+  # provenance drift). Role-nested fields use the ${role^^} segment to match
+  # config.py's TESTBED__VLLM__PREFILL__<KEY> / __DECODE__<KEY> convention.
   local model_name model_served
-  model_name=$(cfg_get .model.name)
-  model_served=$(cfg_get .model.served_name)
+  model_name=$(cfg_get_env MODEL__NAME .model.name)
+  model_served=$(cfg_get_env MODEL__SERVED_NAME .model.served_name)
 
   local nixl_base
-  nixl_base=$(cfg_get .vllm.nixl_port_base)
+  nixl_base=$(cfg_get_env VLLM__NIXL_PORT_BASE .vllm.nixl_port_base)
+  # nixl_base feeds arithmetic ($((nixl_base + rank*100))); a non-numeric value
+  # (yaml omission -> "null", or a TESTBED__VLLM__NIXL_PORT_BASE typo) would be
+  # dereferenced as a varname and abort under set -u. Guard like dp above.
+  if [[ ! "$nixl_base" =~ ^[0-9]+$ ]]; then
+    echo "worker $name: nixl_port_base=$nixl_base is not a non-negative integer" >&2
+    return 2
+  fi
 
+  local role_uc="${role^^}"
   local mml mnbt mns gmu kvdtype
-  mml=$(cfg_get ".vllm.${role}.max_model_len")
-  mnbt=$(cfg_get ".vllm.${role}.max_num_batched_tokens")
-  mns=$(cfg_get ".vllm.${role}.max_num_seqs")
-  gmu=$(cfg_get ".vllm.${role}.gpu_memory_utilization")
-  kvdtype=$(cfg_get ".vllm.${role}.kv_cache_dtype")
+  mml=$(cfg_get_env "VLLM__${role_uc}__MAX_MODEL_LEN" ".vllm.${role}.max_model_len")
+  mnbt=$(cfg_get_env "VLLM__${role_uc}__MAX_NUM_BATCHED_TOKENS" ".vllm.${role}.max_num_batched_tokens")
+  mns=$(cfg_get_env "VLLM__${role_uc}__MAX_NUM_SEQS" ".vllm.${role}.max_num_seqs")
+  gmu=$(cfg_get_env "VLLM__${role_uc}__GPU_MEMORY_UTILIZATION" ".vllm.${role}.gpu_memory_utilization")
+  kvdtype=$(cfg_get_env "VLLM__${role_uc}__KV_CACHE_DTYPE" ".vllm.${role}.kv_cache_dtype")
 
   local extra_args
-  extra_args=$(cfg_get '.vllm.extra_args // ""')
+  extra_args=$(cfg_get_env VLLM__EXTRA_ARGS '.vllm.extra_args // ""')
 
   # Role-specific kv-transfer-config JSON (kept as a single arg).
   local disagg_mode kv_role
@@ -183,14 +197,19 @@ spawn_worker() {
   else
     disagg_mode=decode;  kv_role=kv_consumer
   fi
-  local kv_cfg="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"$kv_role\"}"
+  # kv_connector was hardcoded; read it (env > yaml, default NixlConnector so
+  # yaml omission keeps the old behavior) so config.py's vllm.kv_connector
+  # field is actually honored shell-side instead of being a dead config knob.
+  local kv_connector
+  kv_connector=$(cfg_get_env VLLM__KV_CONNECTOR '.vllm.kv_connector // "NixlConnector"')
+  local kv_cfg="{\"kv_connector\":\"$kv_connector\",\"kv_role\":\"$kv_role\"}"
 
   # --dyn-tool-call-parser is decode-only (dynamo/components/src/dynamo/vllm/main.py:723-724).
   # Empty value => skip the flag entirely.
   local -a tool_parser_args=()
   if [[ "$role" == "decode" ]]; then
     local tool_parser
-    tool_parser=$(cfg_get '.vllm.tool_call_parser // ""')
+    tool_parser=$(cfg_get_env VLLM__TOOL_CALL_PARSER '.vllm.tool_call_parser // ""')
     if [[ -n "$tool_parser" ]]; then
       tool_parser_args=(--dyn-tool-call-parser "$tool_parser")
     fi
@@ -202,7 +221,7 @@ spawn_worker() {
   local -a reasoning_parser_args=()
   if [[ "$role" == "decode" ]]; then
     local reasoning_parser
-    reasoning_parser=$(cfg_get '.vllm.reasoning_parser // ""')
+    reasoning_parser=$(cfg_get_env VLLM__REASONING_PARSER '.vllm.reasoning_parser // ""')
     if [[ -n "$reasoning_parser" ]]; then
       reasoning_parser_args=(--dyn-reasoning-parser "$reasoning_parser")
     fi
@@ -219,7 +238,13 @@ spawn_worker() {
   # Worker rank N → port = base + N (DCGM-style; collisions if base+N
   # overlaps another listener). Set system_port_base <= 0 to disable.
   local sys_port_base sys_port=-1
-  sys_port_base=$(cfg_get '.vllm.system_port_base // -1')
+  sys_port_base=$(cfg_get_env VLLM__SYSTEM_PORT_BASE '.vllm.system_port_base // -1')
+  # Feeds `-gt` and $((...)); a non-numeric env value would abort under set -u.
+  # Allow a leading '-' so the -1 disable sentinel (and negatives) stay valid.
+  if [[ ! "$sys_port_base" =~ ^-?[0-9]+$ ]]; then
+    echo "worker $name: system_port_base=$sys_port_base is not an integer" >&2
+    return 2
+  fi
   if [[ "$sys_port_base" -gt 0 ]]; then
     sys_port=$((sys_port_base + rank))
   fi
@@ -227,10 +252,8 @@ spawn_worker() {
   # vLLM tri-state toggles forwarded as paired CLI flags. Null/missing
   # = don't pass either; vLLM v1 default is enable_prefix_caching=True
   # (dynamo/components/src/dynamo/vllm/args.py:225-230).
-  # `// ""` matches the convention used at lines 133 (extra_args) and
-  # 149 (tool_call_parser); `null` and `""` are both unmatched by the
-  # true/false case arms so behavior is identical, but the empty-
-  # string form keeps grep "// \"\"" able to find every fallback.
+  # `// ""` is the no-value sentinel: `null` and `""` are both unmatched by
+  # the true/false case arms so the flag is omitted (vLLM default kept).
   # cfg_bool (env > yaml, NOT plain cfg_get) so a TESTBED__VLLM__* env
   # override is honored on the SHELL side too -- config.py already honors it
   # on the Python side, so without this the run's config.json (Python
@@ -317,6 +340,11 @@ spawn_worker() {
   local prompt_dump_enabled="${DYN_PROMPT_DUMP:-}"
   if [[ -n "$prompt_dump_enabled" && "$prompt_dump_enabled" != "0" && "$prompt_dump_enabled" != "false" ]]; then
     local ws_root prompt_dir
+    # plain cfg_get (NOT cfg_get_env): config.py's TESTBED__ env regex requires
+    # >=2 __-separated segments, so TESTBED__WORKSPACE_ROOT is NOT honored
+    # Python-side (runner.py clones + records config.json from the yaml value).
+    # Honoring it shell-side would split prompt dirs from where runner put the
+    # session workspaces -- the inverse of the drift this sweep fixes.
     ws_root=$(cfg_get .workspace_root)
     prompt_dir="${DYN_PROMPT_DUMP_DIR:-${ws_root}/prompts}"
     mkdir -p "$prompt_dir"
@@ -412,8 +440,8 @@ render_opencode_config() {
   local dynamo_host dynamo_port served name provider_id temperature top_p
   dynamo_host=$(cfg_get_env DYNAMO__HOST .dynamo.host)
   dynamo_port=$(cfg_get_env DYNAMO__PORT .dynamo.port)
-  served=$(cfg_get .model.served_name)
-  name=$(cfg_get .model.name)
+  served=$(cfg_get_env MODEL__SERVED_NAME .model.served_name)
+  name=$(cfg_get_env MODEL__NAME .model.name)
   # Sampling overrides applied to every primary agent so reproducible
   # runs don't get the provider-transform default (qwen → 0.55).
   # `// 0.0` / `// 1.0` fallbacks mirror the `// ""` pattern at
@@ -460,6 +488,9 @@ up_opencode() {
   local profile_enabled="${OPENCODE_PROFILE:-}"
   if [[ -n "$profile_enabled" && "$profile_enabled" != "0" && "$profile_enabled" != "false" ]]; then
     local workspace_root profile_dir
+    # plain cfg_get (NOT cfg_get_env): see the spawn_worker prompt-dump note --
+    # TESTBED__WORKSPACE_ROOT is not honored by config.py, so the shell must
+    # read the same yaml value runner.py uses or profiles split from sessions.
     workspace_root=$(cfg_get .workspace_root)
     profile_dir="${OPENCODE_PROFILE_DIR:-${workspace_root}/profiles}"
     mkdir -p "$profile_dir"
