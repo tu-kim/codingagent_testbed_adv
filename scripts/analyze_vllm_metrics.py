@@ -230,8 +230,13 @@ def collect_series(rows: list[dict], cls: dict[str, str]):
                 elif kind == "counter":
                     counters[key].append((ts, float(value)))
                 elif kind == "histogram_count":
+                    # Strip the `_count` suffix so bucket/count/sum for the
+                    # same histogram share one SeriesKey (see bucket branch).
+                    key = _series_key(row, name[:-6], labels)
                     histograms[key]["count"].append((ts, float(value)))
                 elif kind == "histogram_sum":
+                    # Strip the `_sum` suffix to share the base SeriesKey.
+                    key = _series_key(row, name[:-4], labels)
                     histograms[key]["sum"].append((ts, float(value)))
                 elif kind == "histogram_bucket":
                     le = labels.get("le")
