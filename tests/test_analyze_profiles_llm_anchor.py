@@ -204,7 +204,7 @@ def test_turn_share_distribution_figure_created(mod, tmp_path):
     outdir = tmp_path / "figs"
     outdir.mkdir()
     mod.plot_turn_decomposition(sessions, outdir)
-    fig = outdir / "fig6b_turn_share_distribution.pdf"
+    fig = outdir / "fig6b_turn_share_distribution.png"
     assert fig.exists() and fig.stat().st_size > 0
 
 
@@ -233,8 +233,8 @@ def _run_latency(mod, tmp_path):
 def test_latency_outputs_created(mod, tmp_path):
     outdir = _run_latency(mod, tmp_path)
     for name in ("latency_pooled_share.csv", "latency_per_request_share.csv",
-                 "latency_conditional_by_bucket.csv", "latency_share_violin.pdf",
-                 "latency_sorted_stacked.pdf", "latency_bucket_stacked.pdf"):
+                 "latency_conditional_by_bucket.csv", "latency_share_violin.png",
+                 "latency_sorted_stacked.png", "latency_bucket_stacked.png"):
         f = outdir / name
         assert f.exists() and f.stat().st_size > 0, name
 

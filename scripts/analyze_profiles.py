@@ -23,16 +23,16 @@ Tweak per-call by editing the `if tc.ok` filters and adding an
 `s.aborted` skip if a different policy is needed.
 
 Figures emitted:
-  fig1_session_e2e_latency.pdf   — per-session E2E wall (query.end.duration_s),
+  fig1_session_e2e_latency.png   — per-session E2E wall (query.end.duration_s),
                                    sorted bar chart.
-  fig2_tool_exec_time.pdf        — per-tool execution time mean ± std bar chart.
-  fig3_tool_llm_ratio_turn.pdf   — distribution of (tool_wall / llm_wall) per turn.
-  fig4_tool_llm_ratio_tool.pdf   — per-tool (tool_duration / turn_llm_duration)
+  fig2_tool_exec_time.png        — per-tool execution time mean ± std bar chart.
+  fig3_tool_llm_ratio_turn.png   — distribution of (tool_wall / llm_wall) per turn.
+  fig4_tool_llm_ratio_tool.png   — per-tool (tool_duration / turn_llm_duration)
                                    distribution (boxplot).
-  fig5_tool_tokens.pdf           — for each tool call: (left) turn output tokens
+  fig5_tool_tokens.png           — for each tool call: (left) turn output tokens
                                    that produced the call, (right) input-token
                                    delta added to the next turn by tool results.
-  fig6_turn_decomposition.pdf    — mean turn duration broken into LLM /
+  fig6_turn_decomposition.png    — mean turn duration broken into LLM /
                                    tool / post-overhead segments. Turns that
                                    fired the `task` tool are EXCLUDED wholesale:
                                    `task` runs a nested agent session (its own
@@ -43,14 +43,14 @@ Figures emitted:
                                    separately. Companion stats CSV
                                    (mean/median/p90/p99 per component + average
                                    per-turn ratio).
-  fig6b_turn_share_distribution.pdf — empirical CDF of each component's
+  fig6b_turn_share_distribution.png — empirical CDF of each component's
                                    (llm/tool/others) per-turn share of duration,
                                    overlaid in one graph.
-  fig7_post_overhead_breakdown.pdf — post_overhead (others) split into
+  fig7_post_overhead_breakdown.png — post_overhead (others) split into
                                    snapshot+DB vs the rest (see analyze_post_overhead).
-  latency_share_violin.pdf,        — per-request latency-composition views on the
-  latency_sorted_stacked.pdf,        WALL-CLOCK-anchored components (pooled share,
-  latency_bucket_stacked.pdf         per-request share distribution, and
+  latency_share_violin.png,        — per-request latency-composition views on the
+  latency_sorted_stacked.png,        WALL-CLOCK-anchored components (pooled share,
+  latency_bucket_stacked.png         per-request share distribution, and
   + latency_*.csv                    conditional-by-total-latency-bucket breakdown).
                                    Merged in from the former standalone
                                    analyze_latency_breakdown.py.
@@ -574,7 +574,7 @@ def plot_session_e2e(sessions: dict[str, Session], out: Path) -> Path:
                     stats=("median", "p90", "p99"), fmt=".1f", unit="s")
         ax.set_xlim(-0.5, len(durs) - 0.5)
     fig.tight_layout()
-    path = out / "fig1_session_e2e_latency.pdf"
+    path = out / "fig1_session_e2e_latency.png"
     fig.savefig(path)
     plt.close(fig)
     # Companion CSV: per-session values + summary stats.
@@ -626,7 +626,7 @@ def plot_tool_exec_time(sessions: dict[str, Session], out: Path,
         ax.set_xlim(left=0)
         _annotate_exclusion(ax, exclude_tools)
     fig.tight_layout()
-    path = out / "fig2_tool_exec_time.pdf"
+    path = out / "fig2_tool_exec_time.png"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -639,7 +639,7 @@ def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
         ax.text(0.5, 0.5, "no turns with both tool and llm wall",
                 ha="center", va="center", transform=ax.transAxes)
         fig.tight_layout()
-        path = out / "fig3_tool_llm_ratio_turn.pdf"
+        path = out / "fig3_tool_llm_ratio_turn.png"
         fig.savefig(path)
         plt.close(fig)
         return path
@@ -706,7 +706,7 @@ def plot_ratio_per_turn(sessions: dict[str, Session], out: Path) -> Path:
         if 1.0 <= bulk_cap:
             ax_lo.axvline(1.0, color="0.7", linestyle=":", linewidth=0.5)
         fig.tight_layout(rect=(0, 0.04, 1, 1))
-    path = out / "fig3_tool_llm_ratio_turn.pdf"
+    path = out / "fig3_tool_llm_ratio_turn.png"
     fig.savefig(path)
     plt.close(fig)
     # Companion CSV: per-turn values + summary stats.
@@ -730,7 +730,7 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path,
         ax.text(0.5, 0.5, "no tool/llm pairs",
                 ha="center", va="center", transform=ax.transAxes)
         fig.tight_layout()
-        path = out / "fig4_tool_llm_ratio_tool.pdf"
+        path = out / "fig4_tool_llm_ratio_tool.png"
         fig.savefig(path)
         plt.close(fig)
         return path
@@ -808,7 +808,7 @@ def plot_ratio_per_tool(sessions: dict[str, Session], out: Path,
                      ha="center", va="center", rotation="vertical", fontsize=9)
             fig.tight_layout(rect=(0.05, 0, 1, 1))
             fig.subplots_adjust(hspace=0.08, left=0.18)
-    path = out / "fig4_tool_llm_ratio_tool.pdf"
+    path = out / "fig4_tool_llm_ratio_tool.png"
     fig.savefig(path)
     plt.close(fig)
     # Companion CSV: per-tool-call ratios (no aggregated stats here --
@@ -870,7 +870,7 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path,
         _annotate_exclusion(ax_out, exclude_tools)
 
     fig.tight_layout()
-    path = out / "fig5_tool_tokens.pdf"
+    path = out / "fig5_tool_tokens.png"
     fig.savefig(path)
     plt.close(fig)
 
@@ -943,14 +943,48 @@ def _smooth_cdf(xs, xmax: float):
         x_pts, y_pts = x_pts + [xmax], y_pts + [1.0]
     x_pts, y_pts = np.asarray(x_pts, dtype=float), np.asarray(y_pts, dtype=float)
     if x_pts.size >= 3:
-        try:
-            from scipy.interpolate import PchipInterpolator
-            f = PchipInterpolator(x_pts, y_pts)
-            gx = np.linspace(float(x_pts[0]), float(x_pts[-1]), 400)
-            return gx, np.clip(f(gx), 0.0, 1.0)
-        except Exception:
-            pass
+        gx = np.linspace(float(x_pts[0]), float(x_pts[-1]), 400)
+        return gx, np.clip(_pchip_eval(x_pts, y_pts, gx), 0.0, 1.0)
     return x_pts, y_pts
+
+
+def _pchip_eval(x, y, xq):
+    """Shape-preserving piecewise-cubic Hermite (PCHIP / Fritsch-Carlson) in pure
+    numpy -- monotone, no overshoot, no scipy dependency. `x` strictly increasing."""
+    n = x.size
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    d = np.zeros(n)
+    for i in range(1, n - 1):
+        if delta[i - 1] == 0 or delta[i] == 0 or \
+                np.sign(delta[i - 1]) != np.sign(delta[i]):
+            d[i] = 0.0
+        else:  # weighted harmonic mean of the neighbouring secant slopes
+            w1, w2 = 2 * h[i] + h[i - 1], h[i] + 2 * h[i - 1]
+            d[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i])
+
+    def _end(dl0, dl1, h0, h1):
+        dd = ((2 * h0 + h1) * dl0 - h0 * dl1) / (h0 + h1)
+        if np.sign(dd) != np.sign(dl0):
+            return 0.0
+        if np.sign(dl0) != np.sign(dl1) and abs(dd) > 3 * abs(dl0):
+            return 3 * dl0
+        return dd
+
+    if n >= 3:
+        d[0] = _end(delta[0], delta[1], h[0], h[1])
+        d[-1] = _end(delta[-1], delta[-2], h[-1], h[-2])
+    else:
+        d[0] = d[-1] = delta[0]
+
+    idx = np.clip(np.searchsorted(x, xq, side="right") - 1, 0, n - 2)
+    hi = h[idx]
+    t = (xq - x[idx]) / hi
+    t2, t3 = t * t, t * t * t
+    return ((2 * t3 - 3 * t2 + 1) * y[idx]
+            + (t3 - 2 * t2 + t) * hi * d[idx]
+            + (-2 * t3 + 3 * t2) * y[idx + 1]
+            + (t3 - t2) * hi * d[idx + 1])
 
 
 def _fig_turn_share_dist(share_arrays: dict, share_components, path: Path) -> Path:
@@ -1163,13 +1197,13 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
               columnspacing=0.8, handletextpad=0.3)
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.45)
-    path = out / "fig6_turn_decomposition.pdf"
+    path = out / "fig6_turn_decomposition.png"
     fig.savefig(path)
     plt.close(fig)
 
     # companion: the per-turn share of each component overlaid in one graph
     _fig_turn_share_dist(share_arrays, share_components,
-                         out / "fig6b_turn_share_distribution.pdf")
+                         out / "fig6b_turn_share_distribution.png")
     return path
 
 
@@ -1476,8 +1510,8 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
                   columnspacing=0.8, handletextpad=0.3)
         fig.tight_layout()
         fig.subplots_adjust(bottom=0.55)
-        path = out / ("fig7_post_overhead_breakdown.pdf" if dur_floor is None
-                      else "fig7_post_overhead_breakdown_tail.pdf")
+        path = out / ("fig7_post_overhead_breakdown.png" if dur_floor is None
+                      else "fig7_post_overhead_breakdown_tail.png")
         fig.savefig(path)
         plt.close(fig)
         return path
@@ -1583,9 +1617,9 @@ def analyze_latency_composition(sessions: dict[str, Session], out: Path) -> Path
       latency_conditional_by_bucket.csv -- (3) mean per-request share per component,
                                                conditioned on the total-latency bucket
                                                split at the p50/p90/p99 of duration
-      latency_share_violin.pdf          -- per-component per-request share distribution
-      latency_sorted_stacked.pdf        -- turns sorted by total latency, stacked seconds
-      latency_bucket_stacked.pdf        -- mean share per component per bucket
+      latency_share_violin.png          -- per-component per-request share distribution
+      latency_sorted_stacked.png        -- turns sorted by total latency, stacked seconds
+      latency_bucket_stacked.png        -- mean share per component per bucket
     Returns `out` (or None when there are no turns)."""
     rows = _collect_turn_decomposition(sessions)
     if not rows:
@@ -1695,9 +1729,9 @@ def analyze_latency_composition(sessions: dict[str, Session], out: Path) -> Path
               + " ".join(f"{r[n]:>12.1%}" for n, _, _ in comps))
 
     # ----- figures -----
-    _lat_fig_violin(per_req, comps, out / "latency_share_violin.pdf")
-    _lat_fig_sorted_stacked(dur, comps, out / "latency_sorted_stacked.pdf")
-    _lat_fig_bucket_stacked(cond_rows, comps, out / "latency_bucket_stacked.pdf")
+    _lat_fig_violin(per_req, comps, out / "latency_share_violin.png")
+    _lat_fig_sorted_stacked(dur, comps, out / "latency_sorted_stacked.png")
+    _lat_fig_bucket_stacked(cond_rows, comps, out / "latency_bucket_stacked.png")
     return out
 
 
@@ -1826,7 +1860,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--output", required=True, type=Path,
-        help="Directory to write fig{1..6}_*.pdf into (created if missing)",
+        help="Directory to write fig{1..6}_*.png into (created if missing)",
     )
     ap.add_argument(
         "--exclude-tools", nargs="*", default=[], metavar="NAME",
