@@ -33,9 +33,16 @@ Figures emitted:
                                    that produced the call, (right) input-token
                                    delta added to the next turn by tool results.
   fig6_turn_decomposition.pdf    — mean turn duration broken into LLM /
-                                   tool / post-overhead segments. Companion
-                                   stats CSV (mean/median/p90/p99 per
-                                   component + average per-turn ratio).
+                                   tool / post-overhead segments. Turns that
+                                   fired the `task` tool are EXCLUDED wholesale:
+                                   `task` runs a nested agent session (its own
+                                   LLM + tools) whose wall time lands in this
+                                   turn's tool_wall, so it's downstream LLM
+                                   work, not the plain "one LLM step + local
+                                   tools" shape. Task turns are analyzed
+                                   separately. Companion stats CSV
+                                   (mean/median/p90/p99 per component + average
+                                   per-turn ratio).
 
 Usage:
   scripts/analyze_profiles.py \\
@@ -91,6 +98,13 @@ PAPER_STYLE = {
 
 
 # ---------- data model ----------
+
+
+# OpenCode's `task` tool spawns a nested agent session (its own LLM loop +
+# tools). Its wall time is downstream LLM time, NOT ordinary tool execution,
+# so the turn decomposition splits it into a separate segment. Analyzed in
+# detail elsewhere.
+TASK_TOOL_NAME = "task"
 
 
 @dataclass
@@ -842,12 +856,22 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path,
 
 def _collect_turn_decomposition(sessions: dict[str, Session]):
     """Per-turn (session_id, step, duration_s, llm_wall_s, tool_wall_s,
-    post_overhead_s). Skips turns where the three component fields aren't
-    all present (post_overhead_s is reconstructed from the others when
-    only it is missing -- older patches didn't emit it on turn.end)."""
+    post_overhead_s).
+
+    Turns that fired the `task` tool are EXCLUDED wholesale: `task` spawns
+    a nested agent session (its own LLM loop + tools) whose wall time lands
+    inside this turn's tool_wall_s, so such a turn is really downstream LLM
+    work, not the ordinary "one LLM step + local tools" shape this
+    decomposition characterizes. Task turns are analyzed separately.
+
+    Skips turns where the three turn.end component fields aren't all
+    present (post_overhead_s is reconstructed from the others when only
+    it is missing -- older patches didn't emit it on turn.end)."""
     rows = []
     for sid, s in sorted(sessions.items()):
         for step, t in sorted(s.turns.items()):
+            if any(tc.name == TASK_TOOL_NAME for tc in t.tools):
+                continue
             d, lw, tw = t.turn_duration_s, t.llm_wall_s, t.tool_wall_s
             if d is None or lw is None or tw is None:
                 continue
@@ -878,22 +902,24 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         ("post_overhead_s", post),
     ]
     stats = {name: _summary_stats(vals) for name, vals in components}
+    share_components = ("llm_wall_s", "tool_wall_s", "post_overhead_s")
 
     # Average per-turn share (NOT total ratio -- that would weight long
     # turns more). Skip turns with zero duration to avoid div-by-zero.
     safe = dur > 0
     if safe.any():
+        by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "post_overhead_s": post}
         ratio_mean = {
-            "llm_wall_s": float((llm[safe] / dur[safe]).mean()),
-            "tool_wall_s": float((tool[safe] / dur[safe]).mean()),
-            "post_overhead_s": float((post[safe] / dur[safe]).mean()),
+            name: float((by_name[name][safe] / dur[safe]).mean())
+            for name in share_components
         }
     else:
-        ratio_mean = {"llm_wall_s": 0.0, "tool_wall_s": 0.0, "post_overhead_s": 0.0}
+        ratio_mean = {name: 0.0 for name in share_components}
 
     # ----- stdout pretty table -----
     print()
-    print(f"Per-turn duration decomposition (n={len(rows)} turns):")
+    print(f"Per-turn duration decomposition (n={len(rows)} turns, "
+          f"task-tool turns excluded):")
     hdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
     print(hdr)
     print("-" * len(hdr))
@@ -902,8 +928,8 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         print(f"{name:<18} {s['mean']:>9.3f} {s['median']:>9.3f} "
               f"{s['p90']:>9.3f} {s['p99']:>9.3f}")
     print()
-    print("Average per-turn share of duration:")
-    for name in ("llm_wall_s", "tool_wall_s", "post_overhead_s"):
+    print("Average per-turn share of duration (task-tool turns excluded):")
+    for name in share_components:
         print(f"  {name:<18} {ratio_mean[name]:>7.2%}")
 
     # ----- CSV -----
@@ -919,9 +945,10 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
                 f"{s['mean']:.4f}", f"{s['median']:.4f}",
                 f"{s['p90']:.4f}", f"{s['p99']:.4f}",
             ])
-        f.write("\n# average per-turn share of duration (mean of per-turn ratios)\n")
+        f.write("\n# average per-turn share of duration (mean of per-turn ratios;"
+                " turns that fired the task tool are excluded)\n")
         w.writerow(["component", "mean_ratio"])
-        for name in ("llm_wall_s", "tool_wall_s", "post_overhead_s"):
+        for name in share_components:
             w.writerow([name, f"{ratio_mean[name]:.4f}"])
 
     # ----- figure: horizontal stacked single bar showing mean composition -----
