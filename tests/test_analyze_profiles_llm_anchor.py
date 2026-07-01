@@ -195,6 +195,19 @@ def test_per_turn_csv_has_corrected_columns(mod, tmp_path):
     assert recs[3]["others_true_s"] == ""
 
 
+def test_turn_share_distribution_figure_created(mod, tmp_path):
+    """plot_turn_decomposition also emits the overlaid per-turn share
+    distribution figure."""
+    p = tmp_path / "profiles.jsonl"
+    _write_profiles(p)
+    sessions = mod.load_sessions(p)
+    outdir = tmp_path / "figs"
+    outdir.mkdir()
+    mod.plot_turn_decomposition(sessions, outdir)
+    fig = outdir / "fig6b_turn_share_distribution.pdf"
+    assert fig.exists() and fig.stat().st_size > 0
+
+
 # --------------------------------------------------------------------------
 # analyze_latency_composition (merged from the former analyze_latency_breakdown)
 # --------------------------------------------------------------------------

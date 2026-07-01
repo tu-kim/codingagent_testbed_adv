@@ -43,6 +43,9 @@ Figures emitted:
                                    separately. Companion stats CSV
                                    (mean/median/p90/p99 per component + average
                                    per-turn ratio).
+  fig6b_turn_share_distribution.pdf — per-turn share of each component
+                                   (llm/tool/others) overlaid in one graph
+                                   (histograms + median lines).
   fig7_post_overhead_breakdown.pdf — post_overhead (others) split into
                                    snapshot+DB vs the rest (see analyze_post_overhead).
   latency_share_violin.pdf,        — per-request latency-composition views on the
@@ -921,6 +924,39 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
     return rows
 
 
+_SHARE_COLORS = {"llm_wall_s": "C0", "tool_wall_s": "C2", "others": "0.5"}
+
+
+def _fig_turn_share_dist(share_arrays: dict, share_components, path: Path) -> Path:
+    """Overlaid histograms of each component's per-turn share of duration, in one
+    graph, with a dashed median line per component. Shares are in [0,1] (clipped
+    for the axis; parallel-tool edge cases can nudge tool share past 1)."""
+    fig, ax = plt.subplots(figsize=(4.2, 2.7))
+    bins = np.linspace(0.0, 1.0, 41)
+    any_data = False
+    for name in share_components:
+        v = share_arrays.get(name)
+        if v is None or v.size == 0:
+            continue
+        any_data = True
+        color = _SHARE_COLORS.get(name, "C3")
+        ax.hist(np.clip(v, 0.0, 1.0), bins=bins, histtype="stepfilled", alpha=0.4,
+                color=color, edgecolor=color, linewidth=1.1, label=name)
+        ax.axvline(float(np.median(v)), color=color, linestyle="--", linewidth=0.9)
+    if not any_data:
+        plt.close(fig)
+        return path
+    ax.set_xlabel("per-turn share of duration")
+    ax.set_ylabel("turns")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_title("Per-turn share distribution (dashed = median)", fontsize=9)
+    ax.legend(fontsize=7, frameon=False)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
 def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | None:
     """Mean/median/p90/p99 stats for per-turn duration / llm_wall /
     tool_wall / others, plus the per-turn share distribution. The LLM
@@ -976,13 +1012,11 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     # Skip turns with zero duration to avoid div-by-zero.
     safe = dur > 0
     by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "others": post}
-    if safe.any():
-        share_stats = {
-            name: _summary_stats(by_name[name][safe] / dur[safe])
-            for name in share_components
-        }
-    else:
-        share_stats = {name: {} for name in share_components}
+    share_arrays = {
+        name: (by_name[name][safe] / dur[safe]) if safe.any() else np.array([])
+        for name in share_components
+    }
+    share_stats = {name: _summary_stats(share_arrays[name]) for name in share_components}
     # empty-stats guard so downstream formatting never KeyErrors
     for name in share_components:
         if not share_stats[name]:
@@ -1097,6 +1131,10 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     path = out / "fig6_turn_decomposition.pdf"
     fig.savefig(path)
     plt.close(fig)
+
+    # companion: the per-turn share of each component overlaid in one graph
+    _fig_turn_share_dist(share_arrays, share_components,
+                         out / "fig6b_turn_share_distribution.pdf")
     return path
 
 
