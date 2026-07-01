@@ -927,35 +927,63 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
 _SHARE_COLORS = {"llm_wall_s": "C0", "tool_wall_s": "C2", "others": "0.5"}
 
 
+def _smooth_cdf(xs, xmax: float):
+    """Monotone-smooth empirical CDF for a sorted share sample. Returns (x, y) on
+    a dense grid via a shape-preserving PCHIP spline (no overshoot past [0,1],
+    stays non-decreasing); falls back to the piecewise-linear CDF when scipy is
+    absent or there are too few points. Anchored at (0,0) and extended flat at
+    y=1.0 out to xmax so a curve that reached 1.0 runs to the right edge."""
+    n = xs.size
+    ux = np.unique(xs)                                   # strictly increasing knots
+    uy = np.searchsorted(xs, ux, side="right") / n       # true CDF value at each knot
+    x_pts, y_pts = ux.tolist(), uy.tolist()
+    if x_pts[0] > 0.0:
+        x_pts, y_pts = [0.0] + x_pts, [0.0] + y_pts
+    if x_pts[-1] < xmax:
+        x_pts, y_pts = x_pts + [xmax], y_pts + [1.0]
+    x_pts, y_pts = np.asarray(x_pts, dtype=float), np.asarray(y_pts, dtype=float)
+    if x_pts.size >= 3:
+        try:
+            from scipy.interpolate import PchipInterpolator
+            f = PchipInterpolator(x_pts, y_pts)
+            gx = np.linspace(float(x_pts[0]), float(x_pts[-1]), 400)
+            return gx, np.clip(f(gx), 0.0, 1.0)
+        except Exception:
+            pass
+    return x_pts, y_pts
+
+
 def _fig_turn_share_dist(share_arrays: dict, share_components, path: Path) -> Path:
     """Empirical CDF of each component's per-turn share of duration (llm / tool /
     others), overlaid in one graph. y = fraction of turns with share <= x, so a
     curve hugging the right edge means that component dominates most turns.
     Shares are in [0,1] for the anchored split; parallel-tool edge cases can push
     tool share past 1, so the x-axis extends to the observed max."""
-    fig, ax = plt.subplots(figsize=(4.2, 2.7))
-    any_data = False
+    # pre-pass: collect sorted shares + the global x-extent so every curve can be
+    # drawn flat to the right edge once it reaches 1.0.
+    series = []
     xmax = 1.0
     for name in share_components:
         v = share_arrays.get(name)
         if v is None or v.size == 0:
             continue
-        any_data = True
-        xmax = max(xmax, float(v.max()))
-        color = _SHARE_COLORS.get(name, "C3")
-        xs = np.sort(v)
-        ys = np.arange(1, xs.size + 1) / xs.size
-        # step CDF, anchored at (0,0) so each curve starts on the axis
-        ax.step(np.concatenate(([0.0], xs)), np.concatenate(([0.0], ys)),
-                where="post", color=color, linewidth=1.6, label=name)
-    if not any_data:
-        plt.close(fig)
+        xs = np.sort(np.asarray(v, dtype=float))
+        xmax = max(xmax, float(xs[-1]))
+        series.append((name, xs))
+    if not series:
         return path
+
+    fig, ax = plt.subplots(figsize=(4.2, 2.7))
+    for name, xs in series:
+        gx, gy = _smooth_cdf(xs, xmax)
+        ax.plot(gx, gy, color=_SHARE_COLORS.get(name, "C3"), linewidth=1.6,
+                label=name, solid_joinstyle="round", solid_capstyle="round",
+                antialiased=True)
     ax.axhline(0.5, color="0.7", linewidth=0.6, linestyle=":")  # median reference
     ax.set_xlabel("per-turn share of duration")
     ax.set_ylabel("cumulative fraction of turns")
     ax.set_xlim(0.0, xmax)
-    ax.set_ylim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.02)
     ax.set_title("Per-turn share CDF (llm / tool / others)", fontsize=9)
     ax.legend(fontsize=7, frameon=False, loc="lower right")
     fig.tight_layout()
