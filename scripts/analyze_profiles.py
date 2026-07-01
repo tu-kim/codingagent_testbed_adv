@@ -904,17 +904,22 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     stats = {name: _summary_stats(vals) for name, vals in components}
     share_components = ("llm_wall_s", "tool_wall_s", "post_overhead_s")
 
-    # Average per-turn share (NOT total ratio -- that would weight long
-    # turns more). Skip turns with zero duration to avoid div-by-zero.
+    # Per-turn share distribution (each turn weighted equally -- this is the
+    # mean-OF-ratios family, NOT ratio-of-means, so long turns don't dominate).
+    # Skip turns with zero duration to avoid div-by-zero.
     safe = dur > 0
+    by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "post_overhead_s": post}
     if safe.any():
-        by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "post_overhead_s": post}
-        ratio_mean = {
-            name: float((by_name[name][safe] / dur[safe]).mean())
+        share_stats = {
+            name: _summary_stats(by_name[name][safe] / dur[safe])
             for name in share_components
         }
     else:
-        ratio_mean = {name: 0.0 for name in share_components}
+        share_stats = {name: {} for name in share_components}
+    # empty-stats guard so downstream formatting never KeyErrors
+    for name in share_components:
+        if not share_stats[name]:
+            share_stats[name] = {"mean": 0.0, "median": 0.0, "p90": 0.0, "p99": 0.0}
 
     # ----- stdout pretty table -----
     print()
@@ -928,9 +933,14 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         print(f"{name:<18} {s['mean']:>9.3f} {s['median']:>9.3f} "
               f"{s['p90']:>9.3f} {s['p99']:>9.3f}")
     print()
-    print("Average per-turn share of duration (task-tool turns excluded):")
+    print("Per-turn share of duration (per-turn ratios, task-tool turns excluded):")
+    shdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
+    print(shdr)
+    print("-" * len(shdr))
     for name in share_components:
-        print(f"  {name:<18} {ratio_mean[name]:>7.2%}")
+        s = share_stats[name]
+        print(f"{name:<18} {s['mean']:>9.1%} {s['median']:>9.1%} "
+              f"{s['p90']:>9.1%} {s['p99']:>9.1%}")
 
     # ----- CSV -----
     import csv
@@ -945,11 +955,18 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
                 f"{s['mean']:.4f}", f"{s['median']:.4f}",
                 f"{s['p90']:.4f}", f"{s['p99']:.4f}",
             ])
-        f.write("\n# average per-turn share of duration (mean of per-turn ratios;"
-                " turns that fired the task tool are excluded)\n")
-        w.writerow(["component", "mean_ratio"])
+        f.write("\n# per-turn share of duration (distribution of per-turn ratios,"
+                " each turn weighted equally; turns that fired the task tool"
+                " are excluded)\n")
+        w.writerow(["component", "n_turns",
+                    "mean_ratio", "median_ratio", "p90_ratio", "p99_ratio"])
         for name in share_components:
-            w.writerow([name, f"{ratio_mean[name]:.4f}"])
+            s = share_stats[name]
+            w.writerow([
+                name, len(rows),
+                f"{s['mean']:.4f}", f"{s['median']:.4f}",
+                f"{s['p90']:.4f}", f"{s['p99']:.4f}",
+            ])
 
     # ----- figure: horizontal stacked single bar showing mean composition -----
     fig, ax = plt.subplots(figsize=(3.5, 1.5))
