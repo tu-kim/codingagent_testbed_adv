@@ -14,18 +14,18 @@ or last text-end of the step. llm.step_duration_s separately captures
 the whole AI SDK step bracket. turn.end emits post_overhead_s for the
 non-LLM/non-tool slice.
 ---
- packages/opencode/src/profile/profile.ts   | 472 +++++++++++++++++++++
- packages/opencode/src/session/processor.ts |   4 +
+ packages/opencode/src/profile/profile.ts   | 494 +++++++++++++++++++++
+ packages/opencode/src/session/processor.ts |  13 +
  packages/opencode/src/session/prompt.ts    | 234 +++++++-----
- 3 files changed, 623 insertions(+), 87 deletions(-)
+ 3 files changed, 654 insertions(+), 87 deletions(-)
  create mode 100644 packages/opencode/src/profile/profile.ts
 
 diff --git a/packages/opencode/src/profile/profile.ts b/packages/opencode/src/profile/profile.ts
 new file mode 100644
-index 000000000..a141b1880
+index 000000000..381a2818f
 --- /dev/null
 +++ b/packages/opencode/src/profile/profile.ts
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,494 @@
 +// Lightweight, ENV-gated profiling for the agent loop.
 +//
 +// Turn it on with `OPENCODE_PROFILE=1`. When unset/0/false every Profile.*
@@ -90,6 +90,10 @@ index 000000000..a141b1880
 +  step: number
 +  llmStartByStep: Map<number, number>
 +  llmDurationByStep: Map<number, number>
++  // Absolute ms of the llm.end (finish-step) event per step. Lets turn.end
++  // compute the WALL-CLOCK-anchored llm wall (llm.end - turn.start - tool),
++  // which is correct even when start-step fires late on buffered tool-calls.
++  llmEndByStep: Map<number, number>
 +  // Earliest Profile.tool.start ms per step — best proxy for "AI SDK finished
 +  // parsing tool args from the stream and is invoking execute()", which is the
 +  // closest moment we can observe to "LLM streaming ended for this step".
@@ -126,6 +130,7 @@ index 000000000..a141b1880
 +      step: 0,
 +      llmStartByStep: new Map(),
 +      llmDurationByStep: new Map(),
++      llmEndByStep: new Map(),
 +      firstToolStartByStep: new Map(),
 +      lastTextEndByStep: new Map(),
 +      streamFinishByStep: new Map(),
@@ -337,6 +342,20 @@ index 000000000..a141b1880
 +      // Lump the three non-LLM/non-tool slices into post_overhead_s.
 +      // Clamped at 0 because parallel tool steps have Σtool > wall(tool).
 +      const postMs = Math.max(0, turnMs - llmMs - toolMs)
++      // Wall-clock-anchored split (llm.end - turn.start - tool). Correct even
++      // when start-step fires late on buffered tool-calls, where the real
++      // generation sits in the turn.start->llm.start gap and otherwise leaks
++      // into post_overhead_s. Emitted ALONGSIDE the stream-based fields (which
++      // stay unchanged); omitted when no llm.end fired this step.
++      let anchored: { llm_wall_true_s: number; others_true_s: number } | undefined
++      const llmEnd = s.llmEndByStep.get(step)
++      if (llmEnd != null) {
++        const llmTrueMs = Math.max(0, llmEnd - start - toolMs)
++        anchored = {
++          llm_wall_true_s: roundSec(llmTrueMs),
++          others_true_s: roundSec(Math.max(0, turnMs - llmTrueMs - toolMs)),
++        }
++      }
 +      emit(sessionID, {
 +        ev: "turn.end",
 +        ts: unixTs(),
@@ -346,8 +365,10 @@ index 000000000..a141b1880
 +        llm_wall_s: roundSec(llmMs),
 +        tool_wall_s: roundSec(toolMs),
 +        post_overhead_s: roundSec(postMs),
++        ...(anchored ?? {}),
 +      })
 +      s.turnStartByStep.delete(step)
++      s.llmEndByStep.delete(step)
 +    },
 +  },
 +
@@ -421,6 +442,7 @@ index 000000000..a141b1880
 +        ? Math.max(0, stepEnd - streamFinish)
 +        : null
 +      s.llmDurationByStep.set(s.step, llmMs)
++      s.llmEndByStep.set(s.step, stepEnd)
 +      s.llmStartByStep.delete(s.step)
 +      s.firstToolStartByStep.delete(s.step)
 +      s.lastTextEndByStep.delete(s.step)
@@ -499,7 +521,7 @@ index 000000000..a141b1880
 +  },
 +}
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index f22da9292..2645b7441 100644
+index f22da9292..373b7381c 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
 @@ -24,6 +24,7 @@ import { EventV2 } from "@/v2/event"
@@ -532,15 +554,15 @@ index f22da9292..2645b7441 100644
                EventV2.run(SessionEvent.Step.Ended.Sync, {
 @@ -545,6 +552,7 @@ export const layer: Layer.Layer<
              return
-
+ 
            case "text-end":
 +            Profile.llm.streamingEnd(ctx.sessionID)
              if (!ctx.currentText) return
              // oxlint-disable-next-line no-self-assign -- reactivity trigger
              ctx.currentText.text = ctx.currentText.text
-@@ -579,6 +587,11 @@ export const layer: Layer.Layer<
+@@ -575,6 +583,11 @@ export const layer: Layer.Layer<
              return
-
+ 
            case "finish":
 +            Profile.llm.streamFinish(ctx.sessionID, {
 +              finish: (value as { finishReason?: string }).finishReason,
@@ -548,7 +570,7 @@ index f22da9292..2645b7441 100644
 +              providerMetadata: (value as { providerMetadata?: unknown }).providerMetadata,
 +            })
              return
-
+ 
            default:
 diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
 index fef8c4383..01415fd7c 100644
@@ -850,6 +872,3 @@ index fef8c4383..01415fd7c 100644
          yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
          return yield* lastAssistant(sessionID)
        },
--- 
-2.50.1 (Apple Git-155)
-
