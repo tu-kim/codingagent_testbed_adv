@@ -14,10 +14,10 @@ or last text-end of the step. llm.step_duration_s separately captures
 the whole AI SDK step bracket. turn.end emits post_overhead_s for the
 non-LLM/non-tool slice.
 ---
- packages/opencode/src/profile/profile.ts   | 395 +++++++++++++++++++++
+ packages/opencode/src/profile/profile.ts   | 472 +++++++++++++++++++++
  packages/opencode/src/session/processor.ts |   4 +
  packages/opencode/src/session/prompt.ts    | 234 +++++++-----
- 3 files changed, 546 insertions(+), 87 deletions(-)
+ 3 files changed, 623 insertions(+), 87 deletions(-)
  create mode 100644 packages/opencode/src/profile/profile.ts
 
 diff --git a/packages/opencode/src/profile/profile.ts b/packages/opencode/src/profile/profile.ts
@@ -25,7 +25,7 @@ new file mode 100644
 index 000000000..a141b1880
 --- /dev/null
 +++ b/packages/opencode/src/profile/profile.ts
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,472 @@
 +// Lightweight, ENV-gated profiling for the agent loop.
 +//
 +// Turn it on with `OPENCODE_PROFILE=1`. When unset/0/false every Profile.*
