@@ -266,3 +266,69 @@ def test_latency_buckets_partition_by_total(mod, tmp_path):
         tot = sum(float(recs[b][f"{c}_mean_share"])
                   for c in ("llm_wall_s", "tool_wall_s", "others"))
         assert tot == pytest.approx(1.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------
+# analyze_tool_dominated_turns
+# --------------------------------------------------------------------------
+
+_TSID = "ses_tooltest"
+
+
+def _write_tool_heavy(path: Path) -> None:
+    """Two turns: a bash-dominated one (tool_wall 9/10) and a normal read turn."""
+    turns = [
+        # step, tool_name, tool_dur, out_chars, llm_end_ts, in_tok, out_tok, cache,
+        #   turn_start, dur, llm_wall, tool_wall, post
+        (1, "bash", 9.0, 500, 1000.5, 5000, 200, 1000, 1000.0, 10.0, 0.5, 9.0, 0.5),
+        (2, "read", 0.1, 50, 2004.0, 2000, 800, 0, 2000.0, 5.0, 4.0, 0.1, 0.9),
+    ]
+    lines = []
+    for (step, tname, tdur, oc, lend, itk, otk, cr, tstart, dur, lw, tw, po) in turns:
+        lines.append({"ev": "turn.start", "sessionID": _TSID, "step": step, "ts": tstart})
+        lines.append({"ev": "tool.end", "sessionID": _TSID, "step": step,
+                      "name": tname, "ok": True, "duration_s": tdur, "output_chars": oc})
+        lines.append({"ev": "llm.end", "sessionID": _TSID, "step": step, "ts": lend,
+                      "finish": "tool-calls", "step_duration_s": 0.2,
+                      "tokens": {"total": itk + otk, "input": itk, "output": otk,
+                                 "reasoning": 0, "cache": {"write": 0, "read": cr}}})
+        lines.append({"ev": "turn.end", "sessionID": _TSID, "step": step, "ts": tstart + dur,
+                      "duration_s": dur, "llm_wall_s": lw, "tool_wall_s": tw,
+                      "post_overhead_s": po})
+    with path.open("w", encoding="utf-8") as f:
+        for obj in lines:
+            f.write(json.dumps(obj) + "\n")
+
+
+def _run_tool_dominated(mod, tmp_path):
+    p = tmp_path / "profiles.jsonl"
+    _write_tool_heavy(p)
+    sessions = mod.load_sessions(p)
+    outdir = tmp_path / "td"
+    outdir.mkdir()
+    csv_path = mod.analyze_tool_dominated_turns(sessions, outdir, top_n=20)
+    assert csv_path == outdir / "tool_dominated_turns.csv"
+    with csv_path.open() as f:
+        return list(csv.DictReader(f))
+
+
+def test_tool_dominated_ranks_by_share(mod, tmp_path):
+    recs = _run_tool_dominated(mod, tmp_path)
+    assert len(recs) == 2
+    # sorted by tool_share desc -> bash turn (0.9) first, read turn (0.02) second
+    assert recs[0]["dominant_tool"] == "bash"
+    assert float(recs[0]["tool_share"]) == pytest.approx(0.9, abs=1e-6)
+    assert recs[1]["dominant_tool"] == "read"
+    assert float(recs[1]["tool_share"]) == pytest.approx(0.02, abs=1e-6)
+
+
+def test_tool_dominated_reports_tokens_and_breakdown(mod, tmp_path):
+    recs = _run_tool_dominated(mod, tmp_path)
+    bash = recs[0]
+    assert int(bash["input_tokens"]) == 5000
+    assert int(bash["output_tokens"]) == 200
+    assert int(bash["cache_read"]) == 1000
+    assert int(bash["n_tools"]) == 1
+    assert int(bash["tool_output_chars"]) == 500
+    assert float(bash["dominant_tool_s"]) == pytest.approx(9.0, abs=1e-6)
+    assert bash["tools"] == "bash:9.000"

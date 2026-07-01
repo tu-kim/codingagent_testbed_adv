@@ -1616,6 +1616,97 @@ def analyze_latency_composition(sessions: dict[str, Session], out: Path) -> Path
     return out
 
 
+def _fmt_tok(n) -> str:
+    return "-" if n is None else str(int(n))
+
+
+def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
+                                 top_n: int = 20,
+                                 trace_path: Path | None = None) -> Path | None:
+    """Find turns where tool_wall_s dominates the turn wall (largest
+    tool_wall/duration) and dump their LLM token usage + tool-type breakdown.
+    task-tool turns are excluded. tool_share can exceed 1.0 when a step ran tools
+    in PARALLEL (tool_wall is the SUM of per-tool durations, which can beat the
+    wall span). Writes tool_dominated_turns.csv (all turns w/ tools, sorted by
+    share) + a stdout table of the top N + a dominant-tool rollup."""
+    trace_map = _load_trace_repo_map(trace_path) if trace_path else {}
+    recs = []
+    for sid, s in sorted(sessions.items()):
+        for step, t in sorted(s.turns.items()):
+            if any(tc.name == TASK_TOOL_NAME for tc in t.tools):
+                continue
+            d, tw = t.turn_duration_s, t.tool_wall_s
+            if d is None or tw is None or d <= 0 or not t.tools:
+                continue
+            by_tool: dict[str, float] = {}
+            out_chars = 0
+            for tc in t.tools:
+                by_tool[tc.name] = by_tool.get(tc.name, 0.0) + (tc.duration_s or 0.0)
+                out_chars += tc.output_chars or 0
+            dom_tool, dom_s = max(by_tool.items(), key=lambda kv: kv[1])
+            meta = trace_map.get(sid, {})
+            recs.append({
+                "sid": sid, "step": step,
+                "instance_id": meta.get("instance_id") or "",
+                "repo": meta.get("repo") or "",
+                "duration_s": d, "tool_wall_s": tw, "tool_share": tw / d,
+                "in_tok": t.llm_input_tokens, "out_tok": t.llm_output_tokens,
+                "cache_read": t.llm_cache_read, "n_tools": len(t.tools),
+                "out_chars": out_chars, "dom_tool": dom_tool, "dom_tool_s": dom_s,
+                "by_tool": by_tool,
+            })
+    if not recs:
+        print("\ntool-dominated turns: no turns with tools")
+        return None
+    recs.sort(key=lambda r: -r["tool_share"])
+    top = recs[:top_n]
+
+    print()
+    print(f"Top {len(top)} tool-dominated turns (by tool_wall/duration; task "
+          f"excluded; share>100% => parallel tools):")
+    hdr = (f"{'instance':<24} {'step':>4} {'dur_s':>8} {'tool_s':>8} {'share':>6} "
+           f"{'dom_tool':>10} {'dom_s':>7} {'in_tok':>8} {'out_tok':>8} {'cache_r':>8}")
+    print(hdr)
+    print("-" * len(hdr))
+    for r in top:
+        inst = (r["instance_id"] or r["sid"])[:24]
+        print(f"{inst:<24} {r['step']:>4} {r['duration_s']:>8.2f} "
+              f"{r['tool_wall_s']:>8.2f} {r['tool_share']:>6.0%} "
+              f"{r['dom_tool']:>10} {r['dom_tool_s']:>7.2f} "
+              f"{_fmt_tok(r['in_tok']):>8} {_fmt_tok(r['out_tok']):>8} "
+              f"{_fmt_tok(r['cache_read']):>8}")
+
+    dom_counts: dict[str, int] = {}
+    for r in top:
+        dom_counts[r["dom_tool"]] = dom_counts.get(r["dom_tool"], 0) + 1
+    roll = ", ".join(f"{k}×{v}" for k, v in
+                     sorted(dom_counts.items(), key=lambda kv: -kv[1]))
+    print(f"  dominant-tool rollup (top {len(top)}): {roll}")
+
+    import csv
+    csv_path = out / "tool_dominated_turns.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["session_id", "step", "instance_id", "repo", "duration_s",
+                    "tool_wall_s", "tool_share", "input_tokens", "output_tokens",
+                    "cache_read", "n_tools", "tool_output_chars",
+                    "dominant_tool", "dominant_tool_s", "tools"])
+        for r in recs:
+            tools_str = ";".join(f"{k}:{v:.3f}" for k, v in
+                                 sorted(r["by_tool"].items(), key=lambda kv: -kv[1]))
+            w.writerow([
+                r["sid"], r["step"], r["instance_id"], r["repo"],
+                f"{r['duration_s']:.4f}", f"{r['tool_wall_s']:.4f}",
+                f"{r['tool_share']:.4f}",
+                "" if r["in_tok"] is None else r["in_tok"],
+                "" if r["out_tok"] is None else r["out_tok"],
+                r["cache_read"], r["n_tools"], r["out_chars"],
+                r["dom_tool"], f"{r['dom_tool_s']:.4f}", tools_str,
+            ])
+    print(f"  (csv: {csv_path})")
+    return csv_path
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
@@ -1652,6 +1743,11 @@ def main(argv: list[str] | None = None) -> int:
         "--post-overhead-min-duration", type=float, default=None, metavar="SEC",
         help="Restrict the post_overhead drill-down to turns longer than SEC "
              "seconds (combined with --post-overhead-tail-quantile via max).",
+    )
+    ap.add_argument(
+        "--tool-dominated-top-n", type=int, default=20, metavar="N",
+        help="How many top tool-dominated turns (by tool_wall/duration) to print "
+             "with their LLM token usage + tool breakdown (default 20).",
     )
     args = ap.parse_args(argv)
     exclude_tools = set(args.exclude_tools)
@@ -1700,6 +1796,15 @@ def main(argv: list[str] | None = None) -> int:
     path = analyze_latency_composition(sessions, args.output)
     if path is not None:
         print(f"  wrote latency_* CSVs + figures to {path}")
+
+    # tool-dominated turns: where tool_wall_s eats the turn wall -- with LLM
+    # token usage + tool-type breakdown to see what drove them.
+    path = analyze_tool_dominated_turns(
+        sessions, args.output, top_n=args.tool_dominated_top_n,
+        trace_path=args.trace,
+    )
+    if path is not None:
+        print(f"  wrote {path}")
 
     return 0
 
