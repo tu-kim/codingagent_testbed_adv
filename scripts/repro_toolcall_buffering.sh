@@ -47,7 +47,10 @@ timed() {  # timed <body-json> <out.timed>
   curl -N -sS -H 'content-type: application/json' -d "$body" \
        "$DYN/v1/chat/completions" \
   | while IFS= read -r line; do
-      printf '%s.%06d  %s\n' "$(date +%s)" "$(date +%N | cut -c1-6)" "$line"
+      # %s (not %d) for the fractional part: `date +%N | cut -c1-6` is already a
+      # zero-padded 6-digit string, and printf would parse a leading-zero value
+      # like "009585" as OCTAL (8/9 invalid) and abort the loop.
+      printf '%s.%s  %s\n' "$(date +%s)" "$(date +%N | cut -c1-6)" "$line"
     done | tee "$out" >/dev/null
 }
 

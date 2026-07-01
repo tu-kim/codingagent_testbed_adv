@@ -2,7 +2,7 @@
 """Print per-chunk timing for an SSE capture produced by:
 
   curl -N ... | while IFS= read -r line; do
-      printf '%s.%06d  %s\\n' "$(date +%s)" "$(date +%N | cut -c1-6)" "$line"
+      printf '%s.%s  %s\\n' "$(date +%s)" "$(date +%N | cut -c1-6)" "$line"
     done | tee /tmp/turn.timed
 
 Each non-blank line is `<unix_seconds>.<microseconds>  <raw line>`.
