@@ -1122,18 +1122,52 @@ def _session_concurrency(trace_map: dict[str, dict]) -> dict[str, int]:
 
 
 def analyze_post_overhead(sessions: dict[str, Session], out: Path,
-                          trace_path: Path | None = None) -> Path | None:
+                          trace_path: Path | None = None,
+                          tail_quantile: float | None = None,
+                          min_duration_s: float | None = None) -> Path | None:
     """Drill INTO turn.post_overhead_s (the duration residual = duration -
-    llm_wall - tool_wall). Splits it per turn into:
+    llm_wall - tool_wall, labelled "others" in fig6). Splits it per turn into:
       explained   = post_stream_overhead_s  (snapshot.track+patch + DB write)
       unexplained = post_overhead_s - explained  (pre-turn setup + inter-step
                     gaps + LLM-tail leak when streamFinish didn't fire)
     and reports the streamFinish-miss rate (turns where the LLM stream tail
     leaked into overhead). With --trace, also breaks down by repo (size proxy)
-    and by concurrent in-flight sessions (IO-contention proxy)."""
+    and by concurrent in-flight sessions (IO-contention proxy).
+
+    task-tool turns are EXCLUDED (same rationale as fig6: a `task` turn's wall
+    is a nested agent loop, not this turn's own LLM+finalization shape), so the
+    turn population here matches fig6's per-turn decomposition.
+
+    tail_quantile / min_duration_s restrict the drill-down to the LONGEST turns
+    (turn_duration_s strictly above the threshold). Pass tail_quantile=0.99 to
+    interrogate exactly the >p99 bucket -- i.e. to test whether the tail's
+    inflated "others" is real finalization overhead (large explained slice) or
+    leaked LLM stream tail (high streamFinish-miss rate + unexplained slice)."""
+
+    def _is_task_turn(t: Turn) -> bool:
+        return any(tc.name == TASK_TOOL_NAME for tc in t.tools)
+
+    # Threshold from the SAME (task-excluded) turn population so tail_quantile
+    # lines up with fig6's >pQ bucket. Uses linear-interp percentile == numpy
+    # default, matching pandas' default quantile in analyze_latency_breakdown.
+    dur_floor = min_duration_s
+    if tail_quantile is not None:
+        durs = [t.turn_duration_s for s in sessions.values()
+                for t in s.turns.values()
+                if t.turn_duration_s is not None and not _is_task_turn(t)]
+        if durs:
+            q_thr = float(np.percentile(np.array(durs, dtype=float),
+                                        tail_quantile * 100.0))
+            dur_floor = q_thr if dur_floor is None else max(dur_floor, q_thr)
+
     rows = []  # (sid, step, post, explained_or_None, finish_fired_or_None)
     for sid, s in sorted(sessions.items()):
         for step, t in sorted(s.turns.items()):
+            if _is_task_turn(t):
+                continue
+            if dur_floor is not None:
+                if t.turn_duration_s is None or t.turn_duration_s <= dur_floor:
+                    continue
             po = t.post_overhead_s
             if po is None:
                 d, lw, tw = t.turn_duration_s, t.llm_wall_s, t.tool_wall_s
@@ -1142,8 +1176,9 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
                 po = max(0.0, d - lw - tw)
             rows.append((sid, step, float(po), t.post_stream_overhead_s,
                          t.stream_finish_fired))
+    subset = "" if dur_floor is None else f" with duration > {dur_floor:.2f}s"
     if not rows:
-        print("\npost_overhead decomposition: no turns with timing data")
+        print(f"\npost_overhead decomposition: no turns with timing data{subset}")
         return None
 
     po_all = np.array([r[2] for r in rows], dtype=float)
@@ -1152,7 +1187,7 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
     have_instr = any(r[3] is not None or r[4] is not None for r in rows)
 
     print()
-    print(f"post_overhead decomposition (n={len(rows)} turns):")
+    print(f"post_overhead decomposition (n={len(rows)} turns{subset}):")
     print(f"  post_overhead_s        mean={po_all.mean():.3f}  "
           f"median={np.median(po_all):.3f}  p90={np.percentile(po_all,90):.3f}  "
           f"p99={np.percentile(po_all,99):.3f}")
@@ -1203,7 +1238,8 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
     import csv
     trace_map = _load_trace_repo_map(trace_path) if trace_path else {}
     conc = _session_concurrency(trace_map) if trace_map else {}
-    per_turn_csv = out / "post_overhead_per_turn.csv"
+    per_turn_csv = out / ("post_overhead_per_turn.csv" if dur_floor is None
+                          else "post_overhead_per_turn_tail.csv")
     with per_turn_csv.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["session_id", "step", "instance_id", "repo",
@@ -1275,7 +1311,8 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
                   columnspacing=0.8, handletextpad=0.3)
         fig.tight_layout()
         fig.subplots_adjust(bottom=0.55)
-        path = out / "fig7_post_overhead_breakdown.pdf"
+        path = out / ("fig7_post_overhead_breakdown.pdf" if dur_floor is None
+                      else "fig7_post_overhead_breakdown_tail.pdf")
         fig.savefig(path)
         plt.close(fig)
         return path
@@ -1308,6 +1345,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional run trace.jsonl. Enables the post_overhead breakdown to "
              "join sessions to instance_id/repo (workspace-size proxy) and to "
              "compute per-session in-flight concurrency (IO-contention proxy).",
+    )
+    ap.add_argument(
+        "--post-overhead-tail-quantile", type=float, default=None, metavar="Q",
+        help="Restrict the post_overhead drill-down to turns whose duration "
+             "exceeds the Q-quantile of the (task-excluded) turn population, "
+             "e.g. 0.99 -> the >p99 bucket. Use to test whether the tail's "
+             "inflated 'others' is real finalization overhead or leaked LLM "
+             "stream tail (streamFinish miss). Writes *_tail.{csv,pdf}.",
+    )
+    ap.add_argument(
+        "--post-overhead-min-duration", type=float, default=None, metavar="SEC",
+        help="Restrict the post_overhead drill-down to turns longer than SEC "
+             "seconds (combined with --post-overhead-tail-quantile via max).",
     )
     args = ap.parse_args(argv)
     exclude_tools = set(args.exclude_tools)
@@ -1342,7 +1392,11 @@ def main(argv: list[str] | None = None) -> int:
     # post_overhead drill-down (step 1): split turn.post_overhead_s into the
     # snapshot+DB finalization slice vs the rest, + streamFinish-miss + repo /
     # concurrency breakdowns when --trace is supplied.
-    path = analyze_post_overhead(sessions, args.output, trace_path=args.trace)
+    path = analyze_post_overhead(
+        sessions, args.output, trace_path=args.trace,
+        tail_quantile=args.post_overhead_tail_quantile,
+        min_duration_s=args.post_overhead_min_duration,
+    )
     if path is not None:
         print(f"  wrote {path}")
 
