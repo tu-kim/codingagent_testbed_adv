@@ -130,6 +130,7 @@ class Turn:
     llm_cache_read: int = 0
     llm_step_duration_s: float | None = None
     llm_stream_end_s: float | None = None
+    llm_end_ts: float | None = None            # wall-clock ts of the llm.end event
     # from llm.end.post_stream_overhead_s = max(0, finish-step - streamFinish):
     # the per-step framework finalization slice (snapshot.track + snapshot.patch
     # + session.updateMessage DB write + EventV2 dual-write; processor.ts:453-497).
@@ -234,6 +235,7 @@ def load_sessions(path: Path) -> dict[str, Session]:
                     if step is None:
                         continue
                     t = ensure_turn(sess, step)
+                    t.llm_end_ts = ts
                     t.llm_step_duration_s = ev.get("step_duration_s")
                     t.llm_stream_end_s = ev.get("stream_end_s") or ev.get("duration_s")
                     # post_stream_overhead_s is emitted (possibly null) by the
@@ -856,13 +858,26 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path,
 
 def _collect_turn_decomposition(sessions: dict[str, Session]):
     """Per-turn (session_id, step, duration_s, llm_wall_s, tool_wall_s,
-    post_overhead_s).
+    post_overhead_s, llm_wall_true_s, others_true_s).
 
     Turns that fired the `task` tool are EXCLUDED wholesale: `task` spawns
     a nested agent session (its own LLM loop + tools) whose wall time lands
     inside this turn's tool_wall_s, so such a turn is really downstream LLM
     work, not the ordinary "one LLM step + local tools" shape this
     decomposition characterizes. Task turns are analyzed separately.
+
+    The last two fields are the WALL-CLOCK-ANCHORED correction to the
+    stream-event llm_wall_s. The profiler's llm_wall_s = start-step -> first
+    tool/last text, but `start-step` fires only when opencode begins
+    CONSUMING the response, which for a large buffered tool-call arrives at
+    the END of generation -- so the real LLM time lands in the
+    turn.start -> llm.start gap and gets misattributed to post_overhead
+    ("others"). llm_wall_true_s = (llm.end.ts - turn.start.ts) - tool_wall
+    recovers the true client-observed LLM wall (request send -> response
+    fully received, incl. any server queue/prefill), and others_true_s =
+    duration - llm_true - tool_wall is then just the finish-step ->
+    turn.end framework tail. Both are None when turn.start/llm.end
+    timestamps are missing (fall back to the stream-based split).
 
     Skips turns where the three turn.end component fields aren't all
     present (post_overhead_s is reconstructed from the others when only
@@ -878,7 +893,11 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
             po = t.post_overhead_s
             if po is None:
                 po = max(0.0, d - lw - tw)
-            rows.append((sid, step, d, lw, tw, po))
+            llm_true = others_true = None
+            if t.turn_start_ts is not None and t.llm_end_ts is not None:
+                llm_true = max(0.0, t.llm_end_ts - t.turn_start_ts - tw)
+                others_true = max(0.0, d - llm_true - tw)
+            rows.append((sid, step, d, lw, tw, po, llm_true, others_true))
     return rows
 
 
@@ -892,8 +911,20 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         print("\nturn decomposition: no turns with full timing data")
         return None
 
-    arr = np.array([(d, lw, tw, po) for *_, d, lw, tw, po in rows], dtype=float)
+    arr = np.array([(r[2], r[3], r[4], r[5]) for r in rows], dtype=float)
     dur, llm, tool, post = arr.T
+
+    # Wall-clock-anchored correction (turn.start -> llm.end). Present only on
+    # turns that carry both timestamps; NaN elsewhere. See
+    # _collect_turn_decomposition for why the stream-based llm_wall_s
+    # under-measures buffered large tool-call turns.
+    corr = np.array(
+        [(r[6] if r[6] is not None else np.nan,
+          r[7] if r[7] is not None else np.nan) for r in rows],
+        dtype=float,
+    )
+    llm_true, others_true = corr.T
+    n_corr = int(np.count_nonzero(~np.isnan(llm_true)))
 
     components = [
         ("duration_s", dur),
@@ -943,6 +974,29 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         print(f"{name:<18} {s['mean']:>9.1%} {s['median']:>9.1%} "
               f"{s['p90']:>9.1%} {s['p99']:>9.1%}")
 
+    # ----- wall-clock-anchored correction (turn.start -> llm.end) -----
+    if n_corr:
+        lt = llm_true[~np.isnan(llm_true)]
+        ot = others_true[~np.isnan(others_true)]
+        tw_c = tool[~np.isnan(llm_true)]
+        print()
+        print(f"CORRECTED decomposition (turn.start->llm.end anchor, "
+              f"n={n_corr}/{len(rows)} turns with timestamps):")
+        print("  recovers real LLM wall the stream-based llm_wall_s misses on "
+              "buffered large tool-call turns")
+        chdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
+        print(chdr)
+        print("-" * len(chdr))
+        for name, vals in (("llm_wall_true_s", lt), ("tool_wall_s", tw_c),
+                           ("others_true_s", ot)):
+            s = _summary_stats(vals)
+            print(f"{name:<18} {s['mean']:>9.3f} {s['median']:>9.3f} "
+                  f"{s['p90']:>9.3f} {s['p99']:>9.3f}")
+        # how much LLM time the stream-based split lost into "others"
+        lw_c = llm[~np.isnan(llm_true)]
+        moved = float(np.mean(lt - lw_c))
+        print(f"  mean LLM time recovered from 'others' into LLM: {moved:+.3f}s/turn")
+
     # ----- CSV -----
     import csv
     csv_path = out / "fig6_turn_decomposition_stats.csv"
@@ -976,10 +1030,13 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     with per_turn_path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["session_id", "step", "duration_s",
-                    "llm_wall_s", "tool_wall_s", "others_s"])
-        for sid, step, d, lw, tw, po in rows:
+                    "llm_wall_s", "tool_wall_s", "others_s",
+                    "llm_wall_true_s", "others_true_s"])
+        for sid, step, d, lw, tw, po, llm_t, oth_t in rows:
             w.writerow([sid, step,
-                        f"{d:.6f}", f"{lw:.6f}", f"{tw:.6f}", f"{po:.6f}"])
+                        f"{d:.6f}", f"{lw:.6f}", f"{tw:.6f}", f"{po:.6f}",
+                        "" if llm_t is None else f"{llm_t:.6f}",
+                        "" if oth_t is None else f"{oth_t:.6f}"])
 
     # ----- figure: horizontal stacked single bar showing mean composition -----
     fig, ax = plt.subplots(figsize=(3.5, 1.5))
