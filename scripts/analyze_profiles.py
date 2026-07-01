@@ -43,6 +43,14 @@ Figures emitted:
                                    separately. Companion stats CSV
                                    (mean/median/p90/p99 per component + average
                                    per-turn ratio).
+  fig7_post_overhead_breakdown.pdf — post_overhead (others) split into
+                                   snapshot+DB vs the rest (see analyze_post_overhead).
+  latency_share_violin.pdf,        — per-request latency-composition views on the
+  latency_sorted_stacked.pdf,        WALL-CLOCK-anchored components (pooled share,
+  latency_bucket_stacked.pdf         per-request share distribution, and
+  + latency_*.csv                    conditional-by-total-latency-bucket breakdown).
+                                   Merged in from the former standalone
+                                   analyze_latency_breakdown.py.
 
 Usage:
   scripts/analyze_profiles.py \\
@@ -1038,8 +1046,9 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
             ])
 
     # ----- per-turn RAW rows CSV (one row per turn) -----
-    # Long-form input for downstream latency-composition analysis
-    # (scripts/analyze_latency_breakdown.py). task-tool turns already excluded.
+    # Long-form per-turn dump (task-tool turns already excluded). The
+    # latency-composition views are computed in-process by
+    # analyze_latency_composition(); this CSV is the portable long-form export.
     per_turn_path = out / "fig6_turn_decomposition_per_turn.csv"
     with per_turn_path.open("w", newline="") as f:
         w = csv.writer(f)
@@ -1219,8 +1228,8 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
         return any(tc.name == TASK_TOOL_NAME for tc in t.tools)
 
     # Threshold from the SAME (task-excluded) turn population so tail_quantile
-    # lines up with fig6's >pQ bucket. Uses linear-interp percentile == numpy
-    # default, matching pandas' default quantile in analyze_latency_breakdown.
+    # lines up with fig6's >pQ bucket. Uses linear-interpolation percentile
+    # (numpy default), matching analyze_latency_composition's np.quantile buckets.
     dur_floor = min_duration_s
     if tail_quantile is not None:
         durs = [t.turn_duration_s for s in sessions.values()
@@ -1393,6 +1402,220 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
 # ---------- entry point ----------
 
 
+# Total-latency buckets, split at the p50/p90/p99 of the per-turn duration.
+# Comparison is `<=` on the lower edge so ties fall in the lower bucket.
+_LAT_BUCKETS = ["<=p50", "p50-p90", "p90-p99", ">p99"]
+
+
+def _lat_fig_violin(per_req: dict, comps, path: Path) -> Path:
+    fig, ax = plt.subplots(figsize=(1.6 + 1.1 * len(comps), 3.2))
+    for i, (name, _vals, color) in enumerate(comps):
+        pos = i + 1
+        v = per_req[name]
+        # gaussian_kde (inside violinplot) is singular on zero-variance samples
+        # (e.g. tool share ~0 everywhere); fall back to a median marker.
+        if v.size >= 2 and float(np.var(v)) > 1e-12:
+            parts = ax.violinplot([v], positions=[pos], showmedians=True, showextrema=True)
+            parts["bodies"][0].set_facecolor(color)
+            parts["bodies"][0].set_alpha(0.7)
+            parts["bodies"][0].set_edgecolor("black")
+            parts["bodies"][0].set_linewidth(0.5)
+            for k in ("cbars", "cmins", "cmaxes", "cmedians"):
+                if k in parts:
+                    parts[k].set_color("black")
+                    parts[k].set_linewidth(0.8)
+        else:
+            med = float(np.median(v)) if v.size else 0.0
+            ax.scatter([pos], [med], color=color, edgecolor="black", zorder=3, s=30)
+            ax.hlines(med, pos - 0.25, pos + 0.25, color="black", linewidth=0.8)
+    ax.set_xticks(range(1, len(comps) + 1))
+    ax.set_xticklabels([n for n, _, _ in comps], rotation=20, ha="right", fontsize=8)
+    ax.set_ylabel("per-request share of total latency")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_title("Per-request latency-component share", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _lat_fig_sorted_stacked(dur, comps, path: Path) -> Path:
+    order = dur.argsort()
+    x = np.arange(len(order))
+    bottom = np.zeros(len(order))
+    fig, ax = plt.subplots(figsize=(7.0, 3.2))
+    for name, vals, color in comps:
+        v = vals[order]
+        ax.bar(x, v, bottom=bottom, width=1.0, linewidth=0, color=color, label=name)
+        bottom += v
+    ax.set_xlabel("turn (sorted by total latency, ascending)")
+    ax.set_ylabel("latency (s)")
+    ax.set_xlim(-0.5, len(order) - 0.5)
+    ax.set_ylim(bottom=0)
+    ax.set_title("Latency composition vs magnitude", fontsize=9)
+    ax.legend(fontsize=7, frameon=False, ncol=len(comps), loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _lat_fig_bucket_stacked(cond_rows, comps, path: Path) -> Path:
+    present = [r for r in cond_rows if r["n"] > 0]
+    x = np.arange(len(present))
+    bottom = np.zeros(len(present))
+    fig, ax = plt.subplots(figsize=(1.8 + 1.0 * len(present), 3.4))
+    for name, _vals, color in comps:
+        vals = np.array([r[name] for r in present], dtype=float)
+        ax.bar(x, vals, bottom=bottom, width=0.7, color=color,
+               edgecolor="black", linewidth=0.4, label=name)
+        bottom += vals
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{r['bucket']}\n(n={r['n']})" for r in present], fontsize=8)
+    ax.set_ylabel("mean per-request share")
+    ax.set_ylim(0, 1.02)
+    ax.set_title("Composition by total-latency bucket", fontsize=9)
+    ax.legend(fontsize=7, frameon=False, ncol=len(comps),
+              loc="upper center", bbox_to_anchor=(0.5, -0.12))
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def analyze_latency_composition(sessions: dict[str, Session], out: Path) -> Path | None:
+    """Per-request (per-turn) latency-composition analysis on the WALL-CLOCK-
+    anchored components (llm = llm.end - turn.start - tool, with the stream-based
+    split as fallback where timestamps are missing; task-tool turns excluded via
+    _collect_turn_decomposition). Merged in from the former standalone
+    analyze_latency_breakdown.py so all profile analysis lives in one script and
+    shares the corrected LLM timing.
+
+    Emits into `out`:
+      latency_pooled_share.csv          -- (1) pooled/time-weighted share (Σcomp/Σdur)
+      latency_per_request_share.csv     -- (2) per-request share distribution
+                                               (mean/p50/p90/p99/p25/p75/min/max)
+      latency_conditional_by_bucket.csv -- (3) mean per-request share per component,
+                                               conditioned on the total-latency bucket
+                                               split at the p50/p90/p99 of duration
+      latency_share_violin.pdf          -- per-component per-request share distribution
+      latency_sorted_stacked.pdf        -- turns sorted by total latency, stacked seconds
+      latency_bucket_stacked.pdf        -- mean share per component per bucket
+    Returns `out` (or None when there are no turns)."""
+    rows = _collect_turn_decomposition(sessions)
+    if not rows:
+        print("\nlatency composition: no turns with full timing data")
+        return None
+
+    dur = np.array([r[2] for r in rows], dtype=float)
+    llm_s = np.array([r[3] for r in rows], dtype=float)
+    tool = np.array([r[4] for r in rows], dtype=float)
+    post_s = np.array([r[5] for r in rows], dtype=float)
+    llm_t = np.array([r[6] if r[6] is not None else np.nan for r in rows], dtype=float)
+    oth_t = np.array([r[7] if r[7] is not None else np.nan for r in rows], dtype=float)
+    llm = np.where(np.isnan(llm_t), llm_s, llm_t)       # anchored, stream fallback
+    others = np.where(np.isnan(oth_t), post_s, oth_t)
+
+    comps = [("llm_wall_s", llm, "C0"), ("tool_wall_s", tool, "C2"),
+             ("others", others, "0.6")]
+    safe = dur > 0
+
+    def _pct(v, q):
+        return float(np.percentile(v, q)) if v.size else float("nan")
+
+    import csv
+    # ----- (1) pooled / time-weighted share -----
+    grand = float(dur.sum())
+    pooled = {}
+    with (out / "latency_pooled_share.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["component", "total_seconds", "pooled_share"])
+        for name, vals, _ in comps:
+            s = float(vals.sum())
+            pooled[name] = (s / grand) if grand > 0 else float("nan")
+            w.writerow([name, f"{s:.4f}", f"{pooled[name]:.4f}"])
+        w.writerow(["TOTAL", f"{grand:.4f}", "1.0000" if grand > 0 else ""])
+
+    # ----- (2) per-request share distribution (each turn weighted equally) -----
+    per_req = {}
+    with (out / "latency_per_request_share.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["component", "n_requests", "mean", "p50", "p90", "p99",
+                    "p25", "p75", "min", "max"])
+        for name, vals, _ in comps:
+            sh = vals[safe] / dur[safe]
+            per_req[name] = sh
+            w.writerow([
+                name, sh.size,
+                f"{float(np.mean(sh)):.4f}" if sh.size else "",
+                f"{_pct(sh, 50):.4f}", f"{_pct(sh, 90):.4f}", f"{_pct(sh, 99):.4f}",
+                f"{_pct(sh, 25):.4f}", f"{_pct(sh, 75):.4f}",
+                f"{float(sh.min()):.4f}" if sh.size else "",
+                f"{float(sh.max()):.4f}" if sh.size else "",
+            ])
+
+    # ----- (3) conditional by total-latency bucket -----
+    p50, p90, p99 = (float(np.quantile(dur, q)) for q in (0.5, 0.9, 0.99))
+
+    def _bucket(t):
+        if t <= p50:
+            return 0
+        if t <= p90:
+            return 1
+        if t <= p99:
+            return 2
+        return 3
+
+    bidx = np.array([_bucket(t) for t in dur])
+    cond_rows = []
+    with (out / "latency_conditional_by_bucket.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["bucket", "n_requests", "mean_total_s"]
+                   + [f"{n}_mean_share" for n, _, _ in comps])
+        for bi, blabel in enumerate(_LAT_BUCKETS):
+            m = (bidx == bi) & safe
+            n = int(m.sum())
+            row = {"bucket": blabel, "n": n,
+                   "mean_total": float(dur[m].mean()) if n else float("nan")}
+            shares = []
+            for name, vals, _ in comps:
+                sh = float((vals[m] / dur[m]).mean()) if n else float("nan")
+                shares.append(sh)
+                row[name] = sh
+            cond_rows.append(row)
+            w.writerow([blabel, n, f"{row['mean_total']:.4f}"]
+                       + [f"{x:.4f}" for x in shares])
+
+    # ----- stdout summary -----
+    print()
+    print(f"Latency composition (n={dur.size} turns, wall-clock-anchored, "
+          f"task-tool turns excluded):")
+    print(f"  total-latency thresholds: p50={p50:.3f}s  p90={p90:.3f}s  p99={p99:.3f}s")
+    print("  (1) pooled / time-weighted share:")
+    for name, vals, _ in comps:
+        print(f"      {name:<12} {pooled[name]:>7.2%}  ({float(vals.sum()):.1f}s)")
+    print("  (2) per-request share (each turn weighted equally):")
+    print(f"      {'component':<12} {'mean':>7} {'p50':>7} {'p90':>7} {'p99':>7}")
+    for name, _vals, _ in comps:
+        sh = per_req[name]
+        print(f"      {name:<12} {float(np.mean(sh)) if sh.size else float('nan'):>7.1%} "
+              f"{_pct(sh, 50):>7.1%} {_pct(sh, 90):>7.1%} {_pct(sh, 99):>7.1%}")
+    print("  (3) mean share by total-latency bucket:")
+    print("      " + f"{'bucket':<10} {'n':>5} {'mean_tot':>9}  "
+          + " ".join(f"{n:>12}" for n, _, _ in comps))
+    for r in cond_rows:
+        if r["n"] == 0:
+            continue
+        print("      " + f"{r['bucket']:<10} {r['n']:>5} {r['mean_total']:>9.2f}  "
+              + " ".join(f"{r[n]:>12.1%}" for n, _, _ in comps))
+
+    # ----- figures -----
+    _lat_fig_violin(per_req, comps, out / "latency_share_violin.pdf")
+    _lat_fig_sorted_stacked(dur, comps, out / "latency_sorted_stacked.pdf")
+    _lat_fig_bucket_stacked(cond_rows, comps, out / "latency_bucket_stacked.pdf")
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
@@ -1470,6 +1693,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     if path is not None:
         print(f"  wrote {path}")
+
+    # latency composition (merged from the former analyze_latency_breakdown.py):
+    # per-request pooled / percentile / bucketed share on the wall-clock-anchored
+    # components, plus violin / sorted-stacked / bucket-stacked figures.
+    path = analyze_latency_composition(sessions, args.output)
+    if path is not None:
+        print(f"  wrote latency_* CSVs + figures to {path}")
 
     return 0
 

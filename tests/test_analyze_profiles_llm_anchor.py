@@ -22,6 +22,7 @@ to the Agg backend and import-skipped if absent.
 
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 import sys
@@ -192,3 +193,76 @@ def test_per_turn_csv_has_corrected_columns(mod, tmp_path):
     # fallback turn: blank corrected columns
     assert recs[3]["llm_wall_true_s"] == ""
     assert recs[3]["others_true_s"] == ""
+
+
+# --------------------------------------------------------------------------
+# analyze_latency_composition (merged from the former analyze_latency_breakdown)
+# --------------------------------------------------------------------------
+#
+# Effective (anchored, stream-fallback) per-turn components for the mock:
+#   step1 (buffered):  dur 75.535  llm 75.417  tool 0.016  others 0.102
+#   step2 (streamed):  dur  7.331  llm  7.220  tool 0.011  others 0.100
+#   step3 (no llm.end):dur  5.000  llm  4.000  tool 0.500  others 0.500 (stream)
+# Sums: Σdur=87.866  Σllm=86.637  Σtool=0.527  Σothers=0.702
+
+
+def _run_latency(mod, tmp_path):
+    p = tmp_path / "profiles.jsonl"
+    _write_profiles(p)
+    sessions = mod.load_sessions(p)
+    outdir = tmp_path / "lat"
+    outdir.mkdir()
+    ret = mod.analyze_latency_composition(sessions, outdir)
+    assert ret == outdir
+    return outdir
+
+
+def test_latency_outputs_created(mod, tmp_path):
+    outdir = _run_latency(mod, tmp_path)
+    for name in ("latency_pooled_share.csv", "latency_per_request_share.csv",
+                 "latency_conditional_by_bucket.csv", "latency_share_violin.pdf",
+                 "latency_sorted_stacked.pdf", "latency_bucket_stacked.pdf"):
+        f = outdir / name
+        assert f.exists() and f.stat().st_size > 0, name
+
+
+def test_latency_pooled_share_uses_anchored_components(mod, tmp_path):
+    outdir = _run_latency(mod, tmp_path)
+    with (outdir / "latency_pooled_share.csv").open() as f:
+        recs = {row["component"]: row for row in csv.DictReader(f)}
+    # llm dominated once the buffered turn's 75s is anchored back into LLM
+    assert float(recs["llm_wall_s"]["pooled_share"]) == pytest.approx(86.637 / 87.866, abs=1e-3)
+    assert float(recs["tool_wall_s"]["pooled_share"]) == pytest.approx(0.527 / 87.866, abs=1e-3)
+    assert float(recs["others"]["pooled_share"]) == pytest.approx(0.702 / 87.866, abs=1e-3)
+    # three component shares sum to 1
+    tot = sum(float(recs[c]["pooled_share"]) for c in ("llm_wall_s", "tool_wall_s", "others"))
+    assert tot == pytest.approx(1.0, abs=1e-6)
+
+
+def test_latency_per_request_table_structure(mod, tmp_path):
+    outdir = _run_latency(mod, tmp_path)
+    with (outdir / "latency_per_request_share.csv").open() as f:
+        recs = list(csv.DictReader(f))
+    assert [r["component"] for r in recs] == ["llm_wall_s", "tool_wall_s", "others"]
+    for r in recs:
+        assert int(r["n_requests"]) == 3
+        assert 0.0 <= float(r["mean"]) <= 1.0
+
+
+def test_latency_buckets_partition_by_total(mod, tmp_path):
+    outdir = _run_latency(mod, tmp_path)
+    with (outdir / "latency_conditional_by_bucket.csv").open() as f:
+        recs = {row["bucket"]: row for row in csv.DictReader(f)}
+    # durations [5.0, 7.331, 75.535]: p50=7.331 puts two turns in <=p50, the
+    # 75.5s buffered turn lands in >p99; the middle buckets are empty
+    assert int(recs["<=p50"]["n_requests"]) == 2
+    assert int(recs["p50-p90"]["n_requests"]) == 0
+    assert int(recs["p90-p99"]["n_requests"]) == 0
+    assert int(recs[">p99"]["n_requests"]) == 1
+    # the >p99 bucket is the buffered turn -> ~all LLM once anchored
+    assert float(recs[">p99"]["llm_wall_s_mean_share"]) == pytest.approx(75.417 / 75.535, abs=1e-3)
+    # non-empty buckets' mean shares sum to ~1
+    for b in ("<=p50", ">p99"):
+        tot = sum(float(recs[b][f"{c}_mean_share"])
+                  for c in ("llm_wall_s", "tool_wall_s", "others"))
+        assert tot == pytest.approx(1.0, abs=1e-6)
