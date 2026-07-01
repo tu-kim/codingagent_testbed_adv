@@ -899,16 +899,17 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         ("duration_s", dur),
         ("llm_wall_s", llm),
         ("tool_wall_s", tool),
-        ("post_overhead_s", post),
+        ("others", post),        # duration - llm - tool: pre/post-turn setup,
+                                 # post-tool gap, framework finalization
     ]
     stats = {name: _summary_stats(vals) for name, vals in components}
-    share_components = ("llm_wall_s", "tool_wall_s", "post_overhead_s")
+    share_components = ("llm_wall_s", "tool_wall_s", "others")
 
     # Per-turn share distribution (each turn weighted equally -- this is the
     # mean-OF-ratios family, NOT ratio-of-means, so long turns don't dominate).
     # Skip turns with zero duration to avoid div-by-zero.
     safe = dur > 0
-    by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "post_overhead_s": post}
+    by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "others": post}
     if safe.any():
         share_stats = {
             name: _summary_stats(by_name[name][safe] / dur[safe])
@@ -968,12 +969,24 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
                 f"{s['p90']:.4f}", f"{s['p99']:.4f}",
             ])
 
+    # ----- per-turn RAW rows CSV (one row per turn) -----
+    # Long-form input for downstream latency-composition analysis
+    # (scripts/analyze_latency_breakdown.py). task-tool turns already excluded.
+    per_turn_path = out / "fig6_turn_decomposition_per_turn.csv"
+    with per_turn_path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["session_id", "step", "duration_s",
+                    "llm_wall_s", "tool_wall_s", "others_s"])
+        for sid, step, d, lw, tw, po in rows:
+            w.writerow([sid, step,
+                        f"{d:.6f}", f"{lw:.6f}", f"{tw:.6f}", f"{po:.6f}"])
+
     # ----- figure: horizontal stacked single bar showing mean composition -----
     fig, ax = plt.subplots(figsize=(3.5, 1.5))
     pieces = [
         ("llm_wall",       float(llm.mean()),  "C0"),
         ("tool_wall",      float(tool.mean()), "C2"),
-        ("post_overhead",  float(post.mean()), "0.6"),
+        ("others",         float(post.mean()), "0.6"),
     ]
     mean_dur = float(dur.mean()) or 1.0
     left = 0.0
