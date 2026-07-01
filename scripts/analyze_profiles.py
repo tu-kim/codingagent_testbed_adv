@@ -902,10 +902,15 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
 
 
 def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | None:
-    """Mean/median/p90/p99 stats for turn.end's duration / llm_wall /
-    tool_wall / post_overhead, plus the average per-turn share of duration
-    each component occupies. Emits a small horizontal stacked bar figure
-    + companion CSV + stdout table."""
+    """Mean/median/p90/p99 stats for per-turn duration / llm_wall /
+    tool_wall / others, plus the per-turn share distribution. The LLM
+    component is WALL-CLOCK-ANCHORED (llm.end - turn.start - tool_wall),
+    which recovers the real LLM time the stream-event llm_wall_s misses on
+    buffered large tool-call turns; turns lacking timestamps fall back to
+    the stream-based split. The legacy stream-based numbers are printed
+    below for reference, and the per-turn CSV carries both
+    (llm_wall_s/others_s = stream, llm_wall_true_s/others_true_s = anchored).
+    Emits a horizontal stacked bar figure + companion CSVs + stdout tables."""
     rows = _collect_turn_decomposition(sessions)
     if not rows:
         print("\nturn decomposition: no turns with full timing data")
@@ -926,12 +931,22 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     llm_true, others_true = corr.T
     n_corr = int(np.count_nonzero(~np.isnan(llm_true)))
 
+    # Promote the wall-clock-anchored values (llm.end - turn.start - tool) to
+    # PRIMARY: the stream-event llm_wall_s under-measures buffered large
+    # tool-call turns (start-step fires only when opencode starts consuming the
+    # response). Fall back to the stream-based split only where turn.start /
+    # llm.end timestamps are missing. Both variants satisfy
+    # llm + tool + others == duration, so the fallback is seamless and the
+    # tool_wall_s / duration_s columns are untouched.
+    llm_stream, post_stream = llm.copy(), post.copy()
+    llm = np.where(np.isnan(llm_true), llm_stream, llm_true)
+    post = np.where(np.isnan(others_true), post_stream, others_true)
+
     components = [
         ("duration_s", dur),
-        ("llm_wall_s", llm),
+        ("llm_wall_s", llm),      # wall-clock-anchored (llm.end - turn.start - tool)
         ("tool_wall_s", tool),
-        ("others", post),        # duration - llm - tool: pre/post-turn setup,
-                                 # post-tool gap, framework finalization
+        ("others", post),         # residual = finish-step -> turn.end framework tail
     ]
     stats = {name: _summary_stats(vals) for name, vals in components}
     share_components = ("llm_wall_s", "tool_wall_s", "others")
@@ -956,7 +971,7 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     # ----- stdout pretty table -----
     print()
     print(f"Per-turn duration decomposition (n={len(rows)} turns, "
-          f"task-tool turns excluded):")
+          f"task-tool turns excluded; LLM wall-clock-anchored):")
     hdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
     print(hdr)
     print("-" * len(hdr))
@@ -974,28 +989,27 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         print(f"{name:<18} {s['mean']:>9.1%} {s['median']:>9.1%} "
               f"{s['p90']:>9.1%} {s['p99']:>9.1%}")
 
-    # ----- wall-clock-anchored correction (turn.start -> llm.end) -----
+    # ----- legacy stream-event split (start-step anchor), for reference -----
+    # The primary tables above are now wall-clock-anchored; show the old
+    # stream-based llm/others alongside so the correction's effect is visible.
+    if n_corr < len(rows):
+        print(f"\n  (wall-clock-anchored on {n_corr}/{len(rows)} turns; the rest "
+              f"fell back to the stream-based split)")
     if n_corr:
-        lt = llm_true[~np.isnan(llm_true)]
-        ot = others_true[~np.isnan(others_true)]
-        tw_c = tool[~np.isnan(llm_true)]
+        mask = ~np.isnan(llm_true)
+        moved = float(np.mean(llm_true[mask] - llm_stream[mask]))
         print()
-        print(f"CORRECTED decomposition (turn.start->llm.end anchor, "
-              f"n={n_corr}/{len(rows)} turns with timestamps):")
-        print("  recovers real LLM wall the stream-based llm_wall_s misses on "
-              "buffered large tool-call turns")
-        chdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
-        print(chdr)
-        print("-" * len(chdr))
-        for name, vals in (("llm_wall_true_s", lt), ("tool_wall_s", tw_c),
-                           ("others_true_s", ot)):
+        print("Legacy stream-event decomposition (start-step anchor, reference):")
+        lhdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
+        print(lhdr)
+        print("-" * len(lhdr))
+        for name, vals in (("llm_wall_s(stream)", llm_stream),
+                           ("others(stream)", post_stream)):
             s = _summary_stats(vals)
             print(f"{name:<18} {s['mean']:>9.3f} {s['median']:>9.3f} "
                   f"{s['p90']:>9.3f} {s['p99']:>9.3f}")
-        # how much LLM time the stream-based split lost into "others"
-        lw_c = llm[~np.isnan(llm_true)]
-        moved = float(np.mean(lt - lw_c))
-        print(f"  mean LLM time recovered from 'others' into LLM: {moved:+.3f}s/turn")
+        print(f"  mean LLM time the stream split misattributed to 'others': "
+              f"{moved:+.3f}s/turn (now folded back into llm_wall_s)")
 
     # ----- CSV -----
     import csv
