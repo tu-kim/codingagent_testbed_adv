@@ -122,6 +122,7 @@ class ToolCall:
     duration_s: float
     ok: bool
     output_chars: int | None = None
+    args_head: str | None = None       # tool.start.args_head (≤200-char JSON preview)
 
 
 @dataclass
@@ -181,6 +182,9 @@ def _iter_event_files(path: Path):
 
 def load_sessions(path: Path) -> dict[str, Session]:
     sessions: dict[str, Session] = {}
+    # tool.start carries args_head (the command preview); tool.end carries the
+    # duration. Stash args_head by (sid, callID) on start, attach it on end.
+    pending_tool_args: dict[tuple[str, str], str] = {}
 
     def ensure_session(sid: str) -> Session:
         s = sessions.get(sid)
@@ -265,6 +269,11 @@ def load_sessions(path: Path) -> dict[str, Session]:
                     t.llm_output_tokens = out
                     t.llm_cache_read = (cache.get("read") if isinstance(cache, dict) else 0) or 0
 
+                elif ev_type == "tool.start":
+                    cid = ev.get("callID")
+                    ah = ev.get("args_head")
+                    if cid is not None and ah is not None:
+                        pending_tool_args[(sid, cid)] = ah
                 elif ev_type == "tool.end":
                     step = ev.get("step")
                     name = ev.get("name") or "?"
@@ -272,6 +281,8 @@ def load_sessions(path: Path) -> dict[str, Session]:
                     if step is None or dur is None:
                         continue
                     t = ensure_turn(sess, step)
+                    cid = ev.get("callID")
+                    ah = pending_tool_args.pop((sid, cid), None) if cid is not None else None
                     t.tools.append(
                         ToolCall(
                             name=name,
@@ -279,6 +290,7 @@ def load_sessions(path: Path) -> dict[str, Session]:
                             duration_s=float(dur),
                             ok=bool(ev.get("ok", True)),
                             output_chars=ev.get("output_chars"),
+                            args_head=ah,
                         )
                     )
 
@@ -1620,6 +1632,25 @@ def _fmt_tok(n) -> str:
     return "-" if n is None else str(int(n))
 
 
+def _extract_cmd(args_head: str | None) -> str:
+    """Pull the human-meaningful command out of a tool.start args_head preview
+    (JSON.stringify(args) truncated to 200 chars). Returns the bash command /
+    file path / pattern when the preview parses; else the raw (truncated)
+    preview so the start of a long command is still visible."""
+    if not args_head:
+        return ""
+    try:
+        d = json.loads(args_head)
+        if isinstance(d, dict):
+            for k in ("command", "cmd", "filePath", "path", "pattern", "query"):
+                v = d.get(k)
+                if isinstance(v, str) and v:
+                    return v
+    except Exception:
+        pass
+    return args_head
+
+
 def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
                                  top_n: int = 20,
                                  trace_path: Path | None = None) -> Path | None:
@@ -1644,6 +1675,10 @@ def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
                 by_tool[tc.name] = by_tool.get(tc.name, 0.0) + (tc.duration_s or 0.0)
                 out_chars += tc.output_chars or 0
             dom_tool, dom_s = max(by_tool.items(), key=lambda kv: kv[1])
+            # command of the LONGEST single call of the dominant tool
+            dom_longest = max((tc for tc in t.tools if tc.name == dom_tool),
+                              key=lambda tc: tc.duration_s or 0.0)
+            dom_cmd = _extract_cmd(dom_longest.args_head)
             meta = trace_map.get(sid, {})
             recs.append({
                 "sid": sid, "step": step,
@@ -1653,7 +1688,7 @@ def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
                 "in_tok": t.llm_input_tokens, "out_tok": t.llm_output_tokens,
                 "cache_read": t.llm_cache_read, "n_tools": len(t.tools),
                 "out_chars": out_chars, "dom_tool": dom_tool, "dom_tool_s": dom_s,
-                "by_tool": by_tool,
+                "dom_cmd": dom_cmd, "by_tool": by_tool,
             })
     if not recs:
         print("\ntool-dominated turns: no turns with tools")
@@ -1675,6 +1710,9 @@ def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
               f"{r['dom_tool']:>10} {r['dom_tool_s']:>7.2f} "
               f"{_fmt_tok(r['in_tok']):>8} {_fmt_tok(r['out_tok']):>8} "
               f"{_fmt_tok(r['cache_read']):>8}")
+        if r["dom_cmd"]:
+            cmd = r["dom_cmd"].replace("\n", "\\n")
+            print(f"      └ {cmd[:160]}")
 
     dom_counts: dict[str, int] = {}
     for r in top:
@@ -1690,7 +1728,7 @@ def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
         w.writerow(["session_id", "step", "instance_id", "repo", "duration_s",
                     "tool_wall_s", "tool_share", "input_tokens", "output_tokens",
                     "cache_read", "n_tools", "tool_output_chars",
-                    "dominant_tool", "dominant_tool_s", "tools"])
+                    "dominant_tool", "dominant_tool_s", "dominant_tool_cmd", "tools"])
         for r in recs:
             tools_str = ";".join(f"{k}:{v:.3f}" for k, v in
                                  sorted(r["by_tool"].items(), key=lambda kv: -kv[1]))
@@ -1701,7 +1739,7 @@ def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
                 "" if r["in_tok"] is None else r["in_tok"],
                 "" if r["out_tok"] is None else r["out_tok"],
                 r["cache_read"], r["n_tools"], r["out_chars"],
-                r["dom_tool"], f"{r['dom_tool_s']:.4f}", tools_str,
+                r["dom_tool"], f"{r['dom_tool_s']:.4f}", r["dom_cmd"], tools_str,
             ])
     print(f"  (csv: {csv_path})")
     return csv_path

@@ -275,18 +275,28 @@ def test_latency_buckets_partition_by_total(mod, tmp_path):
 _TSID = "ses_tooltest"
 
 
+_BASH_CMD = "python -m pytest tests/ -x"
+
+
 def _write_tool_heavy(path: Path) -> None:
-    """Two turns: a bash-dominated one (tool_wall 9/10) and a normal read turn."""
+    """Two turns: a bash-dominated one (tool_wall 9/10) and a normal read turn.
+    tool.start carries the command preview (args_head) + callID; tool.end matches
+    by callID."""
     turns = [
-        # step, tool_name, tool_dur, out_chars, llm_end_ts, in_tok, out_tok, cache,
+        # step, tool, dur, out_chars, callID, args_head, llm_end_ts, in, out, cache,
         #   turn_start, dur, llm_wall, tool_wall, post
-        (1, "bash", 9.0, 500, 1000.5, 5000, 200, 1000, 1000.0, 10.0, 0.5, 9.0, 0.5),
-        (2, "read", 0.1, 50, 2004.0, 2000, 800, 0, 2000.0, 5.0, 4.0, 0.1, 0.9),
+        (1, "bash", 9.0, 500, "c1", json.dumps({"command": _BASH_CMD, "description": "run"}),
+         1000.5, 5000, 200, 1000, 1000.0, 10.0, 0.5, 9.0, 0.5),
+        (2, "read", 0.1, 50, "c2", json.dumps({"filePath": "/repo/foo.py"}),
+         2004.0, 2000, 800, 0, 2000.0, 5.0, 4.0, 0.1, 0.9),
     ]
     lines = []
-    for (step, tname, tdur, oc, lend, itk, otk, cr, tstart, dur, lw, tw, po) in turns:
+    for (step, tname, tdur, oc, cid, ah, lend, itk, otk, cr,
+         tstart, dur, lw, tw, po) in turns:
         lines.append({"ev": "turn.start", "sessionID": _TSID, "step": step, "ts": tstart})
-        lines.append({"ev": "tool.end", "sessionID": _TSID, "step": step,
+        lines.append({"ev": "tool.start", "sessionID": _TSID, "step": step,
+                      "callID": cid, "name": tname, "kind": "builtin", "args_head": ah})
+        lines.append({"ev": "tool.end", "sessionID": _TSID, "step": step, "callID": cid,
                       "name": tname, "ok": True, "duration_s": tdur, "output_chars": oc})
         lines.append({"ev": "llm.end", "sessionID": _TSID, "step": step, "ts": lend,
                       "finish": "tool-calls", "step_duration_s": 0.2,
@@ -332,3 +342,13 @@ def test_tool_dominated_reports_tokens_and_breakdown(mod, tmp_path):
     assert int(bash["tool_output_chars"]) == 500
     assert float(bash["dominant_tool_s"]) == pytest.approx(9.0, abs=1e-6)
     assert bash["tools"] == "bash:9.000"
+    # the actual command run under bash is surfaced from tool.start.args_head
+    assert bash["dominant_tool_cmd"] == _BASH_CMD
+
+
+def test_tool_dominated_command_extracted_from_args_head(mod, tmp_path):
+    recs = _run_tool_dominated(mod, tmp_path)
+    by_tool = {r["dominant_tool"]: r for r in recs}
+    assert by_tool["bash"]["dominant_tool_cmd"] == _BASH_CMD
+    # the read turn's file path is pulled from the filePath key
+    assert by_tool["read"]["dominant_tool_cmd"] == "/repo/foo.py"
