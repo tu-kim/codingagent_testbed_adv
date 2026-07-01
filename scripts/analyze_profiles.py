@@ -43,9 +43,9 @@ Figures emitted:
                                    separately. Companion stats CSV
                                    (mean/median/p90/p99 per component + average
                                    per-turn ratio).
-  fig6b_turn_share_distribution.pdf — per-turn share of each component
-                                   (llm/tool/others) overlaid in one graph
-                                   (histograms + median lines).
+  fig6b_turn_share_distribution.pdf — empirical CDF of each component's
+                                   (llm/tool/others) per-turn share of duration,
+                                   overlaid in one graph.
   fig7_post_overhead_breakdown.pdf — post_overhead (others) split into
                                    snapshot+DB vs the rest (see analyze_post_overhead).
   latency_share_violin.pdf,        — per-request latency-composition views on the
@@ -928,29 +928,36 @@ _SHARE_COLORS = {"llm_wall_s": "C0", "tool_wall_s": "C2", "others": "0.5"}
 
 
 def _fig_turn_share_dist(share_arrays: dict, share_components, path: Path) -> Path:
-    """Overlaid histograms of each component's per-turn share of duration, in one
-    graph, with a dashed median line per component. Shares are in [0,1] (clipped
-    for the axis; parallel-tool edge cases can nudge tool share past 1)."""
+    """Empirical CDF of each component's per-turn share of duration (llm / tool /
+    others), overlaid in one graph. y = fraction of turns with share <= x, so a
+    curve hugging the right edge means that component dominates most turns.
+    Shares are in [0,1] for the anchored split; parallel-tool edge cases can push
+    tool share past 1, so the x-axis extends to the observed max."""
     fig, ax = plt.subplots(figsize=(4.2, 2.7))
-    bins = np.linspace(0.0, 1.0, 41)
     any_data = False
+    xmax = 1.0
     for name in share_components:
         v = share_arrays.get(name)
         if v is None or v.size == 0:
             continue
         any_data = True
+        xmax = max(xmax, float(v.max()))
         color = _SHARE_COLORS.get(name, "C3")
-        ax.hist(np.clip(v, 0.0, 1.0), bins=bins, histtype="stepfilled", alpha=0.4,
-                color=color, edgecolor=color, linewidth=1.1, label=name)
-        ax.axvline(float(np.median(v)), color=color, linestyle="--", linewidth=0.9)
+        xs = np.sort(v)
+        ys = np.arange(1, xs.size + 1) / xs.size
+        # step CDF, anchored at (0,0) so each curve starts on the axis
+        ax.step(np.concatenate(([0.0], xs)), np.concatenate(([0.0], ys)),
+                where="post", color=color, linewidth=1.6, label=name)
     if not any_data:
         plt.close(fig)
         return path
+    ax.axhline(0.5, color="0.7", linewidth=0.6, linestyle=":")  # median reference
     ax.set_xlabel("per-turn share of duration")
-    ax.set_ylabel("turns")
-    ax.set_xlim(0.0, 1.0)
-    ax.set_title("Per-turn share distribution (dashed = median)", fontsize=9)
-    ax.legend(fontsize=7, frameon=False)
+    ax.set_ylabel("cumulative fraction of turns")
+    ax.set_xlim(0.0, xmax)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("Per-turn share CDF (llm / tool / others)", fontsize=9)
+    ax.legend(fontsize=7, frameon=False, loc="lower right")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
