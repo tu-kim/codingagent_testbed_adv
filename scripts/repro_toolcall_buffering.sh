@@ -37,7 +37,10 @@ done
 cfg() { yq -r "$1" "$CFG"; }
 DYN="http://$(cfg .dynamo.host):$(cfg .dynamo.port)"
 SERVED="$(cfg .model.served_name)"
-MAX_TOKENS="${MAX_TOKENS:-4096}"
+MAX_TOKENS="${MAX_TOKENS:-8192}"
+MIN_TOKENS="${MIN_TOKENS:-3000}"   # vLLM extension: force a long generation so
+                                   # there is actually something to (not) stream
+COUNT="${COUNT:-1500}"             # enumeration length: 1..COUNT one per line
 OUT_DIR="${OUT_DIR:-$(mktemp -d)}"
 mkdir -p "$OUT_DIR"
 
@@ -54,24 +57,28 @@ timed() {  # timed <body-json> <out.timed>
     done | tee "$out" >/dev/null
 }
 
-# (A) FORCE a large tool-call (tool_choice pins the function).
+# (A) FORCE a large tool-call. tool_choice pins the function; the enumeration
+# prompt + min_tokens force a genuinely long `content` so there is real
+# generation time to observe (a stub tool-call finishes in ~20ms and proves
+# nothing). Emitting every integer explicitly defeats the model's urge to stub
+# with an ellipsis.
 read -r -d '' TOOL_BODY <<JSON || true
 {"model":"$SERVED","stream":true,"stream_options":{"include_usage":true},
- "max_tokens":$MAX_TOKENS,
- "messages":[{"role":"user","content":"Create hello.py: a Python file with 200 functions f1..f200, each printing its own number. Emit the ENTIRE file content via the write_file tool."}],
+ "max_tokens":$MAX_TOKENS,"min_tokens":$MIN_TOKENS,"temperature":0,
+ "messages":[{"role":"user","content":"Call write_file with path=\"nums.txt\" and content set to every integer from 1 to $COUNT, ONE PER LINE, in ascending order. Write EVERY number explicitly: no ranges, no ellipsis, no comments, no truncation."}],
  "tools":[{"type":"function","function":{"name":"write_file","description":"write a file",
    "parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}],
  "tool_choice":{"type":"function","function":{"name":"write_file"}}}
 JSON
 
-# (B) Control: a similarly large PLAIN-TEXT response, no tools.
+# (B) Control: a similarly long PLAIN-TEXT generation, no tools.
 read -r -d '' TEXT_BODY <<JSON || true
 {"model":"$SERVED","stream":true,"stream_options":{"include_usage":true},
- "max_tokens":$MAX_TOKENS,
- "messages":[{"role":"user","content":"Write a 200-line Python file with functions f1..f200, each printing its own number. Output the full code as plain text, do not use any tools."}]}
+ "max_tokens":$MAX_TOKENS,"min_tokens":$MIN_TOKENS,"temperature":0,
+ "messages":[{"role":"user","content":"List every integer from 1 to $COUNT, ONE PER LINE, in ascending order. Write EVERY number explicitly: no ranges, no ellipsis, no truncation. Do not use any tools."}]}
 JSON
 
-echo "DYN=$DYN  SERVED=$SERVED  MAX_TOKENS=$MAX_TOKENS  OUT_DIR=$OUT_DIR"
+echo "DYN=$DYN  SERVED=$SERVED  MAX_TOKENS=$MAX_TOKENS  MIN_TOKENS=$MIN_TOKENS  COUNT=$COUNT  OUT_DIR=$OUT_DIR"
 echo
 echo "== firing TOOL-CALL request =="
 timed "$TOOL_BODY" "$OUT_DIR/toolcall.timed"
