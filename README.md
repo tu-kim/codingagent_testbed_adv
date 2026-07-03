@@ -149,6 +149,14 @@ Progress prints per task to **stderr** (`[done/total] instance_id ok/FAIL rtt=..
 scripts/evaluate_apps.py --run results/apps1
 ```
 
+**Scaffold comparison — SWE-agent on the same APPS samples + same Dynamo backend** (`pip install sweagent` first; `--dry-run` prints the commands to validate the CLI surface):
+```bash
+scripts/run_sweagent_apps.py --split competition --num-samples 20 --seed 42 \
+  --out results/sweagent-apps1 --deployment local        # docker = +container overhead
+scripts/analyze_sweagent_traj.py --run results/sweagent-apps1 --frontend logs/frontend.log
+scripts/evaluate_apps.py --run results/sweagent-apps1     # same scorer as opencode runs
+```
+
 **Router sweep** (actual routing is set when the frontend starts, not by `--router`):
 ```bash
 for r in round-robin least-loaded kv; do
