@@ -57,10 +57,24 @@ def _load_dataset(hf_id: str, split: str) -> list[dict[str, Any]]:
 
     The "all" config is the full dataset (the difficulty-named configs are
     subsets); we always load "all" and filter difficulty in Python so the
-    deterministic-selection contract has a single code path."""
+    deterministic-selection contract has a single code path.
+
+    codeparrot/apps is a legacy SCRIPT-based hub dataset (it ships an
+    apps.py loading script). datasets >= 4.0 removed script support
+    entirely ("Dataset scripts are no longer supported"), and 2.20+ gates
+    it behind trust_remote_code (ValueError). Fallback: read the Hub's
+    auto-converted parquet export (refs/convert/parquet branch) through
+    the packaged parquet builder -- same rows/fields, no script."""
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset(hf_id, "all", split=split)
+    try:
+        ds = load_dataset(hf_id, "all", split=split)
+    except (RuntimeError, ValueError):
+        # The convert branch lays shards out as <config>/<split>/*.parquet.
+        # With explicit data_files the parquet builder names its single
+        # split "train" regardless of the source split -- request that.
+        files = f"hf://datasets/{hf_id}@refs/convert/parquet/all/{split}/*.parquet"
+        ds = load_dataset("parquet", data_files=files, split="train")
     return [dict(s) for s in ds]
 
 
