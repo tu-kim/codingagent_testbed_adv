@@ -148,10 +148,17 @@ vllm:
   #   ep:   --enable-expert-parallel (optional, default false). MoE expert
   #         sharding (e.g. MiniMax M2); EP size = tp*dp, so it's a bare toggle
   #         and does NOT add GPUs to the tp*pp*dp count.
+  # Topology is EITHER disagg (prefill_workers + decode_workers + prefill/decode
+  # sections) OR colocation (agg_workers + agg section). config.py rejects
+  # mixing, an empty union, and a half-configured disagg pair (a lone decode
+  # pool never becomes ready -- dynamo readiness gating needs a Prefill peer).
   prefill_workers:
     - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1, dp: 1, ep: true }
   decode_workers:
     - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1, dp: 1, ep: true }
+  agg_workers: []                 # PD colocation (aggregated): one worker type does
+                                  # prefill AND decode. Requires the `agg:` role
+                                  # section; mutually exclusive with the two lists above.
 
   prefill:
     max_model_len: 32768
@@ -203,10 +210,13 @@ There is **no `runner:` section**. Runner-side defaults (`num_samples=10`, `qps=
 Each worker needs role-specific Dynamo/vLLM args. `testbed.sh` injects these at launch:
 - `prefill_workers[]` → `--disaggregation-mode prefill` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`
 - `decode_workers[]`  → `--disaggregation-mode decode` plus `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` plus (if `vllm.tool_call_parser` is non-empty) `--dyn-tool-call-parser <name>` plus (if `vllm.reasoning_parser` is non-empty) `--dyn-reasoning-parser <name>`
-- Both roles → `--data-parallel-size <dp>` (only when the worker's `dp > 1`) plus `--enable-expert-parallel` (when the worker's `ep: true`). These are per-worker parallelism knobs forwarded straight to `AsyncEngineArgs` (so prefill and decode can differ); EP shards MoE experts across the `tp*dp` ranks without changing the `tp*pp*dp` GPU count.
-- Both roles → `--override-generation-config '<json>'` (if `vllm.override_generation_config` is a non-null dict) so the model's `generation_config.json` defaults are merged with our reproducibility-pinned baseline (see the bullet in "Conventions / gotchas" for the rationale).
+- `agg_workers[]` (**PD colocation**) → `--disaggregation-mode agg` (a first-class `DisaggregationMode` enum value, `dynamo/components/src/dynamo/common/constants.py:9-15`; omitting the flag resolves to the same AGGREGATED default, `backend_args.py:378-379`), **NO `--kv-transfer-config`** (only required for prefill, `args.py:213-223`; KV stays in-engine across both phases) and **NO `VLLM_NIXL_SIDE_CHANNEL_*` env**. Parsers ARE applied (see below). Aggregated workers register as component `backend` with `needs=[]` (`args.py:183-185`, `worker_factory.py:563-569`) so they serve the moment they register — the frontend needs zero changes, and `router_mode: kv` still works because agg workers publish KV events (only DECODE disables them, `args.py:338-343`). Do NOT mix agg and prefill/decode pools in one namespace (same `backend` component, ambiguous readiness) — `config.py` rejects it.
+- All roles → `--data-parallel-size <dp>` (only when the worker's `dp > 1`) plus `--enable-expert-parallel` (when the worker's `ep: true`). These are per-worker parallelism knobs forwarded straight to `AsyncEngineArgs` (so roles can differ); EP shards MoE experts across the `tp*dp` ranks without changing the `tp*pp*dp` GPU count.
+- All roles → `--override-generation-config '<json>'` (if `vllm.override_generation_config` is a non-null dict) so the model's `generation_config.json` defaults are merged with our reproducibility-pinned baseline (see the bullet in "Conventions / gotchas" for the rationale).
 
-The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The decode-only tool-call/reasoning-parser branch is enforced by `dynamo/components/src/dynamo/vllm/main.py:722-724` (`if worker_type != WorkerType.Prefill: runtime_config.tool_call_parser = ...; runtime_config.reasoning_parser = ...`); applying a parser on prefill is a no-op but a smell. The **reasoning parser** (`vllm.reasoning_parser` → `--dyn-reasoning-parser`) rides the same decode-only branch and is wired identically to `tool_call_parser` in `testbed.sh` — needed for models that emit in-band reasoning the frontend must strip (e.g. MiniMax M3's `<mm:think>…</mm:think>` → `reasoning_parser: minimax_m3`).
+The flag schema and connector class name come from the vendored Dynamo (`dynamo/components/src/dynamo/vllm/{args,backend_args}.py`). The tool-call/reasoning-parser branch is **non-prefill, not decode-only**: `dynamo/components/src/dynamo/vllm/main.py:722-724` (`if worker_type != WorkerType.Prefill: runtime_config.tool_call_parser = ...; runtime_config.reasoning_parser = ...`) applies the parsers to decode AND aggregated workers — both are the OpenAI surface that emits tool calls; only prefill skips (applying one there is a no-op but a smell). `testbed.sh` mirrors this with a `role != prefill` guard. The **reasoning parser** (`vllm.reasoning_parser` → `--dyn-reasoning-parser`) rides the same branch and is wired identically to `tool_call_parser` — needed for models that emit in-band reasoning the frontend must strip (e.g. MiniMax M3's `<mm:think>…</mm:think>` → `reasoning_parser: minimax_m3`).
+
+**Agg mode + testbed patches**: both `dynamo-scheduling-log.patch` and `dynamo-prompt-dump.patch` hook the `DecodeWorkerHandler` path that aggregated workers execute (`worker_factory.py:177-185` routes AGGREGATED through `_create_decode_worker`), so SCHED_DELAY lines and prompt dumps still fire in colocation — but always with `role=decode` (one line per request, no separate prefill record). The disagg-era guidance "filter prompt dumps to `role=prefill` for the canonical prompt" applies ONLY to disagg; in agg mode use the single `decode` record.
 
 ### Discovery vs. NATS
 

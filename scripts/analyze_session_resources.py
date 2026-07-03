@@ -42,9 +42,10 @@ per drain window, `max` = peak window. The first sample for each
 across role GPUs (total throughput) rather than averaging.
 
 Optionally reads `deploy/testbed.yaml` to label each GPU as
-prefill/decode/other based on `vllm.prefill_workers[].gpus` and
-`vllm.decode_workers[].gpus`, and to emit role-aggregated rows
-(prefill-mean SM_ACTIVE across both GPUs, etc).
+prefill/decode/agg/other based on `vllm.prefill_workers[].gpus`,
+`vllm.decode_workers[].gpus`, and `vllm.agg_workers[].gpus` (PD
+colocation), and to emit role-aggregated rows (prefill-mean SM_ACTIVE
+across both GPUs, etc).
 
 Usage:
   # Session window
@@ -148,8 +149,8 @@ def load_all_samples(resource_path: Path) -> list[dict]:
 
 
 def parse_gpu_role_map(testbed_yaml: Path | None) -> dict[int, tuple[str, str]]:
-    """{gpu_index: (worker_name, role)} where role ∈ {"prefill", "decode"}.
-    Returns {} if path is None or yaml is unreadable."""
+    """{gpu_index: (worker_name, role)} where role ∈ {"prefill", "decode",
+    "agg"}. Returns {} if path is None or yaml is unreadable."""
     if testbed_yaml is None or not testbed_yaml.exists():
         return {}
     try:
@@ -178,6 +179,7 @@ def parse_gpu_role_map(testbed_yaml: Path | None) -> dict[int, tuple[str, str]]:
     vllm = (cfg or {}).get("vllm", {}) or {}
     _add(vllm.get("prefill_workers"), "prefill")
     _add(vllm.get("decode_workers"), "decode")
+    _add(vllm.get("agg_workers"), "agg")  # PD colocation: one role does both
     return out
 
 

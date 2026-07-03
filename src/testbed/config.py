@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -243,18 +243,72 @@ class VLLMCfg(_Strict):
             "repetition_penalty": 1.0,
         }
     )
-    prefill_workers: list[WorkerCfg]
-    decode_workers: list[WorkerCfg]
-    prefill: VLLMRoleCfg
-    decode: VLLMRoleCfg
+    # Two mutually exclusive deployment topologies:
+    #   PD disaggregation: prefill_workers + decode_workers (+ prefill/decode
+    #     role sections). Workers get --disaggregation-mode prefill|decode and
+    #     a NixlConnector --kv-transfer-config; KV flows prefill -> decode.
+    #   PD colocation (aggregated): agg_workers (+ agg role section). One
+    #     worker type does both phases: --disaggregation-mode agg, NO
+    #     --kv-transfer-config, NO NIXL side-channel env (KV stays in-engine;
+    #     dynamo/components/src/dynamo/vllm/backend_args.py:378-379 resolves
+    #     the omitted flag to AGGREGATED, and args.py:213-223 only requires
+    #     kv-transfer-config for prefill). Aggregated workers register as
+    #     component "backend" with needs=[] (args.py:183-185,
+    #     worker_factory.py:563-569) so the frontend needs no changes and
+    #     kv router-mode still works (agg publishes KV events —
+    #     args.py:338-343 disables them for DECODE only).
+    # Mixing both in one namespace is rejected: an agg worker and a PD pair
+    # would register under the same component with ambiguous readiness.
+    prefill_workers: list[WorkerCfg] = Field(default_factory=list)
+    decode_workers: list[WorkerCfg] = Field(default_factory=list)
+    agg_workers: list[WorkerCfg] = Field(default_factory=list)
+    prefill: VLLMRoleCfg | None = None
+    decode: VLLMRoleCfg | None = None
+    agg: VLLMRoleCfg | None = None
     extra_args: str = ""
 
-    @field_validator("prefill_workers", "decode_workers")
+    @field_validator("prefill_workers", "decode_workers", "agg_workers")
     @classmethod
     def _validate_workers(cls, workers: list[WorkerCfg]) -> list[WorkerCfg]:
         for w in workers:
             w.validate_against_parallelism()
         return workers
+
+    @model_validator(mode="after")
+    def _validate_topology(self) -> "VLLMCfg":
+        disagg = bool(self.prefill_workers or self.decode_workers)
+        agg = bool(self.agg_workers)
+        if agg and disagg:
+            raise ValueError(
+                "agg_workers is mutually exclusive with prefill_workers/"
+                "decode_workers: aggregated and disaggregated workers would "
+                "register under the same dynamo component with ambiguous "
+                "readiness. Configure one topology per deployment."
+            )
+        if not agg and not disagg:
+            raise ValueError(
+                "no vllm workers configured: set prefill_workers+decode_workers "
+                "(PD disaggregation) or agg_workers (PD colocation)"
+            )
+        if disagg:
+            # A decode worker's WorkerSet needs a Prefill peer to become
+            # ready (dynamo model.rs readiness gating) — half a pair never
+            # serves, so reject it at config time.
+            if not (self.prefill_workers and self.decode_workers):
+                raise ValueError(
+                    "PD disaggregation needs BOTH prefill_workers and "
+                    "decode_workers (a lone decode pool never becomes ready; "
+                    "a lone prefill pool serves nothing). For a single-pool "
+                    "setup use agg_workers."
+                )
+            if self.prefill is None or self.decode is None:
+                raise ValueError(
+                    "prefill_workers/decode_workers require the matching "
+                    "'prefill:' and 'decode:' role sections"
+                )
+        if agg and self.agg is None:
+            raise ValueError("agg_workers requires the 'agg:' role section")
+        return self
 
 
 class DynamoCfg(_Strict):

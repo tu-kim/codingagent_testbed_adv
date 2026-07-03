@@ -169,12 +169,15 @@ spawn_worker() {
   model_name=$(cfg_get_env MODEL__NAME .model.name)
   model_served=$(cfg_get_env MODEL__SERVED_NAME .model.served_name)
 
+  # nixl_port_base is a DISAGG-only knob (feeds the NIXL side-channel port);
+  # agg workers never use it, so a pure-agg yaml may omit it entirely. Read
+  # with a "" fallback and validate only for prefill/decode roles.
   local nixl_base
-  nixl_base=$(cfg_get_env VLLM__NIXL_PORT_BASE .vllm.nixl_port_base)
+  nixl_base=$(cfg_get_env VLLM__NIXL_PORT_BASE '.vllm.nixl_port_base // ""')
   # nixl_base feeds arithmetic ($((nixl_base + rank*100))); a non-numeric value
-  # (yaml omission -> "null", or a TESTBED__VLLM__NIXL_PORT_BASE typo) would be
+  # (yaml omission -> "", or a TESTBED__VLLM__NIXL_PORT_BASE typo) would be
   # dereferenced as a varname and abort under set -u. Guard like dp above.
-  if [[ ! "$nixl_base" =~ ^[0-9]+$ ]]; then
+  if [[ "$role" != "agg" && ! "$nixl_base" =~ ^[0-9]+$ ]]; then
     echo "worker $name: nixl_port_base=$nixl_base is not a non-negative integer" >&2
     return 2
   fi
@@ -186,28 +189,57 @@ spawn_worker() {
   mns=$(cfg_get_env "VLLM__${role_uc}__MAX_NUM_SEQS" ".vllm.${role}.max_num_seqs")
   gmu=$(cfg_get_env "VLLM__${role_uc}__GPU_MEMORY_UTILIZATION" ".vllm.${role}.gpu_memory_utilization")
   kvdtype=$(cfg_get_env "VLLM__${role_uc}__KV_CACHE_DTYPE" ".vllm.${role}.kv_cache_dtype")
+  # Fail fast if the role section is missing/incomplete (yq yields "null"):
+  # otherwise vLLM would be launched with literal `--max-model-len null`.
+  # config.py validates this too, but testbed.sh reads the yaml directly.
+  local knob
+  for knob in "max_model_len=$mml" "max_num_batched_tokens=$mnbt" \
+              "max_num_seqs=$mns" "gpu_memory_utilization=$gmu" \
+              "kv_cache_dtype=$kvdtype"; do
+    if [[ "${knob#*=}" == "null" || -z "${knob#*=}" ]]; then
+      echo "worker $name: vllm.${role}.${knob%%=*} is missing (yaml lacks the" \
+           "'${role}:' role section or the key) -- refusing to launch" >&2
+      return 2
+    fi
+  done
 
   local extra_args
   extra_args=$(cfg_get_env VLLM__EXTRA_ARGS '.vllm.extra_args // ""')
 
-  # Role-specific kv-transfer-config JSON (kept as a single arg).
-  local disagg_mode kv_role
+  # Role-specific disaggregation flags.
+  #   prefill/decode: --disaggregation-mode + NixlConnector kv-transfer-config
+  #     (kv_producer/kv_consumer) + NIXL side-channel env.
+  #   agg (PD colocation): --disaggregation-mode agg, NO --kv-transfer-config
+  #     and NO NIXL env -- a single aggregated worker keeps KV in-engine
+  #     across prefill+decode; dynamo only REQUIRES kv-transfer-config for
+  #     prefill (dynamo/components/src/dynamo/vllm/args.py:213-223), and
+  #     passing NixlConnector without a transfer peer just stands up dead
+  #     transfer machinery.
+  local disagg_mode kv_role=""
+  local -a kv_args=()
   if [[ "$role" == "prefill" ]]; then
     disagg_mode=prefill; kv_role=kv_producer
-  else
+  elif [[ "$role" == "decode" ]]; then
     disagg_mode=decode;  kv_role=kv_consumer
+  else
+    disagg_mode=agg
   fi
-  # kv_connector was hardcoded; read it (env > yaml, default NixlConnector so
-  # yaml omission keeps the old behavior) so config.py's vllm.kv_connector
-  # field is actually honored shell-side instead of being a dead config knob.
-  local kv_connector
-  kv_connector=$(cfg_get_env VLLM__KV_CONNECTOR '.vllm.kv_connector // "NixlConnector"')
-  local kv_cfg="{\"kv_connector\":\"$kv_connector\",\"kv_role\":\"$kv_role\"}"
+  if [[ -n "$kv_role" ]]; then
+    # kv_connector was hardcoded; read it (env > yaml, default NixlConnector so
+    # yaml omission keeps the old behavior) so config.py's vllm.kv_connector
+    # field is actually honored shell-side instead of being a dead config knob.
+    local kv_connector
+    kv_connector=$(cfg_get_env VLLM__KV_CONNECTOR '.vllm.kv_connector // "NixlConnector"')
+    kv_args=(--kv-transfer-config "{\"kv_connector\":\"$kv_connector\",\"kv_role\":\"$kv_role\"}")
+  fi
 
-  # --dyn-tool-call-parser is decode-only (dynamo/components/src/dynamo/vllm/main.py:723-724).
+  # --dyn-tool-call-parser applies to every NON-PREFILL worker: the branch in
+  # dynamo/components/src/dynamo/vllm/main.py:722-724 is
+  # `if worker_type != WorkerType.Prefill`, which covers decode AND
+  # aggregated workers (both are the OpenAI surface that emits tool calls).
   # Empty value => skip the flag entirely.
   local -a tool_parser_args=()
-  if [[ "$role" == "decode" ]]; then
+  if [[ "$role" != "prefill" ]]; then
     local tool_parser
     tool_parser=$(cfg_get_env VLLM__TOOL_CALL_PARSER '.vllm.tool_call_parser // ""')
     if [[ -n "$tool_parser" ]]; then
@@ -215,11 +247,11 @@ spawn_worker() {
     fi
   fi
 
-  # --dyn-reasoning-parser is decode-only too (same main.py:724 branch). Strips
-  # in-band reasoning spans (e.g. MiniMax M3 <mm:think>...</mm:think>) so they
-  # don't reach the agent as content. Empty value => skip the flag.
+  # --dyn-reasoning-parser rides the same non-prefill branch (main.py:724).
+  # Strips in-band reasoning spans (e.g. MiniMax M3 <mm:think>...</mm:think>)
+  # so they don't reach the agent as content. Empty value => skip the flag.
   local -a reasoning_parser_args=()
-  if [[ "$role" == "decode" ]]; then
+  if [[ "$role" != "prefill" ]]; then
     local reasoning_parser
     reasoning_parser=$(cfg_get_env VLLM__REASONING_PARSER '.vllm.reasoning_parser // ""')
     if [[ -n "$reasoning_parser" ]]; then
@@ -231,7 +263,18 @@ spawn_worker() {
   nats_url=$(cfg_get_env DYNAMO__NATS_URL .dynamo.nats_url)
   etcd_endpoints=$(cfg_get_env DYNAMO__ETCD_ENDPOINTS .dynamo.etcd_endpoints)
 
-  local nixl_port=$((nixl_base + rank * 100))
+  # NIXL side-channel env: only meaningful when KV actually transfers
+  # between workers (disagg). Omitted entirely for agg workers -- and the
+  # port arithmetic stays inside the branch because a pure-agg yaml may
+  # leave nixl_base empty ($(("" + ...)) aborts under set -u/-e).
+  local -a nixl_env=()
+  if [[ "$role" != "agg" ]]; then
+    local nixl_port=$((nixl_base + rank * 100))
+    nixl_env=(
+      "VLLM_NIXL_SIDE_CHANNEL_HOST=$host"
+      "VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port"
+    )
+  fi
 
   # DYN_SYSTEM_PORT exposes per-worker Prometheus /metrics + /health
   # via dynamo's system status server (lib/runtime/src/system_status_server.rs).
@@ -362,8 +405,7 @@ spawn_worker() {
   # newer bash but kept for consistency with the rest of the script).
   spawn "vllm-${name}" \
     "CUDA_VISIBLE_DEVICES=$gpus" \
-    "VLLM_NIXL_SIDE_CHANNEL_HOST=$host" \
-    "VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port" \
+    ${nixl_env[@]+"${nixl_env[@]}"} \
     "NATS_SERVER=$nats_url" \
     "ETCD_ENDPOINTS=$etcd_endpoints" \
     ${sys_env[@]+"${sys_env[@]}"} \
@@ -382,7 +424,7 @@ spawn_worker() {
       --gpu-memory-utilization "$gmu" \
       --kv-cache-dtype "$kvdtype" \
       --disaggregation-mode "$disagg_mode" \
-      --kv-transfer-config "$kv_cfg" \
+      ${kv_args[@]+"${kv_args[@]}"} \
       --seed "$seed" \
       ${prefix_flag[@]+"${prefix_flag[@]}"} \
       ${chunked_flag[@]+"${chunked_flag[@]}"} \
@@ -397,17 +439,27 @@ spawn_worker() {
 # ---------- up verbs ----------
 
 up_workers() {
+  # `// []` so a topology's absent list (pure-agg yaml omits
+  # prefill_workers/decode_workers; pure-disagg omits agg_workers) iterates
+  # zero times instead of yq erroring on null. Spawn order prefill ->
+  # decode -> agg defines the global rank (NIXL/system port math) and MUST
+  # match scrape_vllm_metrics.py:load_workers.
   local rank=0
   while IFS= read -r entry; do
     [[ -z "$entry" ]] && continue
     spawn_worker prefill "$entry" "$rank"
     rank=$((rank + 1))
-  done < <(yq -c '.vllm.prefill_workers[]' "$CFG")
+  done < <(yq -c '.vllm.prefill_workers // [] | .[]' "$CFG")
   while IFS= read -r entry; do
     [[ -z "$entry" ]] && continue
     spawn_worker decode "$entry" "$rank"
     rank=$((rank + 1))
-  done < <(yq -c '.vllm.decode_workers[]' "$CFG")
+  done < <(yq -c '.vllm.decode_workers // [] | .[]' "$CFG")
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    spawn_worker agg "$entry" "$rank"
+    rank=$((rank + 1))
+  done < <(yq -c '.vllm.agg_workers // [] | .[]' "$CFG")
 }
 
 up_frontend() {

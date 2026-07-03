@@ -174,7 +174,11 @@ def load_workers(testbed_yaml: Path) -> list[dict]:
         )
     workers: list[dict] = []
     rank = 0
-    for role, key in (("prefill", "prefill_workers"), ("decode", "decode_workers")):
+    # Order MUST match testbed.sh up_workers spawn order (prefill -> decode
+    # -> agg); rank feeds the same system_port_base + rank math.
+    for role, key in (("prefill", "prefill_workers"),
+                      ("decode", "decode_workers"),
+                      ("agg", "agg_workers")):
         for w in vllm.get(key) or []:
             workers.append({
                 "worker": w.get("name", f"{role}{rank}"),

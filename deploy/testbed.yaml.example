@@ -110,10 +110,22 @@ vllm:
   #         does NOT add GPUs to the tp*pp*dp count. Common MoE recipe: leave
   #         dp:1 and set ep:true to get tp-way expert parallelism over the same
   #         GPUs; raise dp for attention data-parallel + wider EP.
+  # TOPOLOGY -- exactly one of the two, never both (config.py rejects mixing):
+  #   PD disaggregation: prefill_workers + decode_workers (+ prefill/decode
+  #     role sections below). Prefill/decode split across workers, KV flows
+  #     over NIXL.
+  #   PD colocation (aggregated): agg_workers (+ agg role section). One
+  #     worker type does BOTH phases; --disaggregation-mode agg, no
+  #     kv-transfer-config, no NIXL side-channel env. Frontend/router need
+  #     no changes (agg workers register as component "backend" and still
+  #     publish KV events, so router_mode: kv keeps working).
   prefill_workers:
     - { name: p0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1, dp: 1, ep: true }
   decode_workers:
     - { name: d0, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1, dp: 1, ep: true }
+  # agg_workers:                  # PD colocation: comment the two lists above
+  #   - { name: a0, host: 127.0.0.1, gpus: "0,1", tp: 2, pp: 1, dp: 1, ep: true }
+  #   - { name: a1, host: 127.0.0.1, gpus: "2,3", tp: 2, pp: 1, dp: 1, ep: true }
 
   prefill:
     max_model_len: 32768
@@ -128,6 +140,13 @@ vllm:
     max_num_seqs: 64
     gpu_memory_utilization: 0.90
     kv_cache_dtype: auto
+
+  # agg:                          # role knobs for agg_workers (PD colocation).
+  #   max_model_len: 32768        # One engine serves both phases, so budget
+  #   max_num_batched_tokens: 8192  # for chunked-prefill + decode mixing.
+  #   max_num_seqs: 64
+  #   gpu_memory_utilization: 0.90
+  #   kv_cache_dtype: auto
 
   extra_args: "--trust-remote-code --moe-backend triton"   # appended to every vLLM serve invocation (MiniMax M2 is a custom-code sparse-MoE; text-only, no --enable-multimodal)
 
