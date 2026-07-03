@@ -10,9 +10,13 @@ SWE-agent-style scaffolds are reported around 35% in the literature. This
 runner holds the benchmark samples (identical deterministic selection via
 testbed.apps.load_samples), the model, and the serving stack constant, and
 swaps ONLY the scaffold -- so the residual difference is attributable to
-the scaffold + execution environment, and `--deployment docker` vs
-`--deployment local` further splits the container-overhead factor out of
-the scaffold factor.
+the scaffold + execution environment. `--deployment docker` (default) is
+the upstream-supported path; `local` was meant to split the container
+overhead out of the scaffold factor, but upstream copies the repo to the
+DEPLOYMENT ROOT `/{repo_name}` (fine inside a container, PermissionError
+13 on a host for non-root users; the configurable-base-dir PR #1132 was
+closed unmerged with "use mini-swe-agent for fully local runs") -- so the
+scaffold-only arm needs a root-writable / or a different minimal scaffold.
 
 Flow per task (strictly sequential -- matches the opencode comparison mode):
   1. materialize the APPS workspace (PROBLEM.md + solution.py via
@@ -173,11 +177,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="Served model name. Default: model.served_name from testbed.yaml")
     ap.add_argument("--api-key", default="dummy",
                     help="Dynamo ignores it; litellm requires something.")
-    ap.add_argument("--deployment", default="local", choices=["local", "docker"],
-                    help="SWE-agent execution environment. `local` isolates "
-                         "the SCAFFOLD factor (host subprocesses, same as "
-                         "opencode's bash tool); `docker` adds the container "
-                         "round-trip the SWE-agent literature numbers include.")
+    ap.add_argument("--deployment", default="docker", choices=["docker", "local"],
+                    help="SWE-agent execution environment. `docker` (default) "
+                         "is the upstream-supported path and matches the "
+                         "container round-trip the SWE-agent literature "
+                         "numbers include. `local` would isolate the pure "
+                         "scaffold factor BUT upstream hardcodes copying the "
+                         "repo to the deployment root `/{repo_name}` -- on a "
+                         "host that means writing to / (PermissionError 13 "
+                         "for non-root; the repo_base_dir fix, upstream PR "
+                         "#1132, was closed unmerged). Only use `local` if "
+                         "your / is writable; upstream recommends "
+                         "mini-swe-agent for fully-local runs instead.")
     ap.add_argument("--max-steps", default=50, type=int,
                     help="per_instance_call_limit (agent step budget).")
     ap.add_argument("--task-timeout-s", default=1800.0, type=float,

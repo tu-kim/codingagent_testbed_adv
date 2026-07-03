@@ -152,7 +152,7 @@ scripts/evaluate_apps.py --run results/apps1
 **Scaffold comparison — SWE-agent on the same APPS samples + same Dynamo backend** (install from source first — `pip install "git+https://github.com/SWE-agent/SWE-agent.git"`; the PyPI `sweagent` package is an unrelated name-squat that fails to resolve. `--dry-run` prints the commands to validate the CLI surface):
 ```bash
 scripts/run_sweagent_apps.py --split competition --num-samples 20 --seed 42 \
-  --out results/sweagent-apps1 --deployment local        # docker = +container overhead
+  --out results/sweagent-apps1 --deployment docker   # local needs root-writable /: SWE-agent copies the repo to /<name> (PR #1132 closed unmerged)
 scripts/analyze_sweagent_traj.py --run results/sweagent-apps1 --frontend logs/frontend.log
 scripts/evaluate_apps.py --run results/sweagent-apps1     # same scorer as opencode runs
 ```
