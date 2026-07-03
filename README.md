@@ -149,7 +149,7 @@ Progress prints per task to **stderr** (`[done/total] instance_id ok/FAIL rtt=..
 scripts/evaluate_apps.py --run results/apps1
 ```
 
-**Scaffold comparison — SWE-agent on the same APPS samples + same Dynamo backend** (`pip install sweagent` first; `--dry-run` prints the commands to validate the CLI surface):
+**Scaffold comparison — SWE-agent on the same APPS samples + same Dynamo backend** (install from source first — `pip install "git+https://github.com/SWE-agent/SWE-agent.git"`; the PyPI `sweagent` package is an unrelated name-squat that fails to resolve. `--dry-run` prints the commands to validate the CLI surface):
 ```bash
 scripts/run_sweagent_apps.py --split competition --num-samples 20 --seed 42 \
   --out results/sweagent-apps1 --deployment local        # docker = +container overhead

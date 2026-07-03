@@ -36,7 +36,10 @@ Flow per task (strictly sequential -- matches the opencode comparison mode):
   4. append a TaskRecord-shaped line to trace.jsonl.
 
 Version pin / drift note: written against the `sweagent` 1.x CLI
-(`pip install sweagent`; verify with `sweagent run --help`). ALL sweagent
+(install FROM SOURCE: `pip install "git+https://github.com/SWE-agent/SWE-agent.git"`
+-- the PyPI name `sweagent` is an unrelated squatted 0.0.1 package whose
+`togetherunidiff` dep doesn't even resolve; verify with `sweagent run --help`).
+ALL sweagent
 flag names live in build_sweagent_cmd() -- if the CLI surface drifts, fix
 that one function. Use --dry-run to print the exact commands without
 executing anything (cheap flag-surface validation on the GPU host).
