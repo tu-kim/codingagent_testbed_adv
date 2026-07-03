@@ -126,7 +126,8 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 
 | flag | default | meaning |
 |------|---------|---------|
-| `--split` | `lite` | SWE-bench split: `lite` \| `verified` \| `full` |
+| `--workload` | `swebench` | benchmark: `swebench` (git checkout + issue fix) \| `apps` (APPS problem, `PROBLEM.md` + `solution.py`, no git) |
+| `--split` | workload default | swebench: `lite` \| `verified` \| `full` (default `lite`). apps: `train` \| `test` (default `test`) \| difficulty pseudo-splits `introductory` \| `interview` \| `competition` |
 | `--num-samples` | `10` | number of tasks (deterministic pick from `(split, seed, n)`) |
 | `--qps` | `0.5` | Poisson arrival rate (ignored with `--sequential`) |
 | `--seed` | `42` | sampling + arrival seed |
@@ -139,6 +140,14 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 | `--out` | required | output directory |
 
 Progress prints per task to **stderr** (`[done/total] instance_id ok/FAIL rtt=.. elapsed=..`).
+
+**APPS workload** (no git; workspaces are materialized locally, so `pre-clone` is instant):
+```bash
+.venv/bin/python -m testbed run --workload apps --split introductory \
+  --num-samples 20 --qps 0.5 --seed 42 --out results/apps1
+# post-hoc correctness (executes generated code -- use a container):
+scripts/evaluate_apps.py --run results/apps1
+```
 
 **Router sweep** (actual routing is set when the frontend starts, not by `--router`):
 ```bash

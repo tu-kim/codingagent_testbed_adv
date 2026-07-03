@@ -12,8 +12,37 @@ import click
 
 from . import config as config_mod
 from . import runner as runner_mod
-from . import swebench
 from .opencode import OpenCodeClient
+
+
+def _resolve_split(workload: str, split: str | None) -> str:
+    """Fill in the workload's default split and reject splits the workload
+    doesn't have (click.Choice can't express per-workload choices)."""
+    wl = runner_mod.get_workload(workload)
+    if split is None:
+        return wl.default_split
+    if split not in wl.splits:
+        raise click.BadParameter(
+            f"workload {workload!r} has splits {list(wl.splits)}, not {split!r}",
+            param_hint="--split",
+        )
+    return split
+
+
+_WORKLOAD_OPT = click.option(
+    "--workload", default="swebench", show_default=True,
+    type=click.Choice(sorted(runner_mod.WORKLOADS)),
+    help="Benchmark driving the workload: swebench (git checkout + issue "
+         "fix) or apps (materialized PROBLEM.md + solution.py, no git).",
+)
+
+_SPLIT_OPT = click.option(
+    "--split", default=None,
+    help="Sample split. Default: the workload's default (swebench: lite; "
+         "apps: test). swebench: lite|verified|full. apps: train|test plus "
+         "the difficulty pseudo-splits introductory|interview|competition "
+         "(= test filtered to that difficulty).",
+)
 
 
 @click.group()
@@ -22,7 +51,8 @@ def main() -> None:
 
 
 @main.command("run")
-@click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
+@_WORKLOAD_OPT
+@_SPLIT_OPT
 @click.option("--num-samples", default=10, show_default=True, type=int)
 @click.option("--qps", default=0.5, show_default=True, type=float)
 @click.option("--seed", default=42, show_default=True, type=int)
@@ -82,7 +112,8 @@ def main() -> None:
 @click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
 def run_cmd(
-    split: str,
+    workload: str,
+    split: str | None,
     num_samples: int,
     qps: float,
     seed: int,
@@ -96,10 +127,12 @@ def run_cmd(
     config_path: Path | None,
 ) -> None:
     """Run a Poisson workload through OpenCode."""
+    split = _resolve_split(workload, split)
     cfg = config_mod.load(config_path)
     asyncio.run(
         runner_mod.run(
             cfg,
+            workload=workload,
             split=split,
             num_samples=num_samples,
             qps=qps,
@@ -116,7 +149,8 @@ def run_cmd(
 
 
 @main.command("pre-clone")
-@click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
+@_WORKLOAD_OPT
+@_SPLIT_OPT
 @click.option("--num-samples", default=10, show_default=True, type=int)
 @click.option("--seed", default=42, show_default=True, type=int)
 @click.option("--reset-workspace", is_flag=True, default=False,
@@ -127,7 +161,8 @@ def run_cmd(
               help="Concurrent workspace clones.")
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
 def pre_clone_cmd(
-    split: str,
+    workload: str,
+    split: str | None,
     num_samples: int,
     seed: int,
     reset_workspace: bool,
@@ -150,10 +185,12 @@ def pre_clone_cmd(
     Resumable: re-running retries only the workspaces that failed.
     Exits 1 if any workspace could not be prepared.
     """
+    split = _resolve_split(workload, split)
     cfg = config_mod.load(config_path)
     failures = asyncio.run(
         runner_mod.pre_clone_run(
             cfg,
+            workload=workload,
             split=split,
             num_samples=num_samples,
             seed=seed,
@@ -172,7 +209,8 @@ def pre_clone_cmd(
 
 
 @main.command("smoke")
-@click.option("--split", default="lite", show_default=True, type=click.Choice(["lite", "verified", "full"]))
+@_WORKLOAD_OPT
+@_SPLIT_OPT
 @click.option("--seed", default=42, show_default=True, type=int)
 @click.option("--task-timeout-s", default=300.0, show_default=True, type=float,
               help="Per-task wall-clock cap; <=0 disables.")
@@ -180,11 +218,13 @@ def pre_clone_cmd(
               help="Same semantics as `run --reset-workspace` -- deterministic "
                    "dir name + reset to base_commit before the task.")
 @click.option("--config", "config_path", default=None, type=click.Path(dir_okay=False, exists=True, path_type=Path))
-def smoke_cmd(split: str, seed: int, task_timeout_s: float,
+def smoke_cmd(workload: str, split: str | None, seed: int, task_timeout_s: float,
               reset_workspace: bool, config_path: Path | None) -> None:
     """Run a single end-to-end task and print the resulting TaskRecord."""
+    split = _resolve_split(workload, split)
+    wl = runner_mod.get_workload(workload)
     cfg = config_mod.load(config_path)
-    sample = swebench.load_samples(split, seed, 1)[0]
+    sample = wl.load_samples(split, seed, 1)[0]
     # Same normalization as runner.run/pre_clone_run: a relative
     # workspace_root must not anchor on the process CWD.
     workspace_root = Path(cfg.workspace_root).expanduser().resolve()
@@ -199,6 +239,7 @@ def smoke_cmd(split: str, seed: int, task_timeout_s: float,
                 client, sample, 0.0, workspace_root, sem,
                 task_timeout_s=timeout,
                 reset_workspace=reset_workspace,
+                workload=wl,
             )
             click.echo(json.dumps(asdict(rec), indent=2))
 

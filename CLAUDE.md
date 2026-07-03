@@ -278,6 +278,18 @@ Concrete build commands will be folded into this doc once each vendor folder is 
 
 CLI defaults (set in `cli.py`): `num_samples=10`, `qps=0.5`, `seed=42`, `split=lite`. Override via flags or `TESTBED__*` env vars.
 
+### Workloads (`--workload swebench|apps`)
+
+`run` / `pre-clone` / `smoke` all take `--workload` (default `swebench`, fully backward-compatible). The pluggable surface is `runner.Workload` (frozen dataclass) + the `runner.WORKLOADS` registry: `load_samples(split, seed, n)`, `render_prompt(sample)`, `prepare(sample, dest, *, reset)` — everything else (Poisson/sequential, semaphore, TaskRecord schema, manifest flow, error stages) is workload-agnostic. Samples MUST carry `instance_id` (swebench has it natively; `apps.load_samples` injects `apps-<problem_id:05d>`).
+
+**APPS** (`src/testbed/apps.py`, dataset `codeparrot/apps`, HF config `"all"`):
+- Splits: `train | test` plus difficulty pseudo-splits `introductory | interview | competition` (= test filtered to that difficulty, filtered BEFORE sort+sample so selection stays deterministic). `--split` defaults to the workload's default (`lite` for swebench, `test` for apps) — it is validated in `cli._resolve_split`, not `click.Choice`.
+- **No git**: `apps.prepare_workspace` materializes `PROBLEM.md` (question) + `solution.py` (starter_code for call-based problems, comment scaffold for stdio) into the workspace. Same idempotence contract as `_pre_clone`: existing workspace with `PROBLEM.md` = no-op (reset=False), wiped + rewritten (reset=True). Prepare failures still land as `error.stage="clone"` — that is the documented trace-schema name for stage-1 workspace preparation, for BOTH workloads.
+- Two judging modes per problem, detected from `input_output` JSON's `fn_name`: **stdio** (run `python solution.py`, stdin→stdout) vs **call-based** (`fn_name` present; LeetCode-style `class Solution` starter code). `render_prompt` tells the agent which mode applies. Hidden tests are NOT written into the workspace (the question text already contains the public examples).
+- Manifest name gains a workload prefix for apps (`.workspaces-apps-<split>-s<seed>-n<n>.json`); swebench keeps the legacy name. `run` also rejects a manifest whose `workload` key mismatches.
+- `config.json` records `workload`.
+- **Correctness eval**: `scripts/evaluate_apps.py --run results/<dir>` (APPS counterpart of extract+evaluate_predictions): re-derives samples from config.json, executes each workspace's `solution.py` against the hidden `input_output` tests (`--max-tests 20`, `--timeout-s 10` caps), writes `<run>/apps_eval.json` with per-instance verdicts (`resolved|unresolved|no_solution|no_tests|not_in_sample_set`) + `resolve_rate_all` / `resolve_rate_http_ok`. Pragmatic approximation of the official APPS harness (slightly stricter, uniformly). **Executes model-generated code — run in a container.**
+
 Router sweeps are just a shell loop:
 ```
 for r in round-robin least-loaded kv; do
