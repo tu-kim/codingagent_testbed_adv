@@ -198,7 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     workspace_root = Path(workspace_root).expanduser().resolve()
 
     samples = apps.load_samples(args.split, args.seed, args.num_samples)
-    args.out.mkdir(parents=True, exist_ok=True)
+    # NOTE: no mkdir before the dry-run branch -- --dry-run must be fully
+    # side-effect-free (it only prints the would-be commands).
     traj_root = args.out / "trajs"
 
     if args.dry_run:
@@ -215,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             print(shlex.join(cmd))
         return 0
 
+    args.out.mkdir(parents=True, exist_ok=True)
     workspace_root.mkdir(parents=True, exist_ok=True)
     traj_root.mkdir(parents=True, exist_ok=True)
 
