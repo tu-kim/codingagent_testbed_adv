@@ -148,8 +148,12 @@ def find_patch(traj_root: Path, instance_id: str) -> Path | None:
 
 
 def apply_patch(ws: Path, patch: Path) -> bool:
+    # resolve(): `git -C <ws>` chdirs BEFORE interpreting its arguments, so a
+    # relative patch path (e.g. from a relative --out) would be looked up
+    # inside the workspace and fail with "can't open patch".
     proc = subprocess.run(
-        ["git", "-C", str(ws), "apply", "--whitespace=nowarn", str(patch)],
+        ["git", "-C", str(ws), "apply", "--whitespace=nowarn",
+         str(Path(patch).resolve())],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -214,7 +218,10 @@ def main(argv: list[str] | None = None) -> int:
     samples = apps.load_samples(args.split, args.seed, args.num_samples)
     # NOTE: no mkdir before the dry-run branch -- --dry-run must be fully
     # side-effect-free (it only prints the would-be commands).
-    traj_root = args.out / "trajs"
+    # resolve(): a relative --out would otherwise flow into trace.jsonl's
+    # traj_dir (breaking analyzers run from another CWD) and into git-apply
+    # arguments that `git -C <ws>` interprets relative to the WORKSPACE.
+    traj_root = (args.out / "trajs").resolve()
 
     if args.dry_run:
         for s in samples:
