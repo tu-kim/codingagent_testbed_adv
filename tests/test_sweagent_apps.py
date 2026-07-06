@@ -762,6 +762,14 @@ def test_analyze_main_end_to_end_writes_csv_and_pooled_share(
     assert float(row_a["tool_s"]) == pytest.approx(3.0)
     assert float(row_a["llm_s"]) == pytest.approx(4.0)
     assert float(row_a["others_s"]) == pytest.approx(3.0)  # 10 - 3 - 4
+    # Degenerate head/tail/active: the fixture's single completion sits at
+    # ts=1000 (== task_start) with elapsed=4.0, so its "start" (1000-4=996)
+    # is BEFORE task_start -> head clamps to 0. tail = task_end(1010) -
+    # last_completion_ts(1000) = 10.0. active = total(10) - head(0) -
+    # tail(10) = 0.0.
+    assert float(row_a["env_head_s"]) == pytest.approx(0.0)
+    assert float(row_a["env_tail_s"]) == pytest.approx(10.0)
+    assert float(row_a["active_s"]) == pytest.approx(0.0)
 
     row_b = next(r for r in rows if r["instance_id"] == "apps-00002")
     assert row_b["tool_s"] == "nan"
@@ -770,6 +778,119 @@ def test_analyze_main_end_to_end_writes_csv_and_pooled_share(
     assert "wrote " in out
     assert "fully-decomposed=1" in out
     assert "pooled share over 1 tasks" in out
+    # active_s is non-NaN for the only fully-decomposed row but sums to
+    # 0.0 (degenerate fixture) -- the active-time table requires
+    # active_tot > 0, so it must NOT be printed here.
+    assert "active-time share" not in out
+
+
+def _write_realistic_head_tail_run(tmp_path: Path) -> tuple[Path, Path]:
+    """Single-task fixture with a NON-degenerate env_head/env_tail split:
+    two completions strictly inside (task_start, task_end), so the first
+    completion's start point sits after task_start (head > 0) and the
+    last completion's ts sits before task_end (tail > 0).
+
+    task_start=1000.0, task_end=1010.0, rtt_s=10.0 (total).
+    Completions (unix ts, elapsed_s): (1005.0, 2.0), (1009.0, 1.0) --
+    both fall in [1000, 1010].
+      head = max(0, win[0].ts - win[0].elapsed - start)
+           = max(0, 1005 - 2 - 1000) = 3.0
+      tail = max(0, end - win[-1].ts) = max(0, 1010 - 1009) = 1.0
+      llm  = 2.0 + 1.0 = 3.0
+      active = max(0, total - head - tail) = max(0, 10 - 3 - 1) = 6.0
+    tool = 1.5 + 0.5 = 2.0 (from the .traj execution_time steps)
+      others = max(0, total - tool - llm) = max(0, 10 - 2 - 3) = 5.0
+      others_a (active-time table) = max(0, active - llm - tool)
+                                    = max(0, 6 - 3 - 2) = 1.0
+    """
+    run_dir = tmp_path / "run"
+    trajs = run_dir / "trajs"
+    trajs.mkdir(parents=True)
+
+    iid = "apps-00001"
+    traj_dir = trajs / iid
+    traj_dir.mkdir()
+    (traj_dir / f"{iid}.traj").write_text(json.dumps(
+        {"trajectory": [{"execution_time": 1.5}, {"execution_time": 0.5}]}
+    ))
+
+    record = {
+        "instance_id": iid, "success": True, "rtt_s": 10.0,
+        "traj_dir": str(traj_dir),
+        "task_start_unix_s": 1000.0, "task_end_unix_s": 1010.0,
+    }
+    (run_dir / "trace.jsonl").write_text(json.dumps(record) + "\n")
+
+    frontend_path = tmp_path / "frontend.log"
+    # 1970-01-01T00:00:00Z + 1005s = 00:16:45Z; +1009s = 00:16:49Z.
+    frontend_path.write_text(
+        "1970-01-01T00:16:45Z INFO request completed elapsed_ms=2000\n"
+        "1970-01-01T00:16:49Z INFO request completed elapsed_ms=1000\n"
+    )
+
+    return run_dir, frontend_path
+
+
+def test_analyze_main_realistic_head_tail_csv_values(analyze_mod, tmp_path):
+    """CSV env_head_s/env_tail_s/active_s for a non-degenerate window --
+    hand-computed in _write_realistic_head_tail_run's docstring."""
+    run_dir, frontend_path = _write_realistic_head_tail_run(tmp_path)
+
+    saved_argv = sys.argv
+    try:
+        sys.argv = ["analyze_sweagent_traj", "--run", str(run_dir),
+                    "--frontend", str(frontend_path)]
+        rc = analyze_mod.main()
+    finally:
+        sys.argv = saved_argv
+
+    assert rc == 0
+    import csv as csv_mod
+    with (run_dir / "sweagent_decomposition.csv").open() as f:
+        rows = list(csv_mod.DictReader(f))
+    assert len(rows) == 1
+    row = rows[0]
+    assert float(row["llm_s"]) == pytest.approx(3.0)
+    assert float(row["tool_s"]) == pytest.approx(2.0)
+    assert float(row["others_s"]) == pytest.approx(5.0)
+    assert float(row["env_head_s"]) == pytest.approx(3.0)
+    assert float(row["env_tail_s"]) == pytest.approx(1.0)
+    assert float(row["active_s"]) == pytest.approx(6.0)
+
+
+def test_analyze_main_active_time_table_prints_when_active_tot_positive(
+    analyze_mod, tmp_path, capsys,
+):
+    """active_tot=6.0 > 0 for the realistic fixture -> the active-time
+    share table must print, with shares computed over ACTIVE seconds
+    (head/tail excluded), not total seconds."""
+    run_dir, frontend_path = _write_realistic_head_tail_run(tmp_path)
+
+    saved_argv = sys.argv
+    try:
+        sys.argv = ["analyze_sweagent_traj", "--run", str(run_dir),
+                    "--frontend", str(frontend_path)]
+        rc = analyze_mod.main()
+    finally:
+        sys.argv = saved_argv
+
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # Total-based pooled table is still printed and unaffected by the new
+    # columns: llm=3.0/10.0=30%, tool=2.0/10.0=20%, others=5.0/10.0=50%.
+    assert "pooled share over 1 tasks" in out
+    assert "30.00%" in out
+    assert "20.00%" in out
+    assert "50.00%" in out
+
+    # Active-time table: llm=3/6=50%, tool=2/6=33.33%, others=1/6=16.67%.
+    assert "active-time share" in out
+    assert "head 3.0s + tail 1.0s excluded" in out
+    assert "active 6.0s" in out
+    assert "50.00%" in out
+    assert "33.33%" in out
+    assert "16.67%" in out
 
 
 def test_analyze_main_tool_only_fallback_without_frontend(
