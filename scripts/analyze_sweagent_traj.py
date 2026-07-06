@@ -19,9 +19,19 @@ Per task (trace.jsonl record):
            sweagent process startup, env setup/teardown, docker
            round-trips beyond the command itself, history serialization.
 
+The per-task env-setup split rides along: env_head_s (task start -> first
+LLM request start: docker create + swe-rex bootstrap + tool install; the
+bulk of "others" on docker runs), env_tail_s (last completion -> exit:
+patch extraction + container teardown), active_s = total - head - tail.
+The stdout adds an ACTIVE-TIME share table (head/tail excluded) -- that is
+the definition the literature's ~35% tool-share numbers use, and the fair
+row against opencode's turn-level shares.
+
 Outputs:
-  <run>/sweagent_decomposition.csv   per-task seconds + shares
-  stdout                             pooled share table (compare with
+  <run>/sweagent_decomposition.csv   per-task seconds (llm/tool/others +
+                                     env_head/env_tail/active)
+  stdout                             pooled share table (total-based AND
+                                     active-time; compare the latter with
                                      opencode's latency_pooled_share.csv)
 
 Usage:
@@ -140,12 +150,25 @@ def main(argv: list[str] | None = None) -> int:
             continue
         tool = traj_tool_seconds(Path(rec["traj_dir"]), rec["instance_id"])
         llm = math.nan
+        head = math.nan   # env setup: task start -> first LLM request start
+        tail = math.nan   # env teardown: last LLM completion -> task end
         start, end = rec.get("task_start_unix_s"), rec.get("task_end_unix_s")
         if completions and start is not None and end is not None:
-            llm = llm_seconds_in_window(completions, start, end)
+            win = [(ts, el) for ts, el in completions if start <= ts <= end]
+            llm = sum(el for _, el in win)
+            if win:
+                # First completion's start = its completion ts minus its
+                # elapsed. Everything before that is environment startup
+                # (docker create, swe-rex bootstrap, tool-bundle install)
+                # -- empirically the bulk of "others" on docker runs.
+                head = max(0.0, (win[0][0] - win[0][1]) - start)
+                tail = max(0.0, end - win[-1][0])
         others = math.nan
         if not math.isnan(tool) and not math.isnan(llm):
             others = max(0.0, total - tool - llm)
+        active = math.nan
+        if not math.isnan(head):
+            active = max(0.0, total - head - tail)
         rows.append({
             "instance_id": rec["instance_id"],
             "success": rec.get("success"),
@@ -153,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
             "llm_s": llm,
             "tool_s": tool,
             "others_s": others,
+            "env_head_s": head,
+            "env_tail_s": tail,
+            "active_s": active,
         })
 
     if not rows:
@@ -181,6 +207,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  llm    {llm:10.1f}s  {llm / tot:7.2%}")
         print(f"  tool   {tool:10.1f}s  {tool / tot:7.2%}")
         print(f"  others {others:10.1f}s  {others / tot:7.2%}")
+
+        # Active-time shares: env head/tail excluded. This matches the
+        # "share of ACTIVE time" definition used by the agent-workload
+        # characterization literature (their ~35% tool numbers), and is
+        # the apples-to-apples row against opencode's turn-level shares
+        # (opencode turns carry no per-task env startup either).
+        act = [r for r in full if not math.isnan(r["active_s"])]
+        active_tot = sum(r["active_s"] for r in act)
+        if act and active_tot > 0:
+            head_tot = sum(r["env_head_s"] for r in act)
+            tail_tot = sum(r["env_tail_s"] for r in act)
+            llm_a = sum(r["llm_s"] for r in act)
+            tool_a = sum(r["tool_s"] for r in act)
+            others_a = sum(
+                max(0.0, r["active_s"] - r["llm_s"] - r["tool_s"]) for r in act)
+            print(f"\nactive-time share ({len(act)} tasks; env setup "
+                  f"head {head_tot:.1f}s + tail {tail_tot:.1f}s excluded; "
+                  f"active {active_tot:.1f}s):")
+            print(f"  llm    {llm_a:10.1f}s  {llm_a / active_tot:7.2%}")
+            print(f"  tool   {tool_a:10.1f}s  {tool_a / active_tot:7.2%}")
+            print(f"  others {others_a:10.1f}s  {others_a / active_tot:7.2%}")
     else:
         known_tool = [r for r in rows if not math.isnan(r["tool_s"])]
         if known_tool:
