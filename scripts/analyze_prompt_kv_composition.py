@@ -149,6 +149,16 @@ def chars_in_region(intervals: list[tuple[int, int]],
     return total
 
 
+# opencode fires a TITLE-GENERATION side request per session (its "title"
+# agent; opencode/packages/opencode/src/session/prompt.ts:211 injects this
+# literal user message). Those one-shot prompts are measurement noise for
+# KV-composition purposes and are dropped by default (--keep-title to
+# retain). Matching on the marker -- not on turn position -- keeps the
+# main session's real first turn and works whether the title request
+# chains as its own session or sneaks in as somebody's turn 1.
+TITLE_MARKER = "Generate a title for this conversation:"
+
+
 # ---------------------------------------------------------------------------
 # Dump ingest + session chaining
 # ---------------------------------------------------------------------------
@@ -307,6 +317,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-prefix-chars", type=int, default=200,
                     help="Chain threshold: absolute minimum shared chars "
                          "(filters system-prompt-only overlap). Default 200.")
+    ap.add_argument("--keep-title", action="store_true",
+                    help="Keep opencode title-generation requests (dropped "
+                         "by default; identified by the literal marker "
+                         "prompt.ts injects, not by turn position).")
     args = ap.parse_args(argv)
 
     tokenizer = None
@@ -319,6 +333,12 @@ def main(argv: list[str] | None = None) -> int:
 
     records = load_dump(args.prompts)
     print(f"{len(records)} unique requests from {args.prompts}")
+    if not args.keep_title:
+        n_before = len(records)
+        records = [r for r in records if TITLE_MARKER not in r.text]
+        if n_before != len(records):
+            print(f"dropped {n_before - len(records)} title-generation "
+                  f"request(s) (--keep-title to retain)")
     chains = chain_sessions(records, min_frac=args.min_prefix_frac,
                             min_chars=args.min_prefix_chars)
     n_multi = sum(1 for c in chains if len(c.records) > 1)
@@ -364,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
                 "ts": rec.ts,
                 "mode": mapper.mode,
             })
-            prev, prev_mapper = rec, mapper
+            prev = rec
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="") as f:
