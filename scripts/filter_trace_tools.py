@@ -74,9 +74,11 @@ ND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("tmp_path", re.compile(r"/tmp/[\w.\-/]{4,}")),
     # workspace dirs carry the uuid suffix in non-reset mode
     ("session_dir", re.compile(r"session-[\w.\-]{4,}")),
-    # unordered-collection smells: dict/set reprs are insertion/hash
-    # ordered -- only flag set-literal-looking reprs, not every brace
-    ("set_repr", re.compile(r"(?<!\{)\{['\"0-9][^{}]*\}(?!\})")),
+    # unordered-collection smells: SET reprs are hash-ordered (dicts are
+    # insertion-ordered since 3.7, and JSON objects are deterministic),
+    # so only flag colon-free brace groups -- `{'b', 'a'}` yes,
+    # `{"key": "val"}` (JSON / dict) no.
+    ("set_repr", re.compile(r"(?<!\{)\{[^{}:]*['\"0-9][^{}:]*\}(?!\})")),
     ("random_seed_word", re.compile(r"\brandom\b|\bseed\b", re.IGNORECASE)),
 ]
 
@@ -89,14 +91,15 @@ def detect_nondeterminism(text: str) -> list[str]:
 def load_trace(trace_path: Path) -> list[dict[str, Any]]:
     out = []
     with trace_path.open(encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 out.append(json.loads(line))
-            except json.JSONDecodeError:
-                print(f"warning: skipping malformed trace line", file=sys.stderr)
+            except json.JSONDecodeError as e:
+                print(f"warning: skipping malformed trace line {lineno} "
+                      f"({e})", file=sys.stderr)
     return out
 
 
@@ -160,8 +163,13 @@ def extract_bash_calls(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _preview(text: Any, n: int) -> str:
-    s = str(text).replace("\n", "\\n")
-    return s if len(s) <= n else s[: n - 1] + "…"
+    # Truncate BEFORE escaping so the cut can't land between the '\' and
+    # 'n' of an escaped newline (escaping may push length slightly past n
+    # for newline-heavy text -- acceptable for a stdout preview).
+    s = str(text)
+    if len(s) > n:
+        s = s[: n - 1] + "…"
+    return s.replace("\n", "\\n")
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
