@@ -21,18 +21,32 @@ attributable to the scaffold + its execution environment.
 
 The PyPI name `sweagent` is an **unrelated squatted 0.0.1 package** whose
 `togetherunidiff` dependency doesn't even resolve. Install the real thing
-from GitHub:
+from GitHub — and install it **editable from a clone**, not with the
+`git+https://...` one-liner:
 
 ```bash
 source .venv/bin/activate
-pip install "git+https://github.com/SWE-agent/SWE-agent.git"
-# or, pinned to a release tag, clone + editable:
-#   git clone https://github.com/SWE-agent/SWE-agent.git
-#   pip install -e SWE-agent
+git clone https://github.com/SWE-agent/SWE-agent.git
+cd SWE-agent
+# git checkout v1.x.x     # pin to a release tag for reproducibility
+pip install -e .
+cd ..
 
 # Verify the CLI surface the driver was written against (1.x):
 sweagent run --help
 ```
+
+> **Why editable-from-clone, not `pip install git+...`:** SWE-agent computes
+> `CONFIG_DIR` as `Path(sweagent.__file__).parent.parent / "config"` and
+> **asserts it is a directory** at import. That `config/` folder lives at the
+> repo *top level* (sibling to the `sweagent/` package), and is **not shipped
+> as package data** — so a non-editable install resolves it to
+> `site-packages/config`, which doesn't exist, and you get:
+> `AssertionError: .venv/lib/python3.12/site-packages/config`.
+> An editable install keeps `CONFIG_DIR` pointing at the clone's real
+> `config/`. Sanity check after install:
+> `python -c "import sweagent,pathlib as p; d=p.Path(sweagent.__file__).parent.parent/'config'; print(d, d.is_dir())"`
+> — must print `True`.
 
 If `sweagent run --help` disagrees with any flag, the fix goes in **one
 place**: `build_sweagent_cmd()` in `scripts/run_sweagent_apps.py`. Validate a
@@ -193,7 +207,9 @@ per se — you have to strip head/tail to compare scaffolds fairly.
 
 ## 7. Gotchas checklist
 
-- Installed `sweagent` from **GitHub**, not PyPI (name-squat).
+- Installed `sweagent` **editable from a GitHub clone** (`pip install -e .`),
+  not PyPI (name-squat) and not `pip install git+...` (the latter drops the
+  top-level `config/` → `AssertionError: .../site-packages/config`).
 - `--deployment local` fails for non-root (hardcoded copy to `/`); default
   to `docker`.
 - Container needs outbound network for the swe-rex pip bootstrap — set
