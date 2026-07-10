@@ -33,15 +33,18 @@ _WORKLOAD_OPT = click.option(
     "--workload", default="swebench", show_default=True,
     type=click.Choice(sorted(runner_mod.WORKLOADS)),
     help="Benchmark driving the workload: swebench (git checkout + issue "
-         "fix) or apps (materialized PROBLEM.md + solution.py, no git).",
+         "fix), apps (materialized PROBLEM.md + solution.py, no git), or "
+         "terminalbench (materialized TASK.md terminal task, no git/Docker).",
 )
 
 _SPLIT_OPT = click.option(
     "--split", default=None,
     help="Sample split. Default: the workload's default (swebench: lite; "
-         "apps: test). swebench: lite|verified|full. apps: train|test plus "
-         "the difficulty pseudo-splits introductory|interview|competition "
-         "(= test filtered to that difficulty).",
+         "apps: test; terminalbench: test). swebench: lite|verified|full. "
+         "apps: train|test plus the difficulty pseudo-splits "
+         "introductory|interview|competition (= test filtered to that "
+         "difficulty). terminalbench: test plus the difficulty "
+         "pseudo-splits easy|medium|hard.",
 )
 
 

@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import apps, poisson, swebench
+from . import apps, poisson, swebench, terminalbench
 from .config import TestbedCfg, resolved_snapshot
 from .opencode import OpenCodeClient
 
@@ -164,12 +164,12 @@ class Workload:
     """One benchmark's pluggable surface. Everything else in the runner
     (Poisson arrivals, semaphore, TaskRecord schema, manifest flow, error
     stages) is workload-agnostic; samples MUST carry an "instance_id" key
-    (swebench has it natively, apps.load_samples injects one).
+    (swebench has it natively, apps/terminalbench load_samples inject one).
 
     `prepare` is the stage-1 workspace materialization -- a git
-    clone+checkout for swebench, local file writes for apps. Its failures
-    land as error.stage="clone" for BOTH workloads: "clone" is the
-    documented trace-schema name for "workspace preparation failed"
+    clone+checkout for swebench, local file writes for apps/terminalbench.
+    Its failures land as error.stage="clone" for EVERY workload: "clone" is
+    the documented trace-schema name for "workspace preparation failed"
     (renaming per-workload would break every downstream consumer)."""
     name: str
     default_split: str
@@ -201,6 +201,15 @@ WORKLOADS: dict[str, Workload] = {
         load_samples=lambda split, seed, n: apps.load_samples(split, seed, n),
         render_prompt=lambda sample: apps.render_prompt(sample),
         prepare=lambda sample, dest, *, reset=False: apps.prepare_workspace(
+            sample, dest, reset=reset),
+    ),
+    "terminalbench": Workload(
+        name="terminalbench",
+        default_split="test",
+        splits=terminalbench.SPLITS,
+        load_samples=lambda split, seed, n: terminalbench.load_samples(split, seed, n),
+        render_prompt=lambda sample: terminalbench.render_prompt(sample),
+        prepare=lambda sample, dest, *, reset=False: terminalbench.prepare_workspace(
             sample, dest, reset=reset),
     ),
 }
@@ -540,7 +549,8 @@ async def run(
     pre_clone_workspaces: bool = True,
     workload: str = "swebench",
 ) -> None:
-    """Drive `num_samples` benchmark tasks (workload: swebench | apps).
+    """Drive `num_samples` benchmark tasks (workload: swebench | apps |
+    terminalbench).
 
     Default mode: Poisson arrivals at `qps`, bounded concurrency at
     `max_in_flight`. arrival_offsets are computed up front and tasks fire

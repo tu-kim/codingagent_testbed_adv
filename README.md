@@ -156,8 +156,8 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 
 | flag | default | meaning |
 |------|---------|---------|
-| `--workload` | `swebench` | benchmark: `swebench` (git checkout + issue fix) \| `apps` (APPS problem, `PROBLEM.md` + `solution.py`, no git) |
-| `--split` | workload default | swebench: `lite` \| `verified` \| `full` (default `lite`). apps: `train` \| `test` (default `test`) \| difficulty pseudo-splits `introductory` \| `interview` \| `competition` |
+| `--workload` | `swebench` | benchmark: `swebench` (git checkout + issue fix) \| `apps` (APPS problem, `PROBLEM.md` + `solution.py`, no git) \| `terminalbench` (Terminal-Bench 2.0 terminal task, `TASK.md`, no git/Docker) |
+| `--split` | workload default | swebench: `lite` \| `verified` \| `full` (default `lite`). apps: `train` \| `test` (default `test`) \| difficulty pseudo-splits `introductory` \| `interview` \| `competition`. terminalbench: `test` (default) \| difficulty pseudo-splits `easy` \| `medium` \| `hard` |
 | `--num-samples` | `10` | number of tasks (deterministic pick from `(split, seed, n)`) |
 | `--qps` | `0.5` | Poisson arrival rate (ignored with `--sequential`) |
 | `--seed` | `42` | sampling + arrival seed |
@@ -177,6 +177,12 @@ Progress prints per task to **stderr** (`[done/total] instance_id ok/FAIL rtt=..
   --num-samples 20 --qps 0.5 --seed 42 --out results/apps1
 # post-hoc correctness (executes generated code -- use a container):
 scripts/evaluate_apps.py --run results/apps1
+```
+
+**Terminal-Bench workload** (no git/Docker; the task set `harborframework/terminal-bench-2.0` is snapshot-downloaded from HF on first use at a pinned revision; each workspace is a materialized `TASK.md` the agent works next to — workload realism for router/scheduling measurement, **not** official Terminal-Bench scoring, which needs the Harbor harness + per-task containers):
+```bash
+.venv/bin/python -m testbed run --workload terminalbench --split test \
+  --num-samples 20 --qps 0.5 --seed 42 --out results/tb1
 ```
 
 **Scaffold comparison — SWE-agent on the same APPS samples + same Dynamo backend** (install from source first — `pip install "git+https://github.com/SWE-agent/SWE-agent.git"`; the PyPI `sweagent` package is an unrelated name-squat that fails to resolve. `--dry-run` prints the commands to validate the CLI surface):

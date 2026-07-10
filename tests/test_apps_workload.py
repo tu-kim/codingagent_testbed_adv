@@ -401,11 +401,28 @@ def test_registry_has_swebench_and_apps_with_correct_default_split():
     assert WORKLOADS["apps"].default_split == "test"
 
 
-def test_registry_entries_wire_up_apps_module_functions():
+async def test_registry_entries_dispatch_to_apps_module_late_bound(monkeypatch):
+    """The registry deliberately wraps the module functions in LATE-BINDING
+    lambdas (see the WORKLOADS comment in runner.py), so monkeypatching the
+    apps module attributes must take effect through the registry. Assert
+    dispatch, not identity -- `wl.load_samples is apps.load_samples` would
+    be False by design (the registry field is the wrapping lambda)."""
     wl = get_workload("apps")
-    assert wl.load_samples is apps.load_samples
-    assert wl.render_prompt is apps.render_prompt
-    assert wl.prepare is apps.prepare_workspace
+    calls: list[Any] = []
+
+    monkeypatch.setattr(apps, "load_samples",
+                        lambda split, seed, n: [("loaded", split, seed, n)])
+    monkeypatch.setattr(apps, "render_prompt",
+                        lambda sample: f"prompt:{sample['instance_id']}")
+
+    async def _prep(sample, dest, *, reset=False):
+        calls.append((sample["instance_id"], dest, reset))
+    monkeypatch.setattr(apps, "prepare_workspace", _prep)
+
+    assert wl.load_samples("test", 1, 0) == [("loaded", "test", 1, 0)]
+    assert wl.render_prompt({"instance_id": "apps-00001"}) == "prompt:apps-00001"
+    await wl.prepare({"instance_id": "apps-00001"}, Path("unused"), reset=True)
+    assert calls == [("apps-00001", Path("unused"), True)]
     assert wl.splits == apps.SPLITS
 
 
