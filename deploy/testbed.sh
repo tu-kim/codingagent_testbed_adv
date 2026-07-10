@@ -584,12 +584,26 @@ up_opencode() {
   popd >/dev/null
 }
 
+# Extract host / port from a URL like nats://127.0.0.1:4222 or
+# http://127.0.0.1:2379 -- strips the scheme, then splits on the last colon
+# so the single-node bind ports stay in sync with the yaml URLs the dynamo
+# processes connect to (single config source; no second hardcoded port).
+_url_host() { local u="${1#*://}"; printf '%s\n' "${u%:*}"; }
+_url_port() { local u="${1#*://}"; printf '%s\n' "${u##*:}"; }
+
 up_nats() {
   if ! command -v nats-server >/dev/null 2>&1; then
     echo "up nats: nats-server not in PATH (install or use external NATS)" >&2
     return 1
   fi
-  spawn nats -- nats-server --addr 127.0.0.1 --port 4222
+  local nats_url host port
+  nats_url=$(cfg_get_env DYNAMO__NATS_URL .dynamo.nats_url)
+  host=$(_url_host "$nats_url"); port=$(_url_port "$nats_url")
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    echo "up nats: could not parse a numeric port from nats_url='$nats_url'" >&2
+    return 1
+  fi
+  spawn nats -- nats-server --addr "$host" --port "$port"
 }
 
 up_etcd() {
@@ -597,9 +611,11 @@ up_etcd() {
     echo "up etcd: etcd not in PATH (install or use external etcd)" >&2
     return 1
   fi
+  local etcd_endpoints
+  etcd_endpoints=$(cfg_get_env DYNAMO__ETCD_ENDPOINTS .dynamo.etcd_endpoints)
   spawn etcd -- etcd \
-    --listen-client-urls http://127.0.0.1:2379 \
-    --advertise-client-urls http://127.0.0.1:2379 \
+    --listen-client-urls "$etcd_endpoints" \
+    --advertise-client-urls "$etcd_endpoints" \
     --data-dir "$LOG_DIR/etcd-data"
 }
 
