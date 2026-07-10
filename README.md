@@ -44,6 +44,36 @@ yq --version && nats-server --version && etcd --version && python -c "import vll
 
 Vendored submodules (`opencode/`, `dynamo/`) are built from source — see §2.
 
+**Optional — DCGM (only for `up monitor`, the GPU/CPU sampler in §6):**
+
+```bash
+# DCGM core + Python bindings (from the NVIDIA CUDA apt repo; the package
+# name varies by distro/DCGM major: datacenter-gpu-manager-4-core or
+# datacenter-gpu-manager).
+sudo apt install -y datacenter-gpu-manager-4-core
+
+# Locate the Python bindings (dcgm_fields.py) — goes into testbed.yaml.
+dpkg -L datacenter-gpu-manager-4-core datacenter-gpu-manager 2>/dev/null | grep dcgm_fields.py
+# typical: /usr/share/datacenter-gpu-manager-4/bindings/python3
+
+# psutil must be importable by the python that monitor.dcgm_py points at.
+/usr/bin/python3 -c "import psutil" || sudo apt install -y python3-psutil
+```
+
+Then set both keys in `deploy/testbed.yaml` — they are read from yaml precisely so sudo's env-strip can't lose them — and start the monitor with plain sudo:
+
+```yaml
+monitor:
+  dcgm_py: /usr/bin/python3   # python that can import the DCGM bindings + psutil
+  dcgm_bindings_path: /usr/share/datacenter-gpu-manager-4/bindings/python3
+```
+
+```bash
+sudo bash deploy/testbed.sh up monitor
+```
+
+No separate `nv-hostengine` service is needed (the sampler runs DCGM embedded, in-process); sudo IS required — the `DCGM_FI_PROF_*` fields read GPU performance counters gated to root.
+
 ---
 
 ## 2. Setup
@@ -230,7 +260,7 @@ deploy/testbed.sh down scrape_metrics
 sudo deploy/testbed.sh down monitor
 ```
 - `scrape_metrics` — vLLM `/metrics` poller; no sudo, needs `vllm.system_port_base > 0`.
-- `monitor` — DCGM GPU + psutil sampler; **must be run with `sudo`** (root for DCGM). Set `monitor.dcgm_py` in `testbed.yaml` to the Python with DCGM bindings (read from yaml so sudo's env-strip doesn't lose it).
+- `monitor` — DCGM GPU + psutil sampler; **must be run with `sudo`** (root for DCGM). Set `monitor.dcgm_py` + `monitor.dcgm_bindings_path` in `testbed.yaml` (read from yaml so sudo's env-strip doesn't lose them); DCGM install + path discovery: §1 "Optional — DCGM".
 
 OpenCode profiling is ENV-gated: launch opencode with `OPENCODE_PROFILE=1` (per-session NDJSON lands in `<workspace_root>/profiles/`). Aggregate with `scripts/aggregate_profiles.sh <workspace_root>`.
 
