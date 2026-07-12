@@ -256,6 +256,7 @@ All analyzers are standalone (`scripts/*.py`), write CSVs (+ optional `--figures
 | `analyze_worker_scheduling.py` | `logs/vllm-*.log` | per-request prefill/decode **scheduling delay** (needs dynamo patch, §7) |
 | `analyze_request_wait.py` | `frontend.log` + `logs/` | queue-wait as a **fraction of e2e**, joined by request_id; tail concentration; `--figures` |
 | `format_prompt_dump.py` | `prompts/prompt-*.jsonl` | pretty-prints the per-turn **engine prompt** (newlines rendered), one turn per request_id; `--delta` shows only text new since the previous turn (needs dynamo patch, §7) |
+| `export_prompt_turns.py` | `prompts/prompt-*.jsonl` | machine-readable exporter for **external simulators**: one JSON line per request, prompt split into chat-template turns + `text`/`think`/`tool_call`/`tool_response` segments with lossless char offsets; `--no-text` compact mode, `--tokenizer` per-segment token counts (needs dynamo patch, §7) |
 
 Collectors (**optional**, run alongside a workload — never part of `up all`, start/stop them separately):
 ```bash
