@@ -712,30 +712,44 @@ async def run(
                     _print_progress(rec, records, total, time.monotonic() - start)
             else:
                 offsets = poisson.arrival_offsets(qps, num_samples, seed)
-                tasks: list[asyncio.Task[TaskRecord]] = []
-                async for i in poisson.arrivals(offsets, start_monotonic=start):
-                    tasks.append(
-                        asyncio.create_task(
-                            _run_one(
-                                client,
-                                samples[i],
-                                offsets[i],
-                                workspace_root,
-                                sem,
-                                task_timeout_s=task_timeout_s,
-                                reset_workspace=reset_workspace,
-                                directory=directories[samples[i]["instance_id"]],
-                                workload=wl,
-                            )
-                        )
-                    )
 
-                for fut in asyncio.as_completed(tasks):
-                    rec = await fut
+                # Report each task the MOMENT it completes, not after the
+                # whole arrival stream is scheduled. The arrival loop below
+                # sleeps until the LAST Poisson offset, so collecting results
+                # only after it (the old `as_completed` loop) deferred every
+                # progress line -- and every trace.jsonl write -- until the
+                # final arrival, making early finishers appear in one burst
+                # with a misleadingly large `elapsed`. A per-task
+                # write+print coroutine interleaves reporting with arrivals
+                # (the semaphore already governs real concurrency inside
+                # _run_one; this only moves WHEN the finished result is
+                # recorded, not when the slot frees).
+                async def _run_and_report(idx: int) -> TaskRecord:
+                    rec = await _run_one(
+                        client,
+                        samples[idx],
+                        offsets[idx],
+                        workspace_root,
+                        sem,
+                        task_timeout_s=task_timeout_s,
+                        reset_workspace=reset_workspace,
+                        directory=directories[samples[idx]["instance_id"]],
+                        workload=wl,
+                    )
+                    # Single-threaded event loop: these three are atomic
+                    # w.r.t. other tasks, so trace writes never interleave.
                     trace_fh.write(rec.to_jsonl())
                     trace_fh.flush()
                     records.append(rec)
                     _print_progress(rec, records, total, time.monotonic() - start)
+                    return rec
+
+                tasks: list[asyncio.Task[TaskRecord]] = []
+                async for i in poisson.arrivals(offsets, start_monotonic=start):
+                    tasks.append(asyncio.create_task(_run_and_report(i)))
+
+                if tasks:
+                    await asyncio.gather(*tasks)
 
     summary = _summary(records)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
