@@ -200,8 +200,10 @@ def union_length(intervals: list[tuple[float, float]]) -> float:
     return total
 
 
-def summarize_turn(t: _Turn, exclude: frozenset[str]) -> TurnToolSummary:
-    selected = [ti for ti in t.tools.values() if ti.name not in exclude]
+def summarize_turn(t: _Turn, exclude: frozenset[str],
+                   exclude_calls: frozenset[str] = frozenset()) -> TurnToolSummary:
+    selected = [ti for ti in t.tools.values()
+                if ti.name not in exclude and ti.call_id not in exclude_calls]
     all_intervals: list[tuple[float, float]] = []
     per_tool_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
     tool_sum = 0.0
@@ -224,8 +226,9 @@ def summarize_turn(t: _Turn, exclude: frozenset[str]) -> TurnToolSummary:
     )
 
 
-def summarize(turns: list[_Turn], exclude: frozenset[str]) -> list[TurnToolSummary]:
-    rows = [summarize_turn(t, exclude) for t in turns]
+def summarize(turns: list[_Turn], exclude: frozenset[str],
+              exclude_calls: frozenset[str] = frozenset()) -> list[TurnToolSummary]:
+    rows = [summarize_turn(t, exclude, exclude_calls) for t in turns]
     rows.sort(key=lambda r: (r.session_id, r.step))
     return rows
 
@@ -321,6 +324,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="Comma-separated tool names to exclude from the "
                          "ratio (default: task -- the sub-agent spawn). "
                          "Pass an empty string to include every tool.")
+    ap.add_argument("--exclude-calls", type=Path, default=None,
+                    help="Path to a file of callIDs (one per line) to drop "
+                         "from the aggregation, e.g. the exclude_calls.txt "
+                         "produced by filter_hanging_tools.py. Removes "
+                         "hang/server tool calls by callID so they don't "
+                         "inflate the tool-time share.")
     args = ap.parse_args(argv)
 
     if not args.profile.exists():
@@ -330,12 +339,24 @@ def main(argv: list[str] | None = None) -> int:
 
     exclude = frozenset(n for n in args.exclude.split(",") if n)
 
+    exclude_calls: frozenset[str] = frozenset()
+    if args.exclude_calls is not None:
+        if not args.exclude_calls.is_file():
+            print(f"--exclude-calls file not found: {args.exclude_calls}",
+                  file=sys.stderr)
+            return 2
+        exclude_calls = frozenset(
+            ln.strip() for ln in args.exclude_calls.read_text(
+                encoding="utf-8").splitlines() if ln.strip())
+        print(f"  excluding {len(exclude_calls)} callID(s) from "
+              f"{args.exclude_calls}")
+
     turns = load_turns(args.profile)
     if not turns:
         print("no turns found in profile NDJSON", file=sys.stderr)
         return 1
 
-    rows = summarize(turns, exclude)
+    rows = summarize(turns, exclude, exclude_calls)
     agg = by_tool_name(rows)
 
     per_turn_csv = args.output / "tool_time_per_turn.csv"
