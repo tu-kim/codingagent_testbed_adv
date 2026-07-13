@@ -19,6 +19,10 @@ Failure / abort policy (intentional, do not "clean up" silently):
   * Tasks the runner never started (clone / session-create failure
     before opencode is reached) leave no NDJSON, so they're naturally
     absent.
+  * Tool calls named in --exclude-calls (e.g. a hung server launch) are
+    dropped from per-tool stats, and every turn containing one is skipped
+    from the turn-decomposition views (their pre-aggregated tool_wall_s
+    still carries the hang) -- same treatment as task turns.
 Tweak per-call by editing the `if tc.ok` filters and adding an
 `s.aborted` skip if a different policy is needed.
 
@@ -60,6 +64,11 @@ Usage:
       --input results/run1/profiles.jsonl \\
       --output results/run1/figures \\
       [--exclude-tools task]   # drop tools from per-tool plots (fig2/4/5)
+      [--exclude-calls results/run1/hanging_tools/exclude_calls.txt]
+                               # drop specific hang/server tool calls by
+                               # callID (filter_hanging_tools.py output):
+                               # removed from per-tool plots AND their whole
+                               # turn is skipped in the decomposition views
 """
 
 from __future__ import annotations
@@ -126,6 +135,18 @@ class ToolCall:
     ok: bool
     output_chars: int | None = None
     args_head: str | None = None       # tool.start.args_head (≤200-char JSON preview)
+    call_id: str | None = None         # tool.end.callID (join key for --exclude-calls)
+    excluded: bool = False             # dropped via --exclude-calls (e.g. a hung
+                                       # server launch flagged by filter_hanging_tools)
+
+
+def _turn_has_excluded_call(t: "Turn") -> bool:
+    """True if any tool call in the turn was dropped via --exclude-calls.
+    The turn's PRE-AGGREGATED `tool_wall_s` (from turn.end) still includes
+    the excluded call's wall, so such a turn cannot be cleanly corrected by
+    dropping the single call -- it is skipped wholesale from the
+    turn-decomposition / ratio views, the same treatment task turns get."""
+    return any(tc.excluded for tc in t.tools)
 
 
 @dataclass
@@ -183,7 +204,9 @@ def _iter_event_files(path: Path):
         yield f
 
 
-def load_sessions(path: Path) -> dict[str, Session]:
+def load_sessions(path: Path,
+                  exclude_calls: set[str] | None = None) -> dict[str, Session]:
+    excl_calls = exclude_calls or set()
     sessions: dict[str, Session] = {}
     # tool.start carries args_head (the command preview); tool.end carries the
     # duration. Stash args_head by (sid, callID) on start, attach it on end.
@@ -294,6 +317,8 @@ def load_sessions(path: Path) -> dict[str, Session]:
                             ok=bool(ev.get("ok", True)),
                             output_chars=ev.get("output_chars"),
                             args_head=ah,
+                            call_id=cid,
+                            excluded=cid is not None and cid in excl_calls,
                         )
                     )
 
@@ -316,7 +341,7 @@ def per_tool_duration_stats(sessions: dict[str, Session],
     for s in sessions.values():
         for t in s.turns.values():
             for tc in t.tools:
-                if tc.ok and tc.name not in excl:
+                if tc.ok and tc.name not in excl and not tc.excluded:
                     bucket[tc.name].append(tc.duration_s)
     return {
         name: (float(np.mean(v)), float(np.std(v)), len(v))
@@ -336,6 +361,8 @@ def turn_ratio_rows(sessions: dict[str, Session]):
         for step, t in sorted(s.turns.items()):
             if t.tool_wall_s is None or t.llm_wall_s is None or t.llm_wall_s <= 0:
                 continue
+            if _turn_has_excluded_call(t):   # hang turn: tool_wall_s inflated
+                continue
             out.append((sid, step, t.tool_wall_s, t.llm_wall_s,
                         t.tool_wall_s / t.llm_wall_s))
     return out
@@ -352,7 +379,7 @@ def per_tool_ratio_rows(sessions: dict[str, Session],
             if llm is None or llm <= 0:
                 continue
             for tc in t.tools:
-                if tc.ok and tc.name not in excl:
+                if tc.ok and tc.name not in excl and not tc.excluded:
                     out.append((sid, step, tc.name, tc.duration_s / llm))
     return out
 
@@ -369,7 +396,7 @@ def per_tool_ratio_distribution(sessions: dict[str, Session],
             if llm is None or llm <= 0:
                 continue
             for tc in t.tools:
-                if tc.ok and tc.name not in excl:
+                if tc.ok and tc.name not in excl and not tc.excluded:
                     bucket[tc.name].append(tc.duration_s / llm)
     return bucket
 
@@ -400,7 +427,7 @@ def tool_token_pairs(sessions: dict[str, Session],
                 added = next_t.llm_effective_input - t.llm_effective_input - t.llm_output_tokens
                 added = max(0, added)  # clamp (next turn may have compacted)
             for tc in t.tools:
-                if tc.ok and tc.name not in excl:
+                if tc.ok and tc.name not in excl and not tc.excluded:
                     out.append((tc.name, t.llm_output_tokens, added))
     return out
 
@@ -908,7 +935,8 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
     rows = []
     for sid, s in sorted(sessions.items()):
         for step, t in sorted(s.turns.items()):
-            if any(tc.name == TASK_TOOL_NAME for tc in t.tools):
+            if any(tc.name == TASK_TOOL_NAME for tc in t.tools) \
+                    or _turn_has_excluded_call(t):
                 continue
             d, lw, tw = t.turn_duration_s, t.llm_wall_s, t.tool_wall_s
             if d is None or lw is None or tw is None:
@@ -1344,7 +1372,10 @@ def analyze_post_overhead(sessions: dict[str, Session], out: Path,
     leaked LLM stream tail (high streamFinish-miss rate + unexplained slice)."""
 
     def _is_task_turn(t: Turn) -> bool:
-        return any(tc.name == TASK_TOOL_NAME for tc in t.tools)
+        # excluded (hang) turns are skipped alongside task turns: their
+        # pre-aggregated tool_wall_s / duration still carry the hang.
+        return (any(tc.name == TASK_TOOL_NAME for tc in t.tools)
+                or _turn_has_excluded_call(t))
 
     # Threshold from the SAME (task-excluded) turn population so tail_quantile
     # lines up with fig6's >pQ bucket. Uses linear-interpolation percentile
@@ -1771,7 +1802,8 @@ def analyze_tool_dominated_turns(sessions: dict[str, Session], out: Path,
     recs = []
     for sid, s in sorted(sessions.items()):
         for step, t in sorted(s.turns.items()):
-            if any(tc.name == TASK_TOOL_NAME for tc in t.tools):
+            if any(tc.name == TASK_TOOL_NAME for tc in t.tools) \
+                    or _turn_has_excluded_call(t):
                 continue
             d, tw = t.turn_duration_s, t.tool_wall_s
             if d is None or tw is None or d <= 0 or not t.tools:
@@ -1871,6 +1903,18 @@ def main(argv: list[str] | None = None) -> int:
              "unaffected by this flag.",
     )
     ap.add_argument(
+        "--exclude-calls", type=Path, default=None, metavar="FILE",
+        help="Path to a file of callIDs (one per line, e.g. the "
+             "exclude_calls.txt from filter_hanging_tools.py). Those tool "
+             "calls are dropped from per-tool analyses (fig2 / fig4 / fig5), "
+             "and every TURN containing one is excluded wholesale from the "
+             "turn-decomposition / ratio views (fig3 / fig6 / fig6b / latency "
+             "composition / tool-dominated) -- the same treatment task turns "
+             "get -- because turn.end's pre-aggregated tool_wall_s still "
+             "includes the hung call's wall. Use to strip server/hang bash "
+             "calls that otherwise dominate the tool-time share.",
+    )
+    ap.add_argument(
         "--trace", type=Path, default=None, metavar="trace.jsonl",
         help="Optional run trace.jsonl. Enables the post_overhead breakdown to "
              "join sessions to instance_id/repo (workspace-size proxy) and to "
@@ -1900,16 +1944,39 @@ def main(argv: list[str] | None = None) -> int:
     if not args.input.exists():
         print(f"input not found: {args.input}", file=sys.stderr)
         return 2
+
+    exclude_calls: set[str] = set()
+    if args.exclude_calls is not None:
+        if not args.exclude_calls.is_file():
+            print(f"--exclude-calls file not found: {args.exclude_calls}",
+                  file=sys.stderr)
+            return 2
+        exclude_calls = {ln.strip() for ln in
+                         args.exclude_calls.read_text(encoding="utf-8").splitlines()
+                         if ln.strip()}
+
     args.output.mkdir(parents=True, exist_ok=True)
 
-    sessions = load_sessions(args.input)
+    sessions = load_sessions(args.input, exclude_calls=exclude_calls)
     if not sessions:
         print("no sessions parsed from input", file=sys.stderr)
         return 1
 
     n_turns = sum(len(s.turns) for s in sessions.values())
     n_tools = sum(len(t.tools) for s in sessions.values() for t in s.turns.values())
+    n_excl = sum(1 for s in sessions.values() for t in s.turns.values()
+                 for tc in t.tools if tc.excluded)
     print(f"loaded {len(sessions)} sessions, {n_turns} turns, {n_tools} tool calls")
+    if exclude_calls:
+        n_excl_turns = sum(1 for s in sessions.values() for t in s.turns.values()
+                           if _turn_has_excluded_call(t))
+        print(f"  --exclude-calls: matched {n_excl} tool call(s) across "
+              f"{n_excl_turns} turn(s) (dropped from per-tool figs; those "
+              f"turns skipped in turn-decomposition)")
+        if n_excl == 0:
+            print(f"  warning: none of the {len(exclude_calls)} callID(s) in "
+                  f"{args.exclude_calls} matched any tool.end in this profile",
+                  file=sys.stderr)
 
     plt.rcParams.update(PAPER_STYLE)
 
