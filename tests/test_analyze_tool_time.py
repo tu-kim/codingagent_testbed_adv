@@ -291,3 +291,63 @@ def test_main_empty_profile_returns_1(mod, tmp_path, capsys):
     rc = mod.main(["--profile", str(f), "--output", str(tmp_path / "o")])
     assert rc == 1
     assert "no turns found" in capsys.readouterr().err
+
+
+# ---------- --exclude-calls (drop hang/server calls by callID) ----------
+
+
+def test_summarize_excludes_by_call_id(mod, tmp_path):
+    """A 60s hang call excluded by callID leaves only the 2s call."""
+    p = tmp_path / "ses.jsonl"
+    _write(p, [
+        *_tool("s", 0, "c_hang", "bash", 100.0, 160.0),   # 60s
+        *_tool("s", 0, "c_ok", "bash", 160.0, 162.0),     # 2s, disjoint
+        _turn_end("s", 0, 62.0),
+    ])
+    rows = mod.summarize(mod.load_turns(p), frozenset(),
+                         frozenset({"c_hang"}))
+    assert rows[0].tool_wall_s == pytest.approx(2.0)
+    assert rows[0].n_calls == 1
+
+
+def test_summarize_call_and_name_exclusion_compose(mod, tmp_path):
+    """Name exclude and callID exclude both apply."""
+    p = tmp_path / "ses.jsonl"
+    _write(p, [
+        *_tool("s", 0, "c_task", "task", 0.0, 5.0),
+        *_tool("s", 0, "c_hang", "bash", 5.0, 65.0),
+        *_tool("s", 0, "c_ok", "bash", 65.0, 66.0),
+        _turn_end("s", 0, 66.0),
+    ])
+    rows = mod.summarize(mod.load_turns(p), frozenset({"task"}),
+                         frozenset({"c_hang"}))
+    assert rows[0].n_calls == 1
+    assert rows[0].tool_wall_s == pytest.approx(1.0)
+
+
+def test_main_exclude_calls_file(mod, tmp_path):
+    prof = tmp_path / "p.jsonl"
+    _write(prof, [
+        *_tool("s", 0, "c_hang", "bash", 100.0, 160.0),   # 60s
+        *_tool("s", 0, "c_ok", "bash", 160.0, 162.0),     # 2s
+        _turn_end("s", 0, 62.0),
+    ])
+    excl = tmp_path / "exclude.txt"
+    excl.write_text("c_hang\n\n")   # blank line tolerated
+    out = tmp_path / "out"
+    rc = mod.main(["--profile", str(prof), "--output", str(out),
+                   "--exclude", "", "--exclude-calls", str(excl)])
+    assert rc == 0
+    by_name = {r["tool_name"]: float(r["total_wall_s"])
+               for r in csv.DictReader((out / "tool_time_by_name.csv").open())}
+    assert by_name["bash"] == pytest.approx(2.0)   # hang dropped
+
+
+def test_main_missing_exclude_calls_file_returns_2(mod, tmp_path, capsys):
+    prof = tmp_path / "p.jsonl"
+    _write(prof, [*_tool("s", 0, "c1", "bash", 0.0, 1.0), _turn_end("s", 0, 2.0)])
+    out = tmp_path / "out"
+    rc = mod.main(["--profile", str(prof), "--output", str(out),
+                   "--exclude-calls", str(tmp_path / "nope.txt")])
+    assert rc == 2
+    assert "exclude-calls file not found" in capsys.readouterr().err

@@ -44,6 +44,36 @@ yq --version && nats-server --version && etcd --version && python -c "import vll
 
 Vendored submodules (`opencode/`, `dynamo/`) are built from source — see §2.
 
+**Optional — DCGM (only for `up monitor`, the GPU/CPU sampler in §6):**
+
+```bash
+# DCGM core + Python bindings (from the NVIDIA CUDA apt repo; the package
+# name varies by distro/DCGM major: datacenter-gpu-manager-4-core or
+# datacenter-gpu-manager).
+sudo apt install -y datacenter-gpu-manager-4-core
+
+# Locate the Python bindings (dcgm_fields.py) — goes into testbed.yaml.
+dpkg -L datacenter-gpu-manager-4-core datacenter-gpu-manager 2>/dev/null | grep dcgm_fields.py
+# typical: /usr/share/datacenter-gpu-manager-4/bindings/python3
+
+# psutil must be importable by the python that monitor.dcgm_py points at.
+/usr/bin/python3 -c "import psutil" || sudo apt install -y python3-psutil
+```
+
+Then set both keys in `deploy/testbed.yaml` — they are read from yaml precisely so sudo's env-strip can't lose them — and start the monitor with plain sudo:
+
+```yaml
+monitor:
+  dcgm_py: /usr/bin/python3   # python that can import the DCGM bindings + psutil
+  dcgm_bindings_path: /usr/share/datacenter-gpu-manager-4/bindings/python3
+```
+
+```bash
+sudo bash deploy/testbed.sh up monitor
+```
+
+No separate `nv-hostengine` service is needed (the sampler runs DCGM embedded, in-process); sudo IS required — the `DCGM_FI_PROF_*` fields read GPU performance counters gated to root.
+
 ---
 
 ## 2. Setup
@@ -126,7 +156,8 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 
 | flag | default | meaning |
 |------|---------|---------|
-| `--split` | `lite` | SWE-bench split: `lite` \| `verified` \| `full` |
+| `--workload` | `swebench` | benchmark: `swebench` (git checkout + issue fix) \| `apps` (APPS problem, `PROBLEM.md` + `solution.py`, no git) \| `terminalbench` (Terminal-Bench 2.0 terminal task, `TASK.md`, no git/Docker) |
+| `--split` | workload default | swebench: `lite` \| `verified` \| `full` (default `lite`). apps: `train` \| `test` (default `test`) \| difficulty pseudo-splits `introductory` \| `interview` \| `competition`. terminalbench: `test` (default) \| difficulty pseudo-splits `easy` \| `medium` \| `hard` |
 | `--num-samples` | `10` | number of tasks (deterministic pick from `(split, seed, n)`) |
 | `--qps` | `0.5` | Poisson arrival rate (ignored with `--sequential`) |
 | `--seed` | `42` | sampling + arrival seed |
@@ -139,6 +170,28 @@ scripts/curl_smoke.sh swebench    # a real SWE-bench prompt
 | `--out` | required | output directory |
 
 Progress prints per task to **stderr** (`[done/total] instance_id ok/FAIL rtt=.. elapsed=..`).
+
+**APPS workload** (no git; workspaces are materialized locally, so `pre-clone` is instant):
+```bash
+.venv/bin/python -m testbed run --workload apps --split introductory \
+  --num-samples 20 --qps 0.5 --seed 42 --out results/apps1
+# post-hoc correctness (executes generated code -- use a container):
+scripts/evaluate_apps.py --run results/apps1
+```
+
+**Terminal-Bench workload** (no git/Docker; the task set `harborframework/terminal-bench-2.0` is snapshot-downloaded from HF on first use at a pinned revision; each workspace is a materialized `TASK.md` the agent works next to — workload realism for router/scheduling measurement, **not** official Terminal-Bench scoring, which needs the Harbor harness + per-task containers):
+```bash
+.venv/bin/python -m testbed run --workload terminalbench --split test \
+  --num-samples 20 --qps 0.5 --seed 42 --out results/tb1
+```
+
+**Scaffold comparison — SWE-agent on the same APPS samples + same Dynamo backend** (install from source first — `pip install "git+https://github.com/SWE-agent/SWE-agent.git"`; the PyPI `sweagent` package is an unrelated name-squat that fails to resolve. `--dry-run` prints the commands to validate the CLI surface):
+```bash
+scripts/run_sweagent_apps.py --split competition --num-samples 20 --seed 42 \
+  --out results/sweagent-apps1 --deployment docker   # local needs root-writable /: SWE-agent copies the repo to /<name> (PR #1132 closed unmerged)
+scripts/analyze_sweagent_traj.py --run results/sweagent-apps1 --frontend logs/frontend.log
+scripts/evaluate_apps.py --run results/sweagent-apps1     # same scorer as opencode runs
+```
 
 **Router sweep** (actual routing is set when the frontend starts, not by `--router`):
 ```bash
@@ -203,6 +256,7 @@ All analyzers are standalone (`scripts/*.py`), write CSVs (+ optional `--figures
 | `analyze_worker_scheduling.py` | `logs/vllm-*.log` | per-request prefill/decode **scheduling delay** (needs dynamo patch, §7) |
 | `analyze_request_wait.py` | `frontend.log` + `logs/` | queue-wait as a **fraction of e2e**, joined by request_id; tail concentration; `--figures` |
 | `format_prompt_dump.py` | `prompts/prompt-*.jsonl` | pretty-prints the per-turn **engine prompt** (newlines rendered), one turn per request_id; `--delta` shows only text new since the previous turn (needs dynamo patch, §7) |
+| `export_prompt_turns.py` | `prompts/prompt-*.jsonl` | machine-readable exporter for **external simulators**: one JSON line per request, prompt split into chat-template turns + `text`/`think`/`tool_call`/`tool_response` segments with lossless char offsets; `--no-text` compact mode, `--tokenizer` per-segment token counts (needs dynamo patch, §7) |
 
 Collectors (**optional**, run alongside a workload — never part of `up all`, start/stop them separately):
 ```bash
@@ -213,7 +267,7 @@ deploy/testbed.sh down scrape_metrics
 sudo deploy/testbed.sh down monitor
 ```
 - `scrape_metrics` — vLLM `/metrics` poller; no sudo, needs `vllm.system_port_base > 0`.
-- `monitor` — DCGM GPU + psutil sampler; **must be run with `sudo`** (root for DCGM). Set `monitor.dcgm_py` in `testbed.yaml` to the Python with DCGM bindings (read from yaml so sudo's env-strip doesn't lose it).
+- `monitor` — DCGM GPU + psutil sampler; **must be run with `sudo`** (root for DCGM). Set `monitor.dcgm_py` + `monitor.dcgm_bindings_path` in `testbed.yaml` (read from yaml so sudo's env-strip doesn't lose them); DCGM install + path discovery: §1 "Optional — DCGM".
 
 OpenCode profiling is ENV-gated: launch opencode with `OPENCODE_PROFILE=1` (per-session NDJSON lands in `<workspace_root>/profiles/`). Aggregate with `scripts/aggregate_profiles.sh <workspace_root>`.
 

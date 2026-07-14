@@ -37,10 +37,11 @@ def _make_pre_clone_stub(failures: dict | None = None):
         failures = {}
     recorded: list[dict] = []
 
-    async def _stub(cfg, *, split, num_samples, seed, reset_workspace,
+    async def _stub(cfg, *, workload, split, num_samples, seed, reset_workspace,
                     concurrency):
         recorded.append({
             "cfg": cfg,
+            "workload": workload,
             "split": split,
             "num_samples": num_samples,
             "seed": seed,
@@ -188,3 +189,65 @@ def test_seed_forwarded(monkeypatch, tmp_path):
     _, recorded = _invoke(["--seed", "99"], monkeypatch, tmp_path)
 
     assert recorded[0]["seed"] == 99
+
+
+# ---------------------------------------------------------------------------
+# --workload (new: swebench | apps)
+# ---------------------------------------------------------------------------
+
+def test_workload_default_is_swebench(monkeypatch, tmp_path):
+    """Default --workload is swebench; split resolves to swebench's default (lite)."""
+    _, recorded = _invoke([], monkeypatch, tmp_path)
+
+    assert recorded[0]["workload"] == "swebench"
+    assert recorded[0]["split"] == "lite"
+
+
+def test_workload_apps_forwarded_with_default_split(monkeypatch, tmp_path):
+    """--workload apps (no --split) resolves split to apps's default (test)."""
+    _, recorded = _invoke(["--workload", "apps"], monkeypatch, tmp_path)
+
+    assert recorded[0]["workload"] == "apps"
+    assert recorded[0]["split"] == "test"
+
+
+def test_workload_apps_with_difficulty_split_forwarded(monkeypatch, tmp_path):
+    """--workload apps --split introductory reaches pre_clone_run verbatim."""
+    _, recorded = _invoke(
+        ["--workload", "apps", "--split", "introductory"], monkeypatch, tmp_path
+    )
+
+    assert recorded[0]["workload"] == "apps"
+    assert recorded[0]["split"] == "introductory"
+
+
+def test_workload_apps_with_swebench_split_rejected(monkeypatch, tmp_path):
+    """--workload apps --split lite is invalid (lite is a swebench split) ->
+    click.BadParameter -> exit code 2, no call reaches pre_clone_run."""
+    stub, recorded = _make_pre_clone_stub()
+    monkeypatch.setattr("testbed.cli.config_mod.load",
+                        lambda *a, **kw: _make_cfg(str(tmp_path / "ws")))
+    monkeypatch.setattr("testbed.cli.runner_mod.pre_clone_run", stub)
+
+    cli_runner = CliRunner(mix_stderr=False)
+    result = cli_runner.invoke(
+        main, ["pre-clone", "--workload", "apps", "--split", "lite"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 2
+    assert recorded == []
+
+
+def test_workload_unknown_rejected_by_click_choice(monkeypatch, tmp_path):
+    """--workload bogus is rejected by click.Choice before _resolve_split runs."""
+    stub, recorded = _make_pre_clone_stub()
+    monkeypatch.setattr("testbed.cli.config_mod.load",
+                        lambda *a, **kw: _make_cfg(str(tmp_path / "ws")))
+    monkeypatch.setattr("testbed.cli.runner_mod.pre_clone_run", stub)
+
+    cli_runner = CliRunner(mix_stderr=False)
+    result = cli_runner.invoke(
+        main, ["pre-clone", "--workload", "bogus"], catch_exceptions=False,
+    )
+    assert result.exit_code == 2
+    assert recorded == []

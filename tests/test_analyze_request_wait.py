@@ -120,6 +120,47 @@ def test_join_computes_wait_fraction(mod):
     assert r.decode_wait_ms == pytest.approx(30.0)
     assert r.total_wait_ms == pytest.approx(40.0)
     assert r.wait_fraction == pytest.approx(0.2)   # 40 / 200
+    # queue-corrected TTFT: ttft(50) - prefill_wait(10) = 40
+    assert r.prefill_compute_ms == pytest.approx(40.0)
+
+
+def test_prefill_compute_none_without_ttft(mod):
+    r = mod.RequestWait("r", total_ms=100.0, ttft_ms=None,
+                        prefill_wait_ms=10.0, decode_wait_ms=None)
+    assert r.prefill_compute_ms is None
+
+
+def test_prefill_compute_none_without_prefill_wait(mod):
+    r = mod.RequestWait("r", total_ms=100.0, ttft_ms=50.0,
+                        prefill_wait_ms=None, decode_wait_ms=20.0)
+    assert r.prefill_compute_ms is None
+
+
+def test_prefill_compute_can_be_negative(mod):
+    # queue_ms occasionally exceeds ttft (clock skew / rounding); keep the
+    # raw difference rather than clamping so the anomaly stays visible.
+    r = mod.RequestWait("r", total_ms=100.0, ttft_ms=30.0,
+                        prefill_wait_ms=40.0, decode_wait_ms=None)
+    assert r.prefill_compute_ms == pytest.approx(-10.0)
+
+
+def test_percentiles_csv_ttft_decomposition_values(mod, tmp_path):
+    fe = tmp_path / "frontend.log"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    # one request: ttft=300, prefill queue=100 -> prefill_compute=200
+    fe.write_text(_frontend_line("r1", 1000, ttft_ms=300.0))
+    (logs / "vllm-p0.log").write_text(_sched_line("r1", "prefill", 100.0))
+
+    out = tmp_path / "out"
+    assert mod.main(["--frontend", str(fe), "--logs", str(logs),
+                     "--output", str(out)]) == 0
+    pct = {r["metric"]: r for r in csv.DictReader((out / "wait_percentiles.csv").open())}
+    assert pct["ttft_ms"]["mean"] == "300.0000"
+    assert pct["prefill_compute_ms"]["mean"] == "200.0000"
+    req = {r["request_id"]: r
+           for r in csv.DictReader((out / "request_wait.csv").open())}
+    assert req["r1"]["prefill_compute_ms"] == "200.0000"
 
 
 def test_join_unmatched_request_has_none_waits(mod):
@@ -322,7 +363,8 @@ def test_main_writes_percentile_and_tail_csvs(mod, tmp_path, capsys):
     assert rc == 0
 
     pct = {r["metric"]: r for r in csv.DictReader((out / "wait_percentiles.csv").open())}
-    assert set(pct) == {"wait_fraction", "total_wait_ms", "total_ms"}
+    assert set(pct) == {"ttft_ms", "prefill_compute_ms",
+                        "wait_fraction", "total_wait_ms", "total_ms"}
     assert pct["total_ms"]["max"] == "1000.0000"
 
     tail = list(csv.DictReader((out / "wait_tail.csv").open()))

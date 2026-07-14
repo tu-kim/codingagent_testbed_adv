@@ -30,6 +30,18 @@ def _write(tmp: Path, body: str) -> Path:
     return p
 
 
+_AGG_YAML = """
+workspace_root: /tmp/x
+model:
+  name: test-model
+  served_name: local
+vllm:
+  agg_workers:
+    - { name: a0, gpus: "0,1", tp: 2, pp: 1 }
+  agg: { max_model_len: 1024, max_num_batched_tokens: 1024, max_num_seqs: 4, gpu_memory_utilization: 0.9 }
+"""
+
+
 def test_load_defaults(tmp_path: Path):
     cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
     assert cfg.dynamo.router_mode == "round-robin"
@@ -98,6 +110,136 @@ def test_worker_ep_does_not_change_gpu_count(tmp_path: Path):
     p.write_text(yaml.safe_dump(cfg))
     loaded = cfg_mod.load(p, environ={})  # must not raise
     assert loaded.vllm.prefill_workers[0].ep is True
+
+
+# ---------------------------------------------------------------------------
+# PD topology: disagg (prefill_workers+decode_workers) vs agg (agg_workers)
+# are mutually exclusive; exactly one must be fully configured.
+# ---------------------------------------------------------------------------
+
+def test_disagg_topology_still_validates(tmp_path: Path):
+    """Backward compat: the pre-existing full prefill+decode shape (as used
+    by _BASE_YAML throughout this file) must keep validating unchanged."""
+    cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ={})
+    assert len(cfg.vllm.prefill_workers) == 1
+    assert len(cfg.vllm.decode_workers) == 1
+    assert cfg.vllm.agg_workers == []
+    assert cfg.vllm.agg is None
+
+
+def test_agg_topology_validates_with_no_prefill_decode_keys(tmp_path: Path):
+    """Pure PD-colocation config: agg_workers + agg section, and the yaml
+    contains no prefill/decode keys at all (not even empty ones)."""
+    cfg = cfg_mod.load(_write(tmp_path, _AGG_YAML), environ={})
+    assert len(cfg.vllm.agg_workers) == 1
+    assert cfg.vllm.agg is not None
+    assert cfg.vllm.agg.max_model_len == 1024
+    assert cfg.vllm.prefill_workers == []
+    assert cfg.vllm.decode_workers == []
+    assert cfg.vllm.prefill is None
+    assert cfg.vllm.decode is None
+
+
+def test_agg_workers_mutually_exclusive_with_prefill_workers(tmp_path: Path):
+    mixed = yaml.safe_load(_AGG_YAML)
+    mixed["vllm"]["prefill_workers"] = [
+        {"name": "p0", "gpus": "2,3", "tp": 2, "pp": 1}
+    ]
+    p = tmp_path / "mixed.yaml"
+    p.write_text(yaml.safe_dump(mixed))
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        cfg_mod.load(p, environ={})
+
+
+def test_agg_workers_mutually_exclusive_with_decode_workers(tmp_path: Path):
+    mixed = yaml.safe_load(_AGG_YAML)
+    mixed["vllm"]["decode_workers"] = [
+        {"name": "d0", "gpus": "2,3", "tp": 2, "pp": 1}
+    ]
+    p = tmp_path / "mixed2.yaml"
+    p.write_text(yaml.safe_dump(mixed))
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        cfg_mod.load(p, environ={})
+
+
+def test_no_workers_at_all_rejected(tmp_path: Path):
+    body = """
+workspace_root: /tmp/x
+model:
+  name: test-model
+  served_name: local
+vllm: {}
+"""
+    with pytest.raises(ValidationError, match="no vllm workers configured"):
+        cfg_mod.load(_write(tmp_path, body), environ={})
+
+
+def test_prefill_workers_without_decode_workers_rejected(tmp_path: Path):
+    half = yaml.safe_load(_BASE_YAML)
+    del half["vllm"]["decode_workers"]
+    del half["vllm"]["decode"]
+    p = tmp_path / "half_prefill.yaml"
+    p.write_text(yaml.safe_dump(half))
+    with pytest.raises(ValidationError, match="BOTH prefill_workers and decode_workers"):
+        cfg_mod.load(p, environ={})
+
+
+def test_decode_workers_without_prefill_workers_rejected(tmp_path: Path):
+    half = yaml.safe_load(_BASE_YAML)
+    del half["vllm"]["prefill_workers"]
+    del half["vllm"]["prefill"]
+    p = tmp_path / "half_decode.yaml"
+    p.write_text(yaml.safe_dump(half))
+    with pytest.raises(ValidationError, match="BOTH prefill_workers and decode_workers"):
+        cfg_mod.load(p, environ={})
+
+
+def test_disagg_workers_present_but_prefill_section_missing_rejected(tmp_path: Path):
+    """Both worker lists present, but the 'prefill:' role section is dropped
+    -- must be rejected distinctly from the half-pair case."""
+    bad = yaml.safe_load(_BASE_YAML)
+    del bad["vllm"]["prefill"]
+    p = tmp_path / "no_prefill_section.yaml"
+    p.write_text(yaml.safe_dump(bad))
+    with pytest.raises(ValidationError, match="prefill:.*decode:"):
+        cfg_mod.load(p, environ={})
+
+
+def test_disagg_workers_present_but_decode_section_missing_rejected(tmp_path: Path):
+    bad = yaml.safe_load(_BASE_YAML)
+    del bad["vllm"]["decode"]
+    p = tmp_path / "no_decode_section.yaml"
+    p.write_text(yaml.safe_dump(bad))
+    with pytest.raises(ValidationError, match="prefill:.*decode:"):
+        cfg_mod.load(p, environ={})
+
+
+def test_agg_workers_without_agg_section_rejected(tmp_path: Path):
+    bad = yaml.safe_load(_AGG_YAML)
+    del bad["vllm"]["agg"]
+    p = tmp_path / "no_agg_section.yaml"
+    p.write_text(yaml.safe_dump(bad))
+    with pytest.raises(ValidationError, match="agg_workers requires the 'agg:' role section"):
+        cfg_mod.load(p, environ={})
+
+
+def test_agg_worker_gpu_count_mismatch_rejected(tmp_path: Path):
+    """The per-worker field_validator (_validate_workers) now also runs over
+    agg_workers, so a tp*pp*dp mismatch on an agg worker is still caught."""
+    bad = yaml.safe_load(_AGG_YAML)
+    bad["vllm"]["agg_workers"][0]["gpus"] = "0"  # 1 gpu, tp*pp=2
+    p = tmp_path / "bad_agg_gpus.yaml"
+    p.write_text(yaml.safe_dump(bad))
+    with pytest.raises(ValidationError):
+        cfg_mod.load(p, environ={})
+
+
+def test_agg_max_model_len_env_override(tmp_path: Path):
+    """TESTBED__VLLM__AGG__MAX_MODEL_LEN reaches the agg role section, same
+    override mechanism already exercised for VLLM__PREFILL__* fields."""
+    env = {"TESTBED__VLLM__AGG__MAX_MODEL_LEN": "8192"}
+    cfg = cfg_mod.load(_write(tmp_path, _AGG_YAML), environ=env)
+    assert cfg.vllm.agg.max_model_len == 8192
 
 
 def test_router_mode_enum_rejects_unknown(tmp_path: Path):

@@ -29,9 +29,18 @@ is never surfaced dynamo-side). Pass --session-map <csv> with columns
 `request_id,session_id` to roll the per-request rows up by session. See
 the README/CLAUDE note on producing that map from the opencode profile.
 
+TTFT integration: the frontend `ttft_ms` is parsed HERE (same log this
+join already reads), so raw TTFT and the queue-corrected TTFT
+(`prefill_compute_ms = ttft_ms - prefill_wait_ms`) come out of this ONE
+script -- no separate analyze_frontend_log run + manual subtraction. See
+the `ttft_ms` / `prefill_compute_ms` rows in wait_percentiles.csv,
+request_wait.csv, and the TTFT decomposition block in stdout.
+
 Outputs:
-  request_wait.csv     per-request join (one row per frontend request)
-  wait_percentiles.csv p50..p99.9/max of wait_fraction / total_wait_ms / total_ms
+  request_wait.csv     per-request join (one row per frontend request);
+                       includes ttft_ms + prefill_compute_ms (queue-removed TTFT)
+  wait_percentiles.csv p50..p99.9/max of ttft_ms / prefill_compute_ms /
+                       wait_fraction / total_wait_ms / total_ms
   wait_tail.csv        slowest-X% buckets: mean wait_fraction + wait_share
   session_wait.csv     per-session rollup (only with --session-map)
   fig_*.pdf            only with --figures (needs matplotlib):
@@ -174,6 +183,18 @@ class RequestWait:
             return None
         return self.total_wait_ms / self.total_ms
 
+    @property
+    def prefill_compute_ms(self) -> float | None:
+        """ttft with the prefill scheduler queue-wait removed ~= prefill
+        COMPUTE (+ small routing / first-chunk-wire overhead). ttft_ms as
+        logged by the frontend spans prefill_queue + prefill_compute +
+        first-token wire, so subtracting the joined prefill queue_ms
+        isolates the compute-ish remainder. None unless BOTH ttft and a
+        joined prefill queue-wait are present."""
+        if self.ttft_ms is None or self.prefill_wait_ms is None:
+            return None
+        return self.ttft_ms - self.prefill_wait_ms
+
 
 def join_requests(frontend: dict[str, FrontendReq],
                   waits: dict[str, WorkerWait]) -> list[RequestWait]:
@@ -257,12 +278,13 @@ def write_request_csv(rows: list[RequestWait], path: Path) -> None:
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["request_id", "matched", "total_ms", "ttft_ms",
-                    "prefill_wait_ms", "decode_wait_ms",
+                    "prefill_wait_ms", "prefill_compute_ms", "decode_wait_ms",
                     "total_wait_ms", "wait_fraction"])
         for r in rows:
             w.writerow([
                 r.request_id, int(r.matched), _fmt(r.total_ms), _fmt(r.ttft_ms),
-                _fmt(r.prefill_wait_ms), _fmt(r.decode_wait_ms),
+                _fmt(r.prefill_wait_ms), _fmt(r.prefill_compute_ms),
+                _fmt(r.decode_wait_ms),
                 _fmt(r.total_wait_ms), _fmt(r.wait_fraction),
             ])
 
@@ -356,6 +378,12 @@ def write_percentiles_csv(rows: list[RequestWait], path: Path) -> None:
     metrics, one row per metric."""
     matched = [r for r in rows if r.matched]
     metrics = {
+        # ttft (as logged) vs the SAME ttft with prefill queue-wait removed
+        # -- the queue-corrected TTFT the user previously computed by hand
+        # from two scripts. Both come out of this single join now.
+        "ttft_ms": [r.ttft_ms for r in matched if r.ttft_ms is not None],
+        "prefill_compute_ms": [r.prefill_compute_ms for r in matched
+                               if r.prefill_compute_ms is not None],
         "wait_fraction": [r.wait_fraction for r in matched if r.wait_fraction is not None],
         "total_wait_ms": [r.total_wait_ms for r in matched],
         "total_ms": [r.total_ms for r in matched],
@@ -521,6 +549,28 @@ def print_summary(rows: list[RequestWait], sessions: list[SessionWait] | None) -
     print(f"wait_fraction (queue wait / e2e):  {_pctiles(fr)}")
     print(f"prefill_wait_ms:                   {_pctiles(pre)}")
     print(f"decode_wait_ms:                    {_pctiles(dec)}")
+
+    # TTFT decomposition: the whole point of the integration -- raw ttft as
+    # the frontend logs it, and ttft with the joined prefill queue-wait
+    # subtracted (~= prefill compute + first-chunk wire), side by side so
+    # no second script + manual subtraction is needed.
+    ttft = [r.ttft_ms for r in matched if r.ttft_ms is not None]
+    comp = [r.prefill_compute_ms for r in matched if r.prefill_compute_ms is not None]
+    if ttft:
+        print()
+        print(f"ttft_ms (as logged):               {_pctiles(ttft)}")
+        print(f"prefill_compute_ms (ttft - queue): {_pctiles(comp)}")
+        # Aggregate: how much of TTFT was prefill scheduler queue-wait. Use
+        # the requests that have BOTH so the shares are on one population.
+        both = [r for r in matched
+                if r.ttft_ms is not None and r.prefill_compute_ms is not None]
+        sum_ttft = sum(r.ttft_ms for r in both)
+        sum_pre = sum(r.prefill_wait_ms or 0.0 for r in both)
+        if sum_ttft:
+            print(f"Aggregate TTFT: {sum_pre:.1f}ms prefill-queue / {sum_ttft:.1f}ms ttft "
+                  f"= {100*sum_pre/sum_ttft:.1f}% of TTFT was scheduler queue-wait "
+                  f"(remainder {100*(1-sum_pre/sum_ttft):.1f}% ~= prefill compute)")
+
     tot_e2e = sum(r.total_ms for r in matched)
     tot_wait = sum(r.total_wait_ms for r in matched)
     if tot_e2e:

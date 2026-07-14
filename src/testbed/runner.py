@@ -11,9 +11,9 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from . import poisson, swebench
+from . import apps, poisson, swebench, terminalbench
 from .config import TestbedCfg, resolved_snapshot
 from .opencode import OpenCodeClient
 
@@ -153,6 +153,74 @@ async def _pre_clone(repo: str, base_commit: str, dest: Path,
     await _run_git(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
 
 
+async def _prepare_swebench(sample: dict[str, Any], dest: Path, *,
+                            reset: bool = False) -> None:
+    """SWE-bench workspace preparation = git clone + checkout (see _pre_clone)."""
+    await _pre_clone(sample["repo"], sample["base_commit"], dest, reset=reset)
+
+
+@dataclass(frozen=True)
+class Workload:
+    """One benchmark's pluggable surface. Everything else in the runner
+    (Poisson arrivals, semaphore, TaskRecord schema, manifest flow, error
+    stages) is workload-agnostic; samples MUST carry an "instance_id" key
+    (swebench has it natively, apps/terminalbench load_samples inject one).
+
+    `prepare` is the stage-1 workspace materialization -- a git
+    clone+checkout for swebench, local file writes for apps/terminalbench.
+    Its failures land as error.stage="clone" for EVERY workload: "clone" is
+    the documented trace-schema name for "workspace preparation failed"
+    (renaming per-workload would break every downstream consumer)."""
+    name: str
+    default_split: str
+    splits: tuple[str, ...]
+    load_samples: Callable[[str, int, int], list[dict[str, Any]]]
+    render_prompt: Callable[[dict[str, Any]], str]
+    prepare: Callable[..., Awaitable[None]]  # (sample, dest, *, reset) -> None
+
+
+# The lambdas are deliberate LATE bindings: they resolve
+# swebench.load_samples / apps.render_prompt / ... on the module object at
+# CALL time, so monkeypatching the module attribute (the established test
+# pattern, e.g. patch.object(runner.swebench, "load_samples", ...)) still
+# takes effect. Capturing the bare function reference here would freeze
+# the original at import time and silently bypass those patches.
+WORKLOADS: dict[str, Workload] = {
+    "swebench": Workload(
+        name="swebench",
+        default_split="lite",
+        splits=("lite", "verified", "full"),
+        load_samples=lambda split, seed, n: swebench.load_samples(split, seed, n),
+        render_prompt=lambda sample: swebench.render_prompt(sample),
+        prepare=_prepare_swebench,
+    ),
+    "apps": Workload(
+        name="apps",
+        default_split="test",
+        splits=apps.SPLITS,
+        load_samples=lambda split, seed, n: apps.load_samples(split, seed, n),
+        render_prompt=lambda sample: apps.render_prompt(sample),
+        prepare=lambda sample, dest, *, reset=False: apps.prepare_workspace(
+            sample, dest, reset=reset),
+    ),
+    "terminalbench": Workload(
+        name="terminalbench",
+        default_split="test",
+        splits=terminalbench.SPLITS,
+        load_samples=lambda split, seed, n: terminalbench.load_samples(split, seed, n),
+        render_prompt=lambda sample: terminalbench.render_prompt(sample),
+        prepare=lambda sample, dest, *, reset=False: terminalbench.prepare_workspace(
+            sample, dest, reset=reset),
+    ),
+}
+
+
+def get_workload(name: str) -> Workload:
+    if name not in WORKLOADS:
+        raise ValueError(f"unknown workload {name!r}; choose from {sorted(WORKLOADS)}")
+    return WORKLOADS[name]
+
+
 async def _try_list_partial(client: OpenCodeClient, session_id: str,
                             abs_dir: str, *, timeout_s: float = 30.0) -> list[Any]:
     """Best-effort fetch of the turns completed BEFORE a timeout abort.
@@ -189,19 +257,22 @@ async def prepare_workspaces(
     *,
     reset_workspace: bool = False,
     concurrency: int = 8,
+    workload: Workload | None = None,
 ) -> dict[str, str]:
-    """Clone EVERY task workspace up front, before the workload starts.
+    """Prepare EVERY task workspace up front, before the workload starts.
 
-    Moves every (retried) network clone BEFORE the first request, so the
-    workload phase performs zero clones: `_pre_clone` at task time sees
-    the existing checkout and returns immediately (or, with
-    reset_workspace=True, just resets it -- still no clone). On a flaky
-    network nothing can fail a task at arrival time.
+    Moves every (retried) workspace preparation -- a network clone for
+    swebench, local file materialization for apps -- BEFORE the first
+    request, so the workload phase performs zero clones: the prepare call
+    at task time sees the existing workspace and returns immediately (or,
+    with reset_workspace=True, just resets it -- still no clone). On a
+    flaky network nothing can fail a task at arrival time.
 
     Returns {instance_id: error_msg} for workspaces that could NOT be
-    prepared; those tasks retry the clone at their arrival (legacy path)
+    prepared; those tasks retry the prepare at their arrival (legacy path)
     and fail-fast into an error.stage="clone" TaskRecord if it still fails.
     """
+    wl = workload or WORKLOADS["swebench"]
     sem = asyncio.Semaphore(concurrency)
     failures: dict[str, str] = {}
     done = 0
@@ -213,8 +284,7 @@ async def prepare_workspaces(
         dest = workspace_root / directories[iid]
         async with sem:
             try:
-                await _pre_clone(sample["repo"], sample["base_commit"], dest,
-                                 reset=reset_workspace)
+                await wl.prepare(sample, dest, reset=reset_workspace)
             except Exception as exc:  # noqa: BLE001 -- collected, not fatal here
                 failures[iid] = f"{type(exc).__name__}: {exc}"
             done += 1
@@ -227,12 +297,18 @@ async def prepare_workspaces(
 
 
 def workspace_manifest_path(workspace_root: Path, split: str, seed: int,
-                            num_samples: int) -> Path:
+                            num_samples: int, workload: str = "swebench") -> Path:
     """Manifest written by `pre-clone` and consumed (single-use) by `run`.
 
     Keyed by the deterministic sample-selection tuple so a run only picks
-    up workspaces prepared for exactly its sample set."""
-    return workspace_root / f".workspaces-{split}-s{seed}-n{num_samples}.json"
+    up workspaces prepared for exactly its sample set. swebench keeps the
+    legacy (workload-less) filename for backward compatibility with
+    already-written manifests; other workloads get a name-prefixed file
+    (their split names don't collide with swebench's anyway -- this is
+    belt-and-suspenders)."""
+    if workload == "swebench":
+        return workspace_root / f".workspaces-{split}-s{seed}-n{num_samples}.json"
+    return workspace_root / f".workspaces-{workload}-{split}-s{seed}-n{num_samples}.json"
 
 
 async def pre_clone_run(
@@ -243,6 +319,7 @@ async def pre_clone_run(
     seed: int,
     reset_workspace: bool = False,
     concurrency: int = 8,
+    workload: str = "swebench",
 ) -> dict[str, str]:
     """Standalone conservative prepare step (`python -m testbed pre-clone`):
     clone EVERY task workspace, write the manifest.
@@ -260,14 +337,16 @@ async def pre_clone_run(
     Returns {instance_id: error_msg} for workspaces that failed; empty
     means everything is ready.
     """
-    samples = swebench.load_samples(split, seed, num_samples)
+    wl = get_workload(workload)
+    samples = wl.load_samples(split, seed, num_samples)
     # expanduser+resolve: a relative workspace_root in testbed.yaml would
     # otherwise anchor git -C / OpenCode ?directory= on whatever CWD the
     # process happens to run from ("fatal: not a git repository ...").
     workspace_root = Path(cfg.workspace_root).expanduser().resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
 
-    manifest = workspace_manifest_path(workspace_root, split, seed, num_samples)
+    manifest = workspace_manifest_path(workspace_root, split, seed, num_samples,
+                                       workload=wl.name)
     directories: dict[str, str] = {}
     if manifest.exists():
         try:
@@ -287,9 +366,11 @@ async def pre_clone_run(
     failures = await prepare_workspaces(
         samples, directories, workspace_root,
         reset_workspace=reset_workspace, concurrency=concurrency,
+        workload=wl,
     )
 
     manifest.write_text(json.dumps({
+        "workload": wl.name,
         "split": split,
         "seed": seed,
         "num_samples": num_samples,
@@ -308,7 +389,9 @@ async def _run_one(
     task_timeout_s: float | None = None,
     reset_workspace: bool = False,
     directory: str | None = None,
+    workload: Workload | None = None,
 ) -> TaskRecord:
+    wl = workload or WORKLOADS["swebench"]
     instance_id = sample["instance_id"]
     # run() pre-assigns directory names so it can pre-clone all workspaces
     # before the workload starts; smoke (cli.py) passes None and gets the
@@ -323,10 +406,11 @@ async def _run_one(
     abs_dir = str(dest)
 
     async with sem:
-        # Stage 1: clone.
+        # Stage 1: prepare the workspace (git clone for swebench, local
+        # materialization for apps). error.stage stays "clone" either way
+        # -- it is the documented trace-schema name for this stage.
         try:
-            await _pre_clone(sample["repo"], sample["base_commit"], dest,
-                             reset=reset_workspace)
+            await wl.prepare(sample, dest, reset=reset_workspace)
         except Exception as exc:
             return TaskRecord(
                 instance_id=instance_id,
@@ -360,7 +444,7 @@ async def _run_one(
         # in a tool cycle, vLLM KV-transfer stall, or OpenCode SSE never
         # closing — opencode.py uses read=None on purpose to allow long
         # legit runs). task_timeout_s=None disables the cap.
-        prompt = swebench.render_prompt(sample)
+        prompt = wl.render_prompt(sample)
         t0 = time.monotonic()
         try:
             send_coro = client.send_message(session_id, prompt, directory=abs_dir)
@@ -463,8 +547,10 @@ async def run(
     reset_workspace: bool = False,
     sequential: bool = False,
     pre_clone_workspaces: bool = True,
+    workload: str = "swebench",
 ) -> None:
-    """Drive `num_samples` SWE-bench tasks.
+    """Drive `num_samples` benchmark tasks (workload: swebench | apps |
+    terminalbench).
 
     Default mode: Poisson arrivals at `qps`, bounded concurrency at
     `max_in_flight`. arrival_offsets are computed up front and tasks fire
@@ -480,7 +566,8 @@ async def run(
     in TaskRecord becomes the elapsed wall-clock from run start at the
     moment that task started (i.e. the cumulative RTT of prior tasks).
     """
-    samples = swebench.load_samples(split, seed, num_samples)
+    wl = get_workload(workload)
+    samples = wl.load_samples(split, seed, num_samples)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     # expanduser+resolve: a relative workspace_root in testbed.yaml would
@@ -499,7 +586,8 @@ async def run(
     directories: dict[str, str] | None = None
     manifest_used: str | None = None
     if pre_clone_workspaces:
-        manifest = workspace_manifest_path(workspace_root, split, seed, num_samples)
+        manifest = workspace_manifest_path(workspace_root, split, seed, num_samples,
+                                           workload=wl.name)
         if manifest.exists():
             try:
                 data = json.loads(manifest.read_text())
@@ -508,7 +596,13 @@ async def run(
                 print(f"ignoring corrupt workspace manifest: {manifest}",
                       file=sys.stderr, flush=True)
             wanted = {s["instance_id"] for s in samples}
-            if data is not None and data.get("reset_workspace") != reset_workspace:
+            # Legacy manifests (pre-workload) lack the key -> swebench.
+            if data is not None and data.get("workload", "swebench") != wl.name:
+                print(f"ignoring workspace manifest {manifest}: it was built "
+                      f"for workload={data.get('workload', 'swebench')!r} but "
+                      f"this run uses {wl.name!r}",
+                      file=sys.stderr, flush=True)
+            elif data is not None and data.get("reset_workspace") != reset_workspace:
                 print(f"ignoring workspace manifest {manifest}: it was built "
                       f"with reset_workspace={data.get('reset_workspace')} but "
                       f"this run uses {reset_workspace}",
@@ -539,6 +633,7 @@ async def run(
             clone_failures = await prepare_workspaces(
                 samples, directories, workspace_root,
                 reset_workspace=reset_workspace,
+                workload=wl,
             )
             if clone_failures:
                 print(f"  {len(clone_failures)} workspace(s) FAILED to pre-clone "
@@ -561,6 +656,7 @@ async def run(
     }
 
     invocation = {
+        "workload": wl.name,
         "split": split,
         "num_samples": num_samples,
         "qps": qps,
@@ -608,6 +704,7 @@ async def run(
                         task_timeout_s=task_timeout_s,
                         reset_workspace=reset_workspace,
                         directory=directories[sample["instance_id"]],
+                        workload=wl,
                     )
                     trace_fh.write(rec.to_jsonl())
                     trace_fh.flush()
@@ -615,29 +712,44 @@ async def run(
                     _print_progress(rec, records, total, time.monotonic() - start)
             else:
                 offsets = poisson.arrival_offsets(qps, num_samples, seed)
-                tasks: list[asyncio.Task[TaskRecord]] = []
-                async for i in poisson.arrivals(offsets, start_monotonic=start):
-                    tasks.append(
-                        asyncio.create_task(
-                            _run_one(
-                                client,
-                                samples[i],
-                                offsets[i],
-                                workspace_root,
-                                sem,
-                                task_timeout_s=task_timeout_s,
-                                reset_workspace=reset_workspace,
-                                directory=directories[samples[i]["instance_id"]],
-                            )
-                        )
-                    )
 
-                for fut in asyncio.as_completed(tasks):
-                    rec = await fut
+                # Report each task the MOMENT it completes, not after the
+                # whole arrival stream is scheduled. The arrival loop below
+                # sleeps until the LAST Poisson offset, so collecting results
+                # only after it (the old `as_completed` loop) deferred every
+                # progress line -- and every trace.jsonl write -- until the
+                # final arrival, making early finishers appear in one burst
+                # with a misleadingly large `elapsed`. A per-task
+                # write+print coroutine interleaves reporting with arrivals
+                # (the semaphore already governs real concurrency inside
+                # _run_one; this only moves WHEN the finished result is
+                # recorded, not when the slot frees).
+                async def _run_and_report(idx: int) -> TaskRecord:
+                    rec = await _run_one(
+                        client,
+                        samples[idx],
+                        offsets[idx],
+                        workspace_root,
+                        sem,
+                        task_timeout_s=task_timeout_s,
+                        reset_workspace=reset_workspace,
+                        directory=directories[samples[idx]["instance_id"]],
+                        workload=wl,
+                    )
+                    # Single-threaded event loop: these three are atomic
+                    # w.r.t. other tasks, so trace writes never interleave.
                     trace_fh.write(rec.to_jsonl())
                     trace_fh.flush()
                     records.append(rec)
                     _print_progress(rec, records, total, time.monotonic() - start)
+                    return rec
+
+                tasks: list[asyncio.Task[TaskRecord]] = []
+                async for i in poisson.arrivals(offsets, start_monotonic=start):
+                    tasks.append(asyncio.create_task(_run_and_report(i)))
+
+                if tasks:
+                    await asyncio.gather(*tasks)
 
     summary = _summary(records)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
