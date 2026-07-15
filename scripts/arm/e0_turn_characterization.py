@@ -669,10 +669,9 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
                   sample_times: list[float] | None = None) -> None:
     """Two stacked subplots:
       (top)    prefix-cache HIT TOKENS per turn (tokens.cache.read) on a
-               TURN-index x axis, one line per session -- the top-level
-               sample (blue) and its nested `task` sub-agent (orange) are
-               drawn SEPARATELY (independent KV prefixes); red lines at
-               sample-start ordinals.
+               TURN-index x axis, one line per session (the top-level
+               sample and its nested `task` sub-agent are separate lines,
+               independent KV prefixes); red lines at sample-start ordinals.
       (bottom) GPU KV-cache usage (%) on a TIME x axis (seconds from the
                run window start; the scrape series is TRIMMED to the run
                window so an early/late scraper can't shift the origin);
@@ -682,12 +681,9 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
 
     # ---- top: hit tokens vs turn ordinal, ONE line per session ----
     # Parent sample and its nested `task` sub-agent are drawn as SEPARATE
-    # lines (each session_id its own line, in ordinal order): blue for the
-    # top-level sample, orange for a nested sub-agent. They have
-    # independent KV prefixes, so keeping them separate is honest — a
-    # sub-agent's line starting low is its own fresh prefix, not a dip in
-    # the parent's.
-    assign = sample_assignment(ordered, min_turns)
+    # lines (each session_id its own line, in ordinal order). They have
+    # independent KV prefixes, so a sub-agent's line starting low is its
+    # own fresh prefix, not a dip in the parent's.
     by_sess: dict[str, list[tuple[int, float]]] = {}
     for i, t in enumerate(ordered):
         h = _hit_tokens(t)
@@ -695,21 +691,10 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
             by_sess.setdefault(t.session_id, []).append((i, h))
     for b in (sample_ordinals or []):
         ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
-    drew_sample = drew_sub = False
     for sid, pts in by_sess.items():
         pts.sort()
-        nested = assign.get(sid, sid) != sid
-        color = "tab:orange" if nested else "tab:blue"
-        label = None
-        if nested and not drew_sub:
-            label, drew_sub = "task sub-agent", True
-        elif not nested and not drew_sample:
-            label, drew_sample = "sample", True
         ax_top.plot([i for i, _ in pts], [h for _, h in pts],
-                    color=color, marker=".", ms=3, lw=0.8, zorder=2,
-                    label=label)
-    if drew_sub:
-        ax_top.legend(fontsize=8, loc="upper right", framealpha=0.7)
+                    color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
     ax_top.set_xlim(0, max(len(ordered) - 1, 1))
     ax_top.set_ylim(bottom=0)
     ax_top.set_xlabel("turn")
