@@ -255,6 +255,161 @@ def test_by_tool_rows_small_share(mod, tmp_path):
     assert bash["queue_share_large_p50"] == pytest.approx(0.2)
 
 
+# ---------- away_s + cache_hit_ratio (KV-eviction cost analysis) ----------
+
+
+def _llm_start(step, ts):
+    return {"ev": "llm.start", "ts": ts, "step": step}
+
+
+def test_away_s_from_llm_start_end_gap(mod, tmp_path):
+    _write_profile(tmp_path, "s", [
+        _llm_start(1, 100.0),
+        {**_llm_end(1), "ts": 101.0},
+        _llm_start(2, 131.0),                 # 30s off-GPU
+        {**_llm_end(2), "ts": 132.0},
+    ])
+    t1, t2 = mod.load_turns(tmp_path)
+    assert t1.away_s is None                  # first turn has no predecessor
+    assert t2.away_s == pytest.approx(30.0)
+
+
+def test_away_s_negative_gap_dropped(mod, tmp_path):
+    # clock weirdness: start before previous end -> away_s stays None
+    _write_profile(tmp_path, "s", [
+        _llm_start(1, 100.0), {**_llm_end(1), "ts": 105.0},
+        _llm_start(2, 104.0), {**_llm_end(2), "ts": 106.0},
+    ])
+    _, t2 = mod.load_turns(tmp_path)
+    assert t2.away_s is None
+
+
+def test_cache_hit_ratio(mod, tmp_path):
+    _write_profile(tmp_path, "s", [_llm_end(1, inp=200, cache_read=800)])
+    (t,) = mod.load_turns(tmp_path)
+    assert t.cache_hit_ratio == pytest.approx(0.8)
+
+
+def test_cache_hit_ratio_none_without_tokens(mod):
+    t = mod.TurnRec(session_id="s", step=1)
+    assert t.cache_hit_ratio is None
+
+
+def test_away_cache_rows_bucketing(mod):
+    def turn(away, hit, isl=1000):
+        cache = int(isl * hit)
+        return mod.TurnRec(session_id="s", step=1, away_s=away,
+                           input_tokens=isl - cache, cache_read=cache)
+    turns = [turn(0.5, 0.9), turn(2.0, 0.8), turn(30.0, 0.4), turn(120.0, 0.1),
+             mod.TurnRec(session_id="s", step=1)]   # no away/cache -> excluded
+    rows = mod.away_cache_rows(turns)
+    by = {r["away_bucket"]: r for r in rows}
+    assert by["<1s"]["count"] == 1
+    assert by["<1s"]["cache_hit_p50"] == pytest.approx(0.9)
+    assert by["15-60s"]["cache_hit_p50"] == pytest.approx(0.4)
+    assert by[">60s"]["cache_hit_p50"] == pytest.approx(0.1)
+    assert by["5-15s"]["count"] == 0
+
+
+def test_away_cache_correlation_negative(mod):
+    def turn(away, hit, isl=1000):
+        cache = int(isl * hit)
+        return mod.TurnRec(session_id="s", step=1, away_s=away,
+                           input_tokens=isl - cache, cache_read=cache)
+    turns = [turn(a, 0.9 - 0.005 * a) for a in (1, 10, 50, 100)]
+    r, n = mod.away_cache_correlation(turns)
+    assert n == 4
+    assert r < -0.99
+
+
+def test_away_cache_correlation_insufficient(mod):
+    r, n = mod.away_cache_correlation([mod.TurnRec(session_id="s", step=1)])
+    assert n == 0
+    import math
+    assert math.isnan(r)
+
+
+def test_main_profile_only_when_no_sched(mod, tmp_path, capsys):
+    # empty logs dir: away/cache analysis still produced, rc 0
+    prof = tmp_path / "profiles"; prof.mkdir()
+    logs = tmp_path / "logs"; logs.mkdir()
+    _write_profile(prof, "s", [
+        _llm_start(1, 100.0), {**_llm_end(1, inp=100, cache_read=900), "ts": 101.0},
+        _llm_start(2, 111.0), {**_llm_end(2, inp=500, cache_read=500), "ts": 112.0},
+    ])
+    out = tmp_path / "o"
+    rc = mod.main(["--profiles", str(prof), "--logs", str(logs), "--out", str(out)])
+    assert rc == 0
+    assert (out / "away_cache.csv").is_file()
+    assert not (out / "turn_sched.csv").exists()
+    err = capsys.readouterr().err
+    assert "skipping" in err
+
+
+def test_turn_csv_has_away_and_cache_columns(mod, tmp_path):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    logs = tmp_path / "logs"; logs.mkdir()
+    _write_profile(prof, "s", [
+        _llm_start(1, 100.0),
+        {**_llm_end(1, request_id="r1", inp=100, cache_read=300), "ts": 101.0},
+    ])
+    _write_worker_log(logs, [_sched_line("r1", "decode", 10.0, queued_ts=1.0)])
+    out = tmp_path / "o"
+    mod.main(["--profiles", str(prof), "--logs", str(logs), "--out", str(out)])
+    (row,) = list(csv.DictReader((out / "turn_sched.csv").open()))
+    assert row["cache_read"] == "300"
+    assert float(row["cache_hit_ratio"]) == pytest.approx(0.75)
+    assert row["away_s"] == ""                # first turn
+
+
+# ---------- queue_share denominator fallback ----------
+
+
+def test_denom_prefers_elapsed(mod):
+    t = mod.TurnRec(session_id="s", step=1, elapsed_s=2.0, llm_wall_s=1.0)
+    assert mod._denom_ms(t) == 2000.0
+
+
+def test_denom_falls_back_to_llm_wall(mod):
+    t = mod.TurnRec(session_id="s", step=1, elapsed_s=None, llm_wall_s=1.5)
+    assert mod._denom_ms(t) == 1500.0
+
+
+def test_denom_none_when_neither(mod):
+    t = mod.TurnRec(session_id="s", step=1, elapsed_s=None, llm_wall_s=None)
+    assert mod._denom_ms(t) is None
+
+
+def test_by_tool_share_uses_fallback_when_no_elapsed(mod, tmp_path):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    logs = tmp_path / "logs"; logs.mkdir()
+    # no dynamo.elapsed_s; llm_wall 1.0s; decode queue 100ms -> share 0.1
+    _write_profile(prof, "s", [_llm_end(1, request_id="r1", out=10,
+                                        elapsed_s=None, duration_s=1.0)])
+    _write_worker_log(logs, [_sched_line("r1", "decode", 100.0, queued_ts=1.0)])
+    res = mod.join_exact(mod.load_turns(prof), mod.load_sched(logs))
+    rows = mod.by_tool_rows(res, small_tokens=64)
+    assert rows[0]["queue_share_p50"] == pytest.approx(0.1)
+
+
+def test_turn_csv_records_share_basis(mod, tmp_path):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    logs = tmp_path / "logs"; logs.mkdir()
+    _write_profile(prof, "s", [
+        _llm_end(1, request_id="rE", out=10, elapsed_s=2.0, duration_s=1.0),
+        _llm_end(2, request_id="rW", out=10, elapsed_s=None, duration_s=1.0),
+    ])
+    _write_worker_log(logs, [
+        _sched_line("rE", "decode", 10.0, queued_ts=1.0),
+        _sched_line("rW", "decode", 10.0, queued_ts=2.0),
+    ])
+    out = tmp_path / "o"
+    mod.main(["--profiles", str(prof), "--logs", str(logs), "--out", str(out)])
+    rows = {r["request_id"]: r for r in csv.DictReader((out / "turn_sched.csv").open())}
+    assert rows["rE"]["queue_share_basis"] == "elapsed_s"
+    assert rows["rW"]["queue_share_basis"] == "llm_wall_s"
+
+
 # ---------- main() ----------
 
 
@@ -307,10 +462,14 @@ def test_main_missing_profiles_returns_2(mod, tmp_path, capsys):
     assert "not found" in capsys.readouterr().err
 
 
-def test_main_no_sched_returns_2(mod, tmp_path, capsys):
+def test_main_no_turns_returns_2(mod, tmp_path, capsys):
+    # profiles dir exists but has no parseable llm.start/llm.end/tool.end
+    # events -> load_turns() is empty -> hard error (distinct from the
+    # no-sched-records case, which now degrades gracefully to rc 0; see
+    # test_main_profile_only_when_no_sched).
     prof = tmp_path / "profiles"; prof.mkdir()
     logs = tmp_path / "logs"; logs.mkdir()
-    _write_profile(prof, "s", [_llm_end(1)])
+    (prof / "s.jsonl").write_text("", encoding="utf-8")
     rc = mod.main(["--profiles", str(prof), "--logs", str(logs)])
     assert rc == 2
-    assert "SCHED_DELAY" in capsys.readouterr().err
+    assert "no turns parsed" in capsys.readouterr().err

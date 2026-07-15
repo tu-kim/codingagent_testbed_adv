@@ -39,7 +39,13 @@ Outputs (under --out):
   by_tool.csv        per preceding-tool aggregation (count, small-turn share,
                      p50/p90/p99 of output_tokens/llm_wall_s/queue metrics,
                      queue_share conditioned small vs large)
-  stdout             match-quality report + by-tool table
+  away_cache.csv     away-time buckets -> prefix-cache hit ratio + re-prefilled
+                     tokens (PROFILE-ONLY: works without worker logs). Measures
+                     the KV-eviction cost of leaving the GPU between turns:
+                     away_s = llm.start(N) - llm.end(N-1); cache_hit_ratio =
+                     tokens.cache.read / (tokens.input + tokens.cache.read).
+  stdout             match-quality report + by-tool table + away/cache table
+                     with pearson r(away_s, cache_hit_ratio)
 """
 
 from __future__ import annotations
@@ -78,14 +84,32 @@ class TurnRec:
     input_tokens: int | None = None
     cache_read: int = 0
     llm_wall_s: float | None = None    # llm.end duration_s (stream wall)
+    llm_start_ts: float | None = None  # llm.start event ts (unix s)
+    llm_end_ts: float | None = None    # llm.end event ts (unix s)
     tool_names: list[str] = field(default_factory=list)  # tools run IN this step
     prev_tools: tuple[str, ...] = ()   # tools of step-1 (adjacency key)
+    away_s: float | None = None        # llm.start(N) - llm.end(N-1): time the
+                                       # session was OFF the GPU (tool exec +
+                                       # scaffold) before this turn re-entered
 
     @property
     def effective_input(self) -> int | None:
         if self.input_tokens is None:
             return None
         return self.input_tokens + self.cache_read
+
+    @property
+    def cache_hit_ratio(self) -> float | None:
+        """Fraction of this turn's prompt served from prefix cache.
+
+        Profile `tokens.input` already has cache tokens subtracted
+        (CLAUDE.md: ISL = input + cache.read), so `input` IS the
+        re-prefilled token count and `cache.read` the reused count.
+        """
+        eff = self.effective_input
+        if not eff:
+            return None
+        return self.cache_read / eff
 
     @property
     def prev_key(self) -> str:
@@ -109,8 +133,14 @@ def load_turns(profiles_dir: Path) -> list[TurnRec]:
             if step is None:
                 continue
             key = (sid, int(step))
-            if ev_type == "llm.end":
+            if ev_type == "llm.start":
                 t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))
+                if ev.get("ts") is not None:
+                    t.llm_start_ts = float(ev["ts"])
+            elif ev_type == "llm.end":
+                t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))
+                if ev.get("ts") is not None:
+                    t.llm_end_ts = float(ev["ts"])
                 rid = ev.get("request_id")
                 if rid:
                     t.request_id = str(rid)
@@ -137,11 +167,17 @@ def load_turns(profiles_dir: Path) -> list[TurnRec]:
                 name = ev.get("name")
                 if name:
                     t.tool_names.append(str(name))
-    # adjacency: preceding tools of turn N = tools executed in step N-1
+    # adjacency: preceding tools of turn N = tools executed in step N-1;
+    # away_s = llm.start(N) - llm.end(N-1) = time the session spent OFF the
+    # GPU (tool execution + scaffold) before re-entering.
     out: list[TurnRec] = []
     for (sid, step), t in sorted(turns.items()):
         prev = turns.get((sid, step - 1))
         t.prev_tools = tuple(prev.tool_names) if prev else ()
+        if prev is not None and prev.llm_end_ts is not None and t.llm_start_ts is not None:
+            gap = t.llm_start_ts - prev.llm_end_ts
+            if gap >= 0:
+                t.away_s = gap
         # only keep turns that actually had an LLM call
         if t.llm_wall_s is not None or t.output_tokens is not None or t.recv_ts is not None:
             out.append(t)
@@ -294,6 +330,21 @@ def _dist(vals: list[float]) -> dict[str, float]:
     }
 
 
+def _denom_ms(t: "TurnRec") -> float | None:
+    """End-to-end denominator for queue_share, in ms.
+
+    Prefer dynamo's server-side elapsed_s (nvext.timing); when that is
+    absent (non-dynamo provider, or a run where the frontend didn't emit
+    timing) fall back to the client-side LLM stream wall llm_wall_s so
+    queue_share stays computable instead of collapsing to nan.
+    """
+    if t.elapsed_s and t.elapsed_s > 0:
+        return t.elapsed_s * 1000.0
+    if t.llm_wall_s and t.llm_wall_s > 0:
+        return t.llm_wall_s * 1000.0
+    return None
+
+
 def by_tool_rows(match: MatchResult, small_tokens: int) -> list[dict]:
     groups: dict[str, list[tuple[TurnRec, SchedRec]]] = defaultdict(list)
     for t, _rid, rec in match.matched:
@@ -306,9 +357,9 @@ def by_tool_rows(match: MatchResult, small_tokens: int) -> list[dict]:
         dq = [r.decode_queue_ms for _, r in items if r.decode_queue_ms is not None]
         tq = [r.total_queue_ms for _, r in items]
         shares = [
-            r.total_queue_ms / (t.elapsed_s * 1000.0)
+            r.total_queue_ms / d
             for t, r in items
-            if t.elapsed_s and t.elapsed_s > 0
+            if (d := _denom_ms(t)) is not None
         ]
         small = [(t, r) for t, r in items
                  if t.output_tokens is not None and t.output_tokens <= small_tokens]
@@ -316,8 +367,8 @@ def by_tool_rows(match: MatchResult, small_tokens: int) -> list[dict]:
                  if t.output_tokens is not None and t.output_tokens > small_tokens]
 
         def share_of(sub):
-            vals = [r.total_queue_ms / (t.elapsed_s * 1000.0)
-                    for t, r in sub if t.elapsed_s and t.elapsed_s > 0]
+            vals = [r.total_queue_ms / d
+                    for t, r in sub if (d := _denom_ms(t)) is not None]
             return _pct(vals, 0.50) if vals else math.nan
 
         row = {
@@ -342,6 +393,86 @@ def by_tool_rows(match: MatchResult, small_tokens: int) -> list[dict]:
     return rows
 
 
+# ---------- away-time vs cache-hit (KV eviction cost of leaving the GPU) ----------
+
+_AWAY_BUCKETS = [
+    (0.0, 1.0, "<1s"),
+    (1.0, 5.0, "1-5s"),
+    (5.0, 15.0, "5-15s"),
+    (15.0, 60.0, "15-60s"),
+    (60.0, math.inf, ">60s"),
+]
+
+
+def away_cache_rows(turns: list[TurnRec]) -> list[dict]:
+    """Bucket non-first turns by away_s -> cache-hit / re-prefill stats.
+
+    The claim being tested: the longer a session is off the GPU (tool
+    execution between turns), the more of its KV blocks get evicted by
+    concurrent traffic -> lower prefix-cache hit ratio -> more tokens
+    re-prefilled on re-entry. This is the direct measurement of the
+    "host-GPU transition loss" beyond queue wait.
+    """
+    eligible = [t for t in turns
+                if t.away_s is not None and t.cache_hit_ratio is not None]
+    rows = []
+    for lo, hi, label in _AWAY_BUCKETS:
+        sub = [t for t in eligible if lo <= t.away_s < hi]
+        hits = [t.cache_hit_ratio for t in sub]
+        reprefill = [float(t.input_tokens) for t in sub if t.input_tokens is not None]
+        rows.append({
+            "away_bucket": label,
+            "count": len(sub),
+            "cache_hit_p50": _pct(hits, 0.50) if hits else math.nan,
+            "cache_hit_p10": _pct(hits, 0.10) if hits else math.nan,
+            "reprefill_tokens_p50": _pct(reprefill, 0.50) if reprefill else math.nan,
+            "reprefill_tokens_p90": _pct(reprefill, 0.90) if reprefill else math.nan,
+        })
+    return rows
+
+
+def away_cache_correlation(turns: list[TurnRec]) -> tuple[float, int]:
+    """Pearson r between away_s and cache_hit_ratio over non-first turns."""
+    pairs = [(t.away_s, t.cache_hit_ratio) for t in turns
+             if t.away_s is not None and t.cache_hit_ratio is not None]
+    n = len(pairs)
+    if n < 2:
+        return math.nan, n
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in pairs)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx == 0 or vy == 0:
+        return math.nan, n
+    return cov / math.sqrt(vx * vy), n
+
+
+def write_away_cache_csv(path: Path, rows: list[dict]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else
+                           ["away_bucket", "count"])
+        w.writeheader()
+        w.writerows(rows)
+
+
+def print_away_cache(rows: list[dict], r: float, n: int) -> None:
+    print("\nAway-time vs prefix-cache hit (non-first turns; away_s = "
+          "llm.start(N) - llm.end(N-1)):")
+    print(f"{'away':>8s} {'n':>6s} {'hit_p50':>8s} {'hit_p10':>8s} "
+          f"{'reprefill_p50':>13s} {'reprefill_p90':>13s}")
+    for row in rows:
+        print(f"{row['away_bucket']:>8s} {row['count']:6d} "
+              f"{row['cache_hit_p50']:8.3f} {row['cache_hit_p10']:8.3f} "
+              f"{row['reprefill_tokens_p50']:13.0f} {row['reprefill_tokens_p90']:13.0f}")
+    print(f"pearson r(away_s, cache_hit_ratio) = {r:.3f}  (n={n})")
+    if not math.isnan(r) and r < -0.2:
+        print("  -> negative correlation: longer off-GPU time costs prefix "
+              "cache (KV evicted while away); re-entry pays extra prefill.")
+
+
 # ---------- outputs ----------
 
 
@@ -349,16 +480,18 @@ def write_turn_csv(path: Path, match: MatchResult) -> None:
     cols = [
         "session_id", "step", "request_id", "match", "prev_tools",
         "output_tokens", "input_tokens", "llm_wall_s", "elapsed_s",
-        "prefill_queue_ms", "decode_queue_ms", "total_queue_ms", "queue_share",
+        "prefill_queue_ms", "decode_queue_ms", "total_queue_ms",
+        "queue_share", "queue_share_basis",
+        "away_s", "cache_read", "cache_hit_ratio",
     ]
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
         for t, rid, rec in match.matched:
-            share = (
-                rec.total_queue_ms / (t.elapsed_s * 1000.0)
-                if t.elapsed_s and t.elapsed_s > 0 else ""
-            )
+            d = _denom_ms(t)
+            share = rec.total_queue_ms / d if d is not None else ""
+            basis = ("elapsed_s" if t.elapsed_s and t.elapsed_s > 0
+                     else "llm_wall_s" if d is not None else "")
             w.writerow({
                 "session_id": t.session_id,
                 "step": t.step,
@@ -373,6 +506,11 @@ def write_turn_csv(path: Path, match: MatchResult) -> None:
                 "decode_queue_ms": rec.decode_queue_ms if rec.decode_queue_ms is not None else "",
                 "total_queue_ms": rec.total_queue_ms,
                 "queue_share": share,
+                "queue_share_basis": basis,
+                "away_s": t.away_s if t.away_s is not None else "",
+                "cache_read": t.cache_read,
+                "cache_hit_ratio": (t.cache_hit_ratio
+                                    if t.cache_hit_ratio is not None else ""),
             })
 
 
@@ -401,6 +539,26 @@ def print_report(match: MatchResult, total_turns: int, rows: list[dict],
     print(f"turns: {total_turns}  matched: {n} "
           f"({100.0 * n / total_turns:.1f}%)" if total_turns else "turns: 0")
     print(f"unmatched turns: {match.unmatched_turns}")
+    # Coverage of the per-turn signal so nan columns are self-explanatory:
+    # prefill=0 usually means agg/colocation (only decode records) OR the
+    # prefill worker log wasn't in --logs; elapsed=0 means the profile had
+    # no dynamo.nvext.timing (queue_share then falls back to llm_wall_s).
+    if n:
+        has_pf = sum(1 for _t, _r, rec in match.matched if rec.prefill_queue_ms is not None)
+        has_dc = sum(1 for _t, _r, rec in match.matched if rec.decode_queue_ms is not None)
+        has_el = sum(1 for t, _r, _rec in match.matched if t.elapsed_s and t.elapsed_s > 0)
+        has_wall = sum(1 for t, _r, _rec in match.matched if t.llm_wall_s and t.llm_wall_s > 0)
+        print(f"coverage: prefill_queue {has_pf}/{n}  decode_queue {has_dc}/{n}  "
+              f"elapsed_s {has_el}/{n}  llm_wall_s {has_wall}/{n}")
+        if has_pf == 0:
+            print("NOTE: no prefill queue records matched — agg/colocation "
+                  "deployment (decode-only), or prefill worker log missing "
+                  "from --logs. The interesting scheduler wait is usually on "
+                  "prefill.", file=sys.stderr)
+        if has_el == 0:
+            print("NOTE: no dynamo elapsed_s in profiles — queue_share uses "
+                  "llm_wall_s as the denominator (see queue_share_basis "
+                  "column).", file=sys.stderr)
     if match.mode == "timestamp":
         print(f"ambiguous (>=2 candidates in tolerance): {match.ambiguous}")
         if match.dt_abs:
@@ -449,9 +607,22 @@ def main(argv: list[str] | None = None) -> int:
     if not turns:
         print("error: no turns parsed from profiles", file=sys.stderr)
         return 2
+    out_dir = args.out or (args.profiles / "turn_sched")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Away-time vs cache-hit is PROFILE-ONLY (no worker logs needed): the
+    # KV-eviction cost of leaving the GPU between turns.
+    ac_rows = away_cache_rows(turns)
+    r, n_ac = away_cache_correlation(turns)
+    write_away_cache_csv(out_dir / "away_cache.csv", ac_rows)
+
     if not sched:
-        print("error: no SCHED_DELAY records parsed from logs", file=sys.stderr)
-        return 2
+        print("warning: no SCHED_DELAY records parsed from logs — skipping "
+              "queue-wait join, reporting away/cache analysis only",
+              file=sys.stderr)
+        print_away_cache(ac_rows, r, n_ac)
+        print(f"\nwrote {out_dir / 'away_cache.csv'}")
+        return 0
 
     have_ids = sum(1 for t in turns if t.request_id)
     if have_ids:
@@ -460,8 +631,6 @@ def main(argv: list[str] | None = None) -> int:
         isl = load_prompt_isl(args.prompts) if args.prompts else None
         match = join_timestamp(turns, sched, args.tolerance_s, isl, args.isl_band)
 
-    out_dir = args.out or (args.profiles / "turn_sched")
-    out_dir.mkdir(parents=True, exist_ok=True)
     write_turn_csv(out_dir / "turn_sched.csv", match)
     rows = by_tool_rows(match, args.small_tokens)
     write_by_tool_csv(out_dir / "by_tool.csv", rows)
@@ -470,8 +639,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote session map: {args.emit_session_map}")
 
     print_report(match, len(turns), rows, args.small_tokens)
+    print_away_cache(ac_rows, r, n_ac)
     print(f"\nwrote {out_dir / 'turn_sched.csv'}")
     print(f"wrote {out_dir / 'by_tool.csv'}")
+    print(f"wrote {out_dir / 'away_cache.csv'}")
     return 0
 
 
