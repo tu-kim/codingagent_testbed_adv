@@ -163,9 +163,19 @@ def test_gap_reuse_pairs_uses_prev_turn_cache_denominator(mod):
     cur.input_tokens = 5000       # huge NEW read -> raw hit ratio would be tiny
     pairs = mod.gap_reuse_pairs([prev, cur])
     assert len(pairs) == 1
-    g, r, sid, step = pairs[0]
+    g, r, sid, step, prev_task = pairs[0]
     assert (g, sid, step) == (2.0, "A", 2)
     assert r == pytest.approx(80 / 100)      # prev-cache denominator, not 80/5080
+    assert prev_task is False                # prev tool was read, not task
+
+
+def test_gap_reuse_pairs_flags_resume_after_task(mod):
+    # step1 called `task`; step2 is the RESUME turn -> prev_was_task True
+    prev = _T("A", 1, 0, 5, 5.0, [], ["task"], gap=None, hit_tokens=0)
+    prev.output_tokens = 0
+    cur = _T("A", 2, 7, 7.5, 0.5, ["task"], [], gap=2.0, hit_tokens=90)
+    _g, _r, _s, _st, prev_task = mod.gap_reuse_pairs([prev, cur])[0]
+    assert prev_task is True
 
 
 def test_gap_reuse_pairs_drops_first_and_gapless(mod):

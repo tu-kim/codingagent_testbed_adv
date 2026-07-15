@@ -507,9 +507,11 @@ def prev_reuse_ratio(turn, by_key: dict) -> float | None:
     return cr / denom
 
 
-def gap_reuse_pairs(turns: list) -> list[tuple[float, float, str, int]]:
-    """(turn_gap, prev_reuse_ratio, session_id, step) for turns that have
-    a gap and a resolvable previous turn."""
+def gap_reuse_pairs(turns: list) -> list[tuple[float, float, str, int, bool]]:
+    """(turn_gap, prev_reuse_ratio, session_id, step, prev_was_task) for
+    turns with a gap and a resolvable previous turn. prev_was_task marks a
+    RESUME turn (the previous turn called the `task` sub-agent), so fig4
+    can flag whether returning from a sub-agent excursion changes reuse."""
     by_key = {(t.session_id, t.step): t for t in turns}
     out = []
     for t in turns:
@@ -518,7 +520,8 @@ def gap_reuse_pairs(turns: list) -> list[tuple[float, float, str, int]]:
         r = prev_reuse_ratio(t, by_key)
         if r is None:
             continue
-        out.append((t.away_s, r, t.session_id, t.step))
+        prev_task = "task" in (t.prev_tools or ())
+        out.append((t.away_s, r, t.session_id, t.step, prev_task))
     return out
 
 
@@ -795,19 +798,30 @@ def fig_worker_hit_kv(hits: list[tuple[float, float]],
     plt.close(fig)
 
 
-def fig_gap_vs_hit(pairs: list[tuple[float, float, str, int]],
+def fig_gap_vs_hit(pairs: list[tuple[float, float, str, int, bool]],
                    path: Path) -> None:
     """Scatter of turn gap (LOG x) vs the previous-turn KV reuse ratio
     (cache_read(N) / [effective_input(N-1) + output(N-1)]): how much of
-    the previous turn's cached KV this turn actually reused. Single color
-    (the ratio already controls for how much NEW content the turn read)."""
+    the previous turn's cached KV this turn actually reused. Turns whose
+    previous turn called the `task` sub-agent (RESUME turns) are drawn as
+    triangles so we can see whether returning from a sub-agent excursion
+    changes reuse; other turns are dots."""
     plt = _mpl()
     fig, ax = plt.subplots(figsize=(6.5, 4))
-    gs = [p[0] for p in pairs if p[0] > 0]     # log x needs gap > 0
-    hs = [p[1] for p in pairs if p[0] > 0]
-    ax.scatter(gs, hs, s=14, alpha=0.6, color="tab:blue")
-    if gs:
+    pos = [p for p in pairs if p[0] > 0]       # log x needs gap > 0
+    normal = [(p[0], p[1]) for p in pos if not (len(p) > 4 and p[4])]
+    resume = [(p[0], p[1]) for p in pos if len(p) > 4 and p[4]]
+    if normal:
+        ax.scatter([g for g, _ in normal], [h for _, h in normal],
+                   s=14, alpha=0.6, color="tab:blue", label="turn")
+    if resume:
+        ax.scatter([g for g, _ in resume], [h for _, h in resume],
+                   s=20, alpha=0.9, color="tab:blue", marker="^",
+                   label="resume after sub-agent")
+    if pos:
         ax.set_xscale("log")
+    if resume:
+        ax.legend(fontsize=8, loc="best", framealpha=0.7)
     ax.set_xlabel("turn gap (s)")
     ax.set_ylabel("prev-turn KV reuse ratio")
     ax.set_ylim(bottom=0)
