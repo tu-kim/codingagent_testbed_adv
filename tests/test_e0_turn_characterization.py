@@ -46,6 +46,13 @@ class _T:
         self.away_s = gap
         self.input_tokens = None if hit_tokens is None else 100
         self.cache_read = hit_tokens or 0
+        self.output_tokens = 0
+
+    @property
+    def effective_input(self):
+        if self.input_tokens is None:
+            return None
+        return self.input_tokens + self.cache_read
 
     @property
     def prev_key(self):
@@ -146,25 +153,26 @@ def test_hit_series_sorted_filtered_with_session(mod):
     assert s == [(7.5, 1500, "A"), (23.0, 0, "B")]
 
 
-def test_gap_hit_pairs_returns_ratio(mod):
-    # fig4 is ratio-based: _T has input_tokens=100, so ratio = ht/(100+ht)
-    turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], gap=2.0, hit_tokens=1500),
-             _T("A", 1, 0, 5, 5.0, [], [], gap=None, hit_tokens=0)]  # no gap -> dropped
-    pairs = mod.gap_hit_pairs(turns)
+def test_gap_reuse_pairs_uses_prev_turn_cache_denominator(mod):
+    # prev turn (step1): effective_input=100+0=100, output=0 -> cached=100.
+    # this turn (step2): cache_read=80 -> reuse ratio = 80/100 = 0.8, and it
+    # is NOT deflated by this turn reading big new content.
+    prev = _T("A", 1, 0, 5, 5.0, [], ["read"], gap=None, hit_tokens=0)
+    prev.output_tokens = 0        # cached = eff_input(100) + 0
+    cur = _T("A", 2, 7, 7.5, 0.5, ["read"], ["bash"], gap=2.0, hit_tokens=80)
+    cur.input_tokens = 5000       # huge NEW read -> raw hit ratio would be tiny
+    pairs = mod.gap_reuse_pairs([prev, cur])
     assert len(pairs) == 1
-    assert pairs[0][0] == 2.0
-    assert pairs[0][1] == pytest.approx(1500 / 1600)
+    g, r, sid, step = pairs[0]
+    assert (g, sid, step) == (2.0, "A", 2)
+    assert r == pytest.approx(80 / 100)      # prev-cache denominator, not 80/5080
 
 
-def test_categorize_gap_hit_prev_tool(mod):
-    # category is simply the previous turn's tool key; no-gap turns dropped
-    turns = [
-        _T("A", 1, 0, 5, 5.0, [], ["read"], gap=None, hit_tokens=0),
-        _T("A", 2, 7, 7.5, 0.5, ["read"], ["bash"], gap=2.0, hit_tokens=400),
-        _T("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit_tokens=3200),
-    ]
-    cats = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns)}
-    assert cats == {2: "read", 3: "bash"}
+def test_gap_reuse_pairs_drops_first_and_gapless(mod):
+    # first turn has no prev; a gapless turn is dropped
+    turns = [_T("A", 1, 0, 5, 5.0, [], [], gap=None, hit_tokens=0),
+             _T("A", 2, 7, 7.5, 0.5, [], [], gap=None, hit_tokens=50)]
+    assert mod.gap_reuse_pairs(turns) == []
 
 
 def test_sample_start_times_drops_nested_subagent_sessions(mod):

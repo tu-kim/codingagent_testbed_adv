@@ -31,9 +31,12 @@ Views (each figure -> PDF when matplotlib is present; CSVs always):
    fig3-1_worker_hit_kv    (with --worker-log) hit rate + KV usage parsed
                            STRAIGHT from the vLLM worker log's engine-stats
                            line — both off one clock, no alignment needed.
-4. fig4_gap_vs_hit         turn gap (llm.start(N) - llm.end(N-1)) vs prefix-
-                           cache hit RATIO, points COLORED by the previous
-                           turn's tool (also gap_hit.csv).
+4. fig4_gap_vs_hit         turn gap (LOG x) vs PREVIOUS-TURN KV REUSE ratio
+                           = cache_read(N) / (eff_input(N-1)+output(N-1)):
+                           of the KV the previous turn left cached, how much
+                           this turn reused. Unlike the raw hit ratio it is
+                           not deflated by how much NEW content the turn read
+                           (single color; also gap_hit.csv).
    zero_turns.csv          turns whose llm.end duration_s is ~0 (buffered-
                            tool-call steps; see near_zero_turns) — proof
                            they still generated output_tokens.
@@ -452,19 +455,44 @@ def gap_hit_pairs(turns: list) -> list[tuple[float, float]]:
     return out
 
 
-def categorize_gap_hit(turns: list) -> list[tuple[float, float, str, str, int]]:
-    """(turn_gap, hit_ratio, category, session_id, step) for turns with
-    gap + usage data.
+def prev_reuse_ratio(turn, by_key: dict) -> float | None:
+    """Of the KV the PREVIOUS turn left cached, what fraction does THIS
+    turn actually reuse:
 
-    category = the previous turn's tool key (prev_key): in sequential runs
-    the turn gap is ~the preceding tool's exec time, so coloring by prev
-    tool explains most of the vertical spread at a given gap."""
+        cache_read(N) / (effective_input(N-1) + output_tokens(N-1))
+
+    The denominator is the previous turn's full resident sequence (its
+    prompt + its generation) — the tokens that WERE in cache. Unlike the
+    raw hit ratio (cache_read / this turn's effective_input), this is NOT
+    deflated when the current turn injects a lot of NEW content (e.g. a
+    big `read`): a turn that reuses all of the previous turn's KV scores
+    ~1.0 no matter how much fresh text it also prefills. That is the
+    "did the next turn keep the previous turn's cache?" question."""
+    prev = by_key.get((turn.session_id, turn.step - 1))
+    if prev is None:
+        return None
+    prev_eff = getattr(prev, "effective_input", None)
+    if prev_eff is None:
+        return None
+    denom = prev_eff + (getattr(prev, "output_tokens", None) or 0)
+    if denom <= 0:
+        return None
+    cr = getattr(turn, "cache_read", 0) or 0
+    return cr / denom
+
+
+def gap_reuse_pairs(turns: list) -> list[tuple[float, float, str, int]]:
+    """(turn_gap, prev_reuse_ratio, session_id, step) for turns that have
+    a gap and a resolvable previous turn."""
+    by_key = {(t.session_id, t.step): t for t in turns}
     out = []
     for t in turns:
-        h = _hit_ratio(t)
-        if t.away_s is None or h is None:
+        if t.away_s is None:
             continue
-        out.append((t.away_s, h, t.prev_key, t.session_id, t.step))
+        r = prev_reuse_ratio(t, by_key)
+        if r is None:
+            continue
+        out.append((t.away_s, r, t.session_id, t.step))
     return out
 
 
@@ -631,7 +659,7 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
         if h is not None:
             by_sess.setdefault(t.session_id, []).append((i, h))
     for b in (sample_ordinals or []):
-        ax_top.axvline(b, color="crimson", linewidth=1.0, alpha=0.85, zorder=1)
+        ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
     for sid, pts in by_sess.items():
         if len(pts) < min_turns and len(by_sess) > 1:
             continue
@@ -655,11 +683,11 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
         t0 = min((p[0] for p in kv), default=0.0)
     x_right = 0.0
     for b in (sample_times or []):
-        ax_bot.axvline(b - t0, color="crimson", linewidth=1.0, alpha=0.85,
+        ax_bot.axvline(b - t0, color="crimson", linewidth=0.5, alpha=0.7,
                        zorder=1)
     if kv:
         kx = [t - t0 for t, _ in kv]
-        ax_bot.plot(kx, [v * 100.0 for _, v in kv], color="tab:orange",
+        ax_bot.plot(kx, [v * 100.0 for _, v in kv], color="tab:green",
                     lw=1.0, zorder=2)
         x_right = kx[-1]
     if ts_all:
@@ -704,26 +732,23 @@ def fig_worker_hit_kv(hits: list[tuple[float, float]],
     plt.close(fig)
 
 
-def fig_gap_vs_hit(cats: list[tuple[float, float, str, str, int]],
+def fig_gap_vs_hit(pairs: list[tuple[float, float, str, int]],
                    path: Path) -> None:
-    """Scatter of turn gap vs hit ratio, COLORED by the previous turn's
-    tool so the vertical spread at a given gap is explained."""
+    """Scatter of turn gap (LOG x) vs the previous-turn KV reuse ratio
+    (cache_read(N) / [effective_input(N-1) + output(N-1)]): how much of
+    the previous turn's cached KV this turn actually reused. Single color
+    (the ratio already controls for how much NEW content the turn read)."""
     plt = _mpl()
     fig, ax = plt.subplots(figsize=(6.5, 4))
-    groups: dict[str, list[tuple[float, float]]] = {}
-    for g, h, c, _sid, _step in cats:
-        groups.setdefault(c, []).append((g, h))
-    for c in sorted(groups):
-        pts = groups[c]
-        gs = [p[0] for p in pts]
-        hs = [p[1] for p in pts]
-        ax.scatter(gs, hs, s=14, alpha=0.6, label=f"{c} ({len(pts)})")
+    gs = [p[0] for p in pairs if p[0] > 0]     # log x needs gap > 0
+    hs = [p[1] for p in pairs if p[0] > 0]
+    ax.scatter(gs, hs, s=14, alpha=0.6, color="tab:blue")
+    if gs:
+        ax.set_xscale("log")
     ax.set_xlabel("turn gap (s)")
-    ax.set_ylabel("prefix-cache hit ratio")
-    ax.set_ylim(0, 1)
-    if groups:
-        ax.legend(fontsize=7, loc="best", framealpha=0.7)
-    ax.set_title("Prefix-cache hit vs turn gap")
+    ax.set_ylabel("prev-turn KV reuse ratio")
+    ax.set_ylim(bottom=0)
+    ax.set_title("Previous-turn KV reuse vs turn gap")
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -840,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
     samples_abs = sample_start_times_abs(ordered, min_boundary)
     sample_ords = sample_start_ordinals(ordered, min_boundary)
     bottom_rows = bottom_pct_tool_dist(turns, cutoffs)
-    cats = categorize_gap_hit(turns)
+    reuse = gap_reuse_pairs(turns)
     have_metrics = args.metrics is not None and args.metrics.exists()
     kv = kv_usage_series(args.metrics) if have_metrics else []
 
@@ -850,9 +875,9 @@ def main(argv: list[str] | None = None) -> int:
     write_bottom_pct_csv(out_dir / "bottom_pct_tools.csv", bottom_rows)
     with (out_dir / "gap_hit.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["session_id", "step", "turn_gap_s", "cache_hit_ratio", "category"])
-        for g, h, c, sid, step in cats:
-            w.writerow([sid, step, g, h, c])
+        w.writerow(["session_id", "step", "turn_gap_s", "prev_turn_kv_reuse_ratio"])
+        for g, r, sid, step in reuse:
+            w.writerow([sid, step, g, r])
 
     # near-zero-duration turn diagnostic (buffered-tool-call steps)
     keep_ids = {t.session_id for t in turns}
@@ -881,7 +906,7 @@ def main(argv: list[str] | None = None) -> int:
                           min_turns=min_boundary,
                           sample_ordinals=sample_ords,
                           sample_times=samples_abs)
-            fig_gap_vs_hit(cats, out_dir / "fig4_gap_vs_hit.pdf")
+            fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
             if args.worker_log and args.worker_log.exists():
                 wl_hits, wl_kv = worker_log_series(args.worker_log)
                 if wl_hits or wl_kv:
