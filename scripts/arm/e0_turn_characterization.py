@@ -13,10 +13,9 @@ Views (each figure -> PDF when matplotlib is present; CSVs always):
 1. fig1_turn_llm_time      THREE stacked panels on a shared TURN-index axis
                            (thin fixed-width bars, LOG y): (a) per-turn LLM
                            time, (b) per-turn tool execution time, (c) LLM/
-                           tool ratio (dashed line at 1.0); red lines at TOP-
-                           LEVEL sample starts (>= --min-turns-boundary turns
-                           AND not nested inside another kept session's
-                           window, so `task` sub-agents don't add lines).
+                           tool ratio (dashed line at 1.0); red lines at the
+                           TOP-LEVEL sample starts (trace-filtered main
+                           sessions, not nested inside another's window).
 2. fig2_llm_time_cdf       CDF of per-turn LLM time (log x) — the fast/small
                            turns (CPU-offload candidates) and the long tail.
    bottom_pct_tools.csv    for the bottom 10/20/30/40% of the LLM-time
@@ -48,8 +47,9 @@ cache_hit_ratio, away_s == turn gap).
 Usage:
   scripts/arm/e0_turn_characterization.py \\
       --profiles <workspace_root>/profiles \\
-      [--trace results/<run>/trace.jsonl]   # filter to MAIN sessions \\
+      --trace results/<run>/trace.jsonl     # REQUIRED: filter to MAIN sessions \\
       [--metrics logs/vllm_metrics.ndjson] \\
+      [--worker-log logs/vllm-a0.log] \\
       [--cutoffs 90,80,70,60] [--out <dir>] [--no-figures]
 """
 
@@ -815,21 +815,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="turns with llm.end duration_s <= this are dumped to "
                          "zero_turns.csv (the buffered-tool-call steps whose "
                          "duration_s collapses to ~0). Default 0.01.")
-    ap.add_argument("--trace", type=Path, default=None,
-                    help="run's trace.jsonl; when given, only turns from its "
+    ap.add_argument("--trace", required=True, type=Path,
+                    help="run's trace.jsonl (REQUIRED). Only turns from its "
                          "session_ids (the MAIN per-sample sessions) are "
-                         "analyzed — drops title/task-subagent sessions that "
-                         "also land in profiles/")
+                         "analyzed — drops the title / task-subagent sessions "
+                         "that also land in profiles/. Every kept session is a "
+                         "real sample, so no turn-count heuristic is applied.")
     ap.add_argument("--cutoffs", default="10,20,30,40",
                     help="bottom-percentile cutoffs (comma list of %); the "
                          "fastest/smallest-LLM-time turns = CPU-offload "
                          "candidates. Default bottom 10,20,30,40%")
-    ap.add_argument("--min-turns-boundary", type=int, default=2,
-                    help="fig1/fig3: only sessions with >= this many turns get "
-                         "a sample-boundary line (filters single-turn title / "
-                         "task-subagent sessions). Default 2, but forced to 1 "
-                         "when --trace is given (every trace session already "
-                         "IS a main sample, so 1-turn samples must be kept).")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -839,33 +834,33 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     cutoffs = [float(c) / 100.0 for c in args.cutoffs.split(",") if c.strip()]
 
+    if not args.trace.is_file():
+        print(f"error: trace not found: {args.trace}", file=sys.stderr)
+        return 2
+
     ats = _load_ats()
     turns = ats.load_turns(args.profiles)
     if not turns:
         print("error: no turns parsed from profiles", file=sys.stderr)
         return 2
-    if args.trace is not None:
-        if not args.trace.is_file():
-            print(f"error: trace not found: {args.trace}", file=sys.stderr)
-            return 2
-        main_ids = trace_session_ids(args.trace)
-        if not main_ids:
-            print("error: no session_id in trace.jsonl", file=sys.stderr)
-            return 2
-        before = len({t.session_id for t in turns})
-        turns = [t for t in turns if t.session_id in main_ids]
-        kept = {t.session_id for t in turns}
-        print(f"trace filter: kept {len(kept)}/{before} sessions "
-              f"({len(main_ids)} main sessions in trace"
-              + (f"; {len(main_ids - kept)} with no profile" if main_ids - kept
-                 else "") + ")")
-        if not turns:
-            print("error: no turns left after trace filter", file=sys.stderr)
-            return 2
+    main_ids = trace_session_ids(args.trace)
+    if not main_ids:
+        print("error: no session_id in trace.jsonl", file=sys.stderr)
+        return 2
+    before = len({t.session_id for t in turns})
+    turns = [t for t in turns if t.session_id in main_ids]
+    kept = {t.session_id for t in turns}
+    print(f"trace filter: kept {len(kept)}/{before} sessions "
+          f"({len(main_ids)} main sessions in trace"
+          + (f"; {len(main_ids - kept)} with no profile" if main_ids - kept
+             else "") + ")")
+    if not turns:
+        print("error: no turns left after trace filter", file=sys.stderr)
+        return 2
 
-    # With --trace every remaining session is already a main sample, so the
-    # >=2-turn heuristic must not shed a legitimate 1-turn sample.
-    min_boundary = 1 if args.trace is not None else args.min_turns_boundary
+    # Every kept session is a main sample; no turn-count heuristic needed
+    # (a 1-turn sample must still be kept), so the sample filter uses 1.
+    min_boundary = 1
 
     ordered = order_turns(turns)
     samples = sample_start_times(ordered, min_boundary)

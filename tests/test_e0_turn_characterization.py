@@ -286,8 +286,11 @@ def test_main_writes_csvs_no_figures(mod, tmp_path, capsys):
     _write_profile(prof, "A",
                    _turn_events(1, 0, 5, 2000, 300, 0, "read")
                    + _turn_events(2, 7, 7.5, 500, 20, 1500, None))
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(json.dumps({"session_id": "A"}) + "\n")
     out = tmp_path / "o"
-    rc = mod.main(["--profiles", str(prof), "--out", str(out), "--no-figures"])
+    rc = mod.main(["--profiles", str(prof), "--trace", str(trace),
+                   "--out", str(out), "--no-figures"])
     assert rc == 0
     assert not list(out.glob("*.pdf"))
     ordered = list(csv.DictReader((out / "turns_ordered.csv").open()))
@@ -326,6 +329,15 @@ def test_main_trace_missing_returns_2(mod, tmp_path, capsys):
 
 
 def test_main_missing_profiles_returns_2(mod, tmp_path, capsys):
-    rc = mod.main(["--profiles", str(tmp_path / "nope")])
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(json.dumps({"session_id": "A"}) + "\n")
+    rc = mod.main(["--profiles", str(tmp_path / "nope"), "--trace", str(trace)])
     assert rc == 2
     assert "not found" in capsys.readouterr().err
+
+
+def test_main_requires_trace(mod, tmp_path):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    # --trace is required; argparse exits (SystemExit) when it's absent
+    with pytest.raises(SystemExit):
+        mod.main(["--profiles", str(prof), "--no-figures"])
