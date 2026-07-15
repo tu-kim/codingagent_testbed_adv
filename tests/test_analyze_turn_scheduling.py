@@ -362,6 +362,65 @@ def test_turn_csv_has_away_and_cache_columns(mod, tmp_path):
     assert row["away_s"] == ""                # first turn
 
 
+# ---------- away_displaced_tokens (eviction pressure proxy) ----------
+
+
+def test_displaced_tokens_counts_other_sessions_in_window(mod, tmp_path):
+    # A: turn1 ends t=10, turn2 starts t=40 (away 30).
+    # B completes two turns inside [10,40] with 1200 tokens each.
+    def sess(sid, specs):
+        evs = []
+        for step, start, end, inp, out in specs:
+            evs.append(_llm_start(step, start))
+            evs.append({**_llm_end(step, inp=inp, out=out), "ts": end})
+        _write_profile(tmp_path, sid, evs)
+    sess("A", [(1, 5, 10, 2000, 100), (2, 40, 42, 1500, 50)])
+    sess("B", [(1, 12, 20, 1000, 200), (2, 25, 35, 1000, 200)])
+    turns = {(t.session_id, t.step): t for t in mod.load_turns(tmp_path)}
+    assert turns[("A", 2)].away_displaced_tokens == 2400   # B's 1200+1200
+    assert turns[("B", 2)].away_displaced_tokens == 0      # nothing in [20,25]
+    assert turns[("A", 1)].away_displaced_tokens is None   # first turn
+
+
+def test_displaced_excludes_own_session(mod, tmp_path):
+    _write_profile(tmp_path, "solo", [
+        _llm_start(1, 0.0), {**_llm_end(1, inp=500, out=500), "ts": 5.0},
+        _llm_start(2, 30.0), {**_llm_end(2), "ts": 31.0},
+    ])
+    turns = mod.load_turns(tmp_path)
+    t2 = next(t for t in turns if t.step == 2)
+    assert t2.away_displaced_tokens == 0    # own turn-1 end not counted
+
+
+def test_displaced_cache_correlation(mod):
+    def turn(displaced, hit, isl=1000):
+        cache = int(isl * hit)
+        return mod.TurnRec(session_id="s", step=1,
+                           away_displaced_tokens=displaced,
+                           input_tokens=isl - cache, cache_read=cache)
+    turns = [turn(d, 0.9 - 0.0001 * d) for d in (0, 1000, 4000, 8000)]
+    r, n = mod.displaced_cache_correlation(turns)
+    assert n == 4
+    assert r < -0.99
+
+
+def test_turn_csv_has_displaced_and_cur_tools(mod, tmp_path):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    logs = tmp_path / "logs"; logs.mkdir()
+    _write_profile(prof, "s", [
+        _llm_start(1, 1.0),
+        {**_llm_end(1, request_id="r1"), "ts": 2.0},
+        _tool_end(1, "grep"),
+        _tool_end(1, "bash"),
+    ])
+    _write_worker_log(logs, [_sched_line("r1", "decode", 10.0, queued_ts=1.5)])
+    out = tmp_path / "o"
+    mod.main(["--profiles", str(prof), "--logs", str(logs), "--out", str(out)])
+    (row,) = list(csv.DictReader((out / "turn_sched.csv").open()))
+    assert row["cur_tools"] == "bash+grep"
+    assert row["away_displaced_tokens"] == ""   # first turn
+
+
 # ---------- queue_share denominator fallback ----------
 
 

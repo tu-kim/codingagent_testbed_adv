@@ -91,6 +91,13 @@ class TurnRec:
     away_s: float | None = None        # llm.start(N) - llm.end(N-1): time the
                                        # session was OFF the GPU (tool exec +
                                        # scaffold) before this turn re-entered
+    # Proxy for eviction pressure DURING the away window: sum of
+    # (input + output) tokens of OTHER sessions' turns whose llm.end fell
+    # inside this turn's away window — i.e. how much new KV concurrent
+    # traffic allocated while this session was off the GPU. vLLM's LRU
+    # evicts by recency, not by session liveness, so this displaced
+    # traffic is what pushes a still-active session's blocks out.
+    away_displaced_tokens: int | None = None
 
     @property
     def effective_input(self) -> int | None:
@@ -181,7 +188,33 @@ def load_turns(profiles_dir: Path) -> list[TurnRec]:
         # only keep turns that actually had an LLM call
         if t.llm_wall_s is not None or t.output_tokens is not None or t.recv_ts is not None:
             out.append(t)
+    _fill_displaced_tokens(out)
     return out
+
+
+def _fill_displaced_tokens(turns: list[TurnRec]) -> None:
+    """For each turn with an away window, sum the new-KV tokens
+    (input + output) of OTHER sessions' turns whose llm.end fell inside
+    [llm.end(N-1), llm.start(N)]. This approximates how much KV was
+    allocated by concurrent traffic while the session was away — the
+    displacement pressure that evicts its blocks under LRU."""
+    import bisect
+    events = sorted(
+        (t.llm_end_ts, t.session_id,
+         (t.input_tokens or 0) + (t.output_tokens or 0))
+        for t in turns if t.llm_end_ts is not None
+    )
+    ts_list = [e[0] for e in events]
+    for t in turns:
+        if t.away_s is None or t.llm_start_ts is None:
+            continue
+        lo = t.llm_start_ts - t.away_s
+        hi = t.llm_start_ts
+        i = bisect.bisect_left(ts_list, lo)
+        j = bisect.bisect_right(ts_list, hi)
+        t.away_displaced_tokens = sum(
+            tok for ts, sid, tok in events[i:j] if sid != t.session_id
+        )
 
 
 # ---------- worker side ----------
@@ -431,10 +464,7 @@ def away_cache_rows(turns: list[TurnRec]) -> list[dict]:
     return rows
 
 
-def away_cache_correlation(turns: list[TurnRec]) -> tuple[float, int]:
-    """Pearson r between away_s and cache_hit_ratio over non-first turns."""
-    pairs = [(t.away_s, t.cache_hit_ratio) for t in turns
-             if t.away_s is not None and t.cache_hit_ratio is not None]
+def _pearson(pairs: list[tuple[float, float]]) -> tuple[float, int]:
     n = len(pairs)
     if n < 2:
         return math.nan, n
@@ -448,6 +478,24 @@ def away_cache_correlation(turns: list[TurnRec]) -> tuple[float, int]:
     if vx == 0 or vy == 0:
         return math.nan, n
     return cov / math.sqrt(vx * vy), n
+
+
+def away_cache_correlation(turns: list[TurnRec]) -> tuple[float, int]:
+    """Pearson r between away_s and cache_hit_ratio over non-first turns."""
+    return _pearson([(t.away_s, t.cache_hit_ratio) for t in turns
+                     if t.away_s is not None and t.cache_hit_ratio is not None])
+
+
+def displaced_cache_correlation(turns: list[TurnRec]) -> tuple[float, int]:
+    """Pearson r between away_displaced_tokens and cache_hit_ratio.
+
+    Stronger causal proxy than away_s alone: what evicts blocks is not
+    time itself but the KV allocated by OTHER traffic during the away
+    window (LRU displaces by allocation pressure)."""
+    return _pearson([
+        (float(t.away_displaced_tokens), t.cache_hit_ratio) for t in turns
+        if t.away_displaced_tokens is not None and t.cache_hit_ratio is not None
+    ])
 
 
 def write_away_cache_csv(path: Path, rows: list[dict]) -> None:
@@ -473,6 +521,14 @@ def print_away_cache(rows: list[dict], r: float, n: int) -> None:
               "cache (KV evicted while away); re-entry pays extra prefill.")
 
 
+def print_displaced(r: float, n: int) -> None:
+    print(f"pearson r(away_displaced_tokens, cache_hit_ratio) = {r:.3f}  (n={n})")
+    if not math.isnan(r) and r < -0.2:
+        print("  -> displacement pressure (other sessions' KV allocation "
+              "during the away window) drives the eviction, not elapsed "
+              "time per se — LRU is traffic-driven.")
+
+
 # ---------- outputs ----------
 
 
@@ -482,7 +538,8 @@ def write_turn_csv(path: Path, match: MatchResult) -> None:
         "output_tokens", "input_tokens", "llm_wall_s", "elapsed_s",
         "prefill_queue_ms", "decode_queue_ms", "total_queue_ms",
         "queue_share", "queue_share_basis",
-        "away_s", "cache_read", "cache_hit_ratio",
+        "away_s", "away_displaced_tokens", "cache_read", "cache_hit_ratio",
+        "cur_tools",
     ]
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
@@ -508,9 +565,12 @@ def write_turn_csv(path: Path, match: MatchResult) -> None:
                 "queue_share": share,
                 "queue_share_basis": basis,
                 "away_s": t.away_s if t.away_s is not None else "",
+                "away_displaced_tokens": (t.away_displaced_tokens
+                                          if t.away_displaced_tokens is not None else ""),
                 "cache_read": t.cache_read,
                 "cache_hit_ratio": (t.cache_hit_ratio
                                     if t.cache_hit_ratio is not None else ""),
+                "cur_tools": "+".join(sorted(set(t.tool_names))),
             })
 
 
@@ -614,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
     # KV-eviction cost of leaving the GPU between turns.
     ac_rows = away_cache_rows(turns)
     r, n_ac = away_cache_correlation(turns)
+    rd, n_d = displaced_cache_correlation(turns)
     write_away_cache_csv(out_dir / "away_cache.csv", ac_rows)
 
     if not sched:
@@ -621,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
               "queue-wait join, reporting away/cache analysis only",
               file=sys.stderr)
         print_away_cache(ac_rows, r, n_ac)
+        print_displaced(rd, n_d)
         print(f"\nwrote {out_dir / 'away_cache.csv'}")
         return 0
 
@@ -640,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print_report(match, len(turns), rows, args.small_tokens)
     print_away_cache(ac_rows, r, n_ac)
+    print_displaced(rd, n_d)
     print(f"\nwrote {out_dir / 'turn_sched.csv'}")
     print(f"wrote {out_dir / 'by_tool.csv'}")
     print(f"wrote {out_dir / 'away_cache.csv'}")
