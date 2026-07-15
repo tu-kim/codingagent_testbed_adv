@@ -27,9 +27,19 @@ sudo apt install -y yq nats-server
 
 # vLLM pinned to 0.22.1 (matches the AsyncEngineArgs surface the vendored
 # Dynamo submodule v1.3.0-minimax-m3-dev.1 was built against); NIXL is the
-# KV-transfer connector vLLM loads when --kv-transfer-config selects NixlConnector.
+# KV-transfer connector vLLM loads when --kv-transfer-config selects NixlConnector
+# (disagg) OR when KVBM is enabled (§ KVBM below).
 uv pip install vllm==0.22.1
 uv pip install nixl
+
+# NIXL runtime library must be on the loader path. The connector dlopen's
+# libnixl_capi.so at worker start; if the pip package's shared lib isn't
+# discoverable the worker dies with "libnixl_capi.so: cannot open shared
+# object file". Register it once (survives without per-shell export):
+NIXL_LIB_DIR=$(python -c "import nixl, os, glob; print(os.path.dirname(glob.glob(os.path.dirname(nixl.__file__)+'/**/libnixl_capi.so*', recursive=True)[0]))")
+echo "$NIXL_LIB_DIR" | sudo tee /etc/ld.so.conf.d/nixl.conf && sudo ldconfig
+# (or, non-root: export LD_LIBRARY_PATH="$NIXL_LIB_DIR:$LD_LIBRARY_PATH"
+#  in the shell that runs `testbed.sh up workers`.)
 
 # etcd (Dynamo's default --discovery-backend); apt's is too old.
 ETCD_VER=v3.5.17
@@ -73,6 +83,34 @@ sudo bash deploy/testbed.sh up monitor
 ```
 
 No separate `nv-hostengine` service is needed (the sampler runs DCGM embedded, in-process); sudo IS required — the `DCGM_FI_PROF_*` fields read GPU performance counters gated to root.
+
+**Optional — KVBM (only for `vllm.kvbm.enabled`, host/disk KV tiering):**
+
+KVBM ships as a separate CUDA extension (`dynamo/lib/bindings/kvbm`) NOT built by
+the main dynamo build. Build + install it, then verify the import:
+
+```bash
+# from the dynamo submodule; needs the Rust toolchain + CUDA (cudarc, nixl-sys)
+(cd dynamo/lib/bindings/kvbm && maturin build --release && \
+   uv pip install target/wheels/kvbm-*.whl)
+python -c "import kvbm.vllm_integration.connector"   # must succeed
+```
+
+Then enable in `deploy/testbed.yaml` (agg workers only — config.py rejects it
+with a disagg topology):
+
+```yaml
+vllm:
+  kvbm:
+    enabled: true
+    cpu_cache_gb: 40     # MUST exceed the GPU KV pool or offload churn degrades perf
+    disk_cache_gb: 80    # 0 = no disk tier; keep disk >= cpu (pyramid), watch free space
+```
+
+KVBM per-worker Prometheus metrics (`kvbm_host_cache_hit_rate`, offload/onboard
+block counters) are scraped automatically by `up scrape_metrics` (a second
+`role: kvbm` target per agg worker). Sizing caveat + interpretation:
+`docs/cpu_contention_runbook.md` and CLAUDE.md's Worker-role-injection section.
 
 ---
 
@@ -252,9 +290,14 @@ All analyzers are standalone (`scripts/*.py`), write CSVs (+ optional `--figures
 | `analyze_subagent_time.py` | profile NDJSON | per-turn share of time spent in `task` sub-agents (union of intervals) |
 | `analyze_tool_time.py` | profile NDJSON | per-turn share of time in non-`task` tools, broken down by tool name |
 | `analyze_session_resources.py` | `logs/resource.ndjson` | GPU/CPU stats per session window; window-aggregate `{mean,min,max}`; PCIe/NVLink as per-window deltas; prefill/decode role split |
-| `analyze_vllm_metrics.py` | `logs/vllm_metrics.ndjson` | vLLM `/metrics` stats: gauges, counter rates, histogram percentiles, per worker/role |
+| `analyze_vllm_metrics.py` | `logs/vllm_metrics.ndjson` | vLLM (+ KVBM) `/metrics` stats: gauges, counter rates, histogram percentiles, per worker/role. `--trim-margin-s`/`--trim-head-s`/`--trim-tail-s` cut warmup/cooldown idle ticks (scraper started before / stopped after the run) |
 | `analyze_worker_scheduling.py` | `logs/vllm-*.log` | per-request prefill/decode **scheduling delay** (needs dynamo patch, §7) |
-| `analyze_request_wait.py` | `frontend.log` + `logs/` | queue-wait as a **fraction of e2e**, joined by request_id; tail concentration; `--figures` |
+| `analyze_request_wait.py` | `frontend.log` + `logs/` | queue-wait as a **fraction of e2e**, joined by request_id; queue-corrected TTFT (`prefill_compute_ms`); tail concentration; `--figures` |
+| `analyze_turn_scheduling.py` | profile NDJSON + `logs/` | joins profile **turns** ↔ SCHED_DELAY (exact by request_id, else timestamp): per-preceding-tool output-tokens vs queue-share (small-turn CPU-offload analysis) + `away_cache.csv` (off-GPU time / displaced-traffic vs prefix-cache hit = KV-eviction cost). `--emit-session-map` |
+| `compare_prefill_compute.py` | 2 × (`frontend.log` + `logs/`) | A/B baseline-vs-KVBM `prefill_compute_ms` distributions → per-request **onboard-cost estimate** (only handle; the dynamo tag records no per-request transfer time) |
+| `cpu_offload_breakeven.py` | `turn_sched.csv` | per-turn GPU-path vs CPU-path (host-KV) cost model + break-even `cpu_decode_tps`; CPU throughput knobs from a microbench |
+| `arm/e0_turn_characterization.py` | profile NDJSON (+ `logs/vllm_metrics.ndjson`) | E0 views: per-turn LLM-time bar chart with sample boundaries; bottom-90/80/70/60% tool composition (prev/cur %); hit-ratio vs GPU-KV-size time series; turn-gap vs hit. CSVs + PDFs |
+| `filter_hanging_tools.py` | `trace.jsonl` | flags server/background/long-running bash tool calls (hangs); emits `--exclude-calls` list for the tool-time analyzers |
 | `format_prompt_dump.py` | `prompts/prompt-*.jsonl` | pretty-prints the per-turn **engine prompt** (newlines rendered), one turn per request_id; `--delta` shows only text new since the previous turn (needs dynamo patch, §7) |
 | `export_prompt_turns.py` | `prompts/prompt-*.jsonl` | machine-readable exporter for **external simulators**: one JSON line per request, prompt split into chat-template turns + `text`/`think`/`tool_call`/`tool_response` segments with lossless char offsets; `--no-text` compact mode, `--tokenizer` per-segment token counts (needs dynamo patch, §7) |
 
@@ -270,6 +313,8 @@ sudo deploy/testbed.sh down monitor
 - `monitor` — DCGM GPU + psutil sampler; **must be run with `sudo`** (root for DCGM). Set `monitor.dcgm_py` + `monitor.dcgm_bindings_path` in `testbed.yaml` (read from yaml so sudo's env-strip doesn't lose them); DCGM install + path discovery: §1 "Optional — DCGM".
 
 OpenCode profiling is ENV-gated: launch opencode with `OPENCODE_PROFILE=1` (per-session NDJSON lands in `<workspace_root>/profiles/`). Aggregate with `scripts/aggregate_profiles.sh <workspace_root>`.
+
+**Turn-KV / CPU-offload study**: `docs/turn_kv_experiment_plan.md` sequences the runs (E0 `--sequential` characterization → E1 QPS sweep for the eviction/miss curve → E3 KVBM A/B → E4 CPU break-even) and maps each to the analyzers above (`analyze_turn_scheduling.py`, `compare_prefill_compute.py`, `cpu_offload_breakeven.py`). **CPU-contention** simulation (high `--max-in-flight` without GPU KV pressure) uses `scripts/mock_llm_server.py` — a stdlib OpenAI-compatible mock that replaces the Dynamo endpoint; recipe in `docs/cpu_contention_runbook.md`.
 
 **Engine-prompt capture** is a separate ENV-gated option: bring up workers with `DYN_PROMPT_DUMP=1 deploy/testbed.sh up workers` to dump the **exact prompt the vLLM engine receives** each request — the frontend's chat-template-applied token_ids, detokenized to text — as NDJSON to `<workspace_root>/prompts/prompt-<pid>.jsonl` (one record per request: `request_id`, `role` prefill|decode, `num_prompt_tokens`, `prompt_text`). This is distinct from `OPENCODE_PROFILE`, which snapshots OpenCode's **pre-chat-template** wire messages. Optional knobs: `DYN_PROMPT_DUMP_TOKENS=1` to also dump raw token ids, `DYN_PROMPT_DUMP_TEXT=0` to skip detokenization. Needs `dynamo-prompt-dump.patch` applied. **Adds hot-path latency — use for prompt capture, not timing runs.**
 
