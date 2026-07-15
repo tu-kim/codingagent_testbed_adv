@@ -149,12 +149,12 @@ def fig_turn_llm_time(e0, ordered: list, path: Path,
 def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
                   sample_ordinals: list[int],
                   sample_times: list[float]) -> None:
-    """E0's two stacked fig3 panels for a CONCURRENT run. Top panel: x is
-    each session's OWN turn number (1..N_i), one clean line per session —
-    plotting against the global interleaved ordinal made every line
-    zigzag across the others. Global-ordinal boundary lines are dropped
-    on this panel (meaningless on a per-session axis); the bottom time
-    panel keeps its sample-start lines."""
+    """E0's two stacked fig3 panels for a CONCURRENT run. Top panel:
+    sessions are laid out as CONSECUTIVE x-axis blocks, ordered by session
+    start time — each block holds exactly ONE session's turns (in its own
+    chronological order), so lines never overlap or zigzag across each
+    other. Red lines mark the block boundaries. The bottom time panel is
+    unchanged (real time, sample-start lines)."""
     plt = e0._mpl()
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(18, 10))
 
@@ -164,16 +164,20 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
         st = t.llm_start_ts if t.llm_start_ts is not None else t.llm_end_ts
         if h is not None and st is not None:
             by_sess.setdefault(t.session_id, []).append((st, h))
-    x_max = 1
-    for sid, pts in by_sess.items():
-        pts.sort()                      # session-local chronological order
-        xs = list(range(1, len(pts) + 1))
+    # blocks in session start order
+    order = sorted(by_sess, key=lambda sid: min(ts for ts, _ in by_sess[sid]))
+    offset = 0
+    for sid in order:
+        pts = sorted(by_sess[sid])      # session-local chronological order
+        xs = [offset + j for j in range(len(pts))]
+        ax_top.axvline(offset, color="crimson", linewidth=0.5, alpha=0.7,
+                       zorder=1)
         ax_top.plot(xs, [h for _, h in pts],
-                    color="tab:blue", marker=".", ms=3, lw=0.8, alpha=0.7)
-        x_max = max(x_max, len(pts))
-    ax_top.set_xlim(0, x_max)
+                    color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
+        offset += len(pts)
+    ax_top.set_xlim(0, max(offset - 1, 1))
     ax_top.set_ylim(bottom=0)
-    ax_top.set_xlabel("turn (within session)")
+    ax_top.set_xlabel("turn (sessions in start order, one block each)")
     ax_top.set_ylabel("prefix-cache hit tokens / turn")
     ax_top.set_title("Prefix-cache Hit Tokens vs turn")
 
