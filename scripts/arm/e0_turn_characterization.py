@@ -671,8 +671,9 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
       (top)    prefix-cache HIT TOKENS per turn (tokens.cache.read) on a
                TURN-index x axis, one line per session, BROKEN wherever a
                session's ordinals are non-consecutive (the parent is paused
-               while its `task` sub-agent runs, so it draws no line across
-               that stretch); red lines at sample-start ordinals.
+               while its `task` sub-agent runs). Sub-agent turns are marked
+               with a triangle, sample turns with a dot; red lines at
+               sample-start ordinals.
       (bottom) GPU KV-cache usage (%) on a TIME x axis (seconds from the
                run window start; the scrape series is TRIMMED to the run
                window so an early/late scraper can't shift the origin);
@@ -685,6 +686,9 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
     # lines (each session_id its own line, in ordinal order). They have
     # independent KV prefixes, so a sub-agent's line starting low is its
     # own fresh prefix, not a dip in the parent's.
+    # marker per session: `task` sub-agent turns get a triangle, the
+    # top-level sample gets a dot.
+    assign = sample_assignment(ordered, min_turns)
     by_sess: dict[str, list[tuple[int, float]]] = {}
     for i, t in enumerate(ordered):
         h = _hit_tokens(t)
@@ -694,6 +698,8 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
         ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
     for sid, pts in by_sess.items():
         pts.sort()
+        nested = assign.get(sid, sid) != sid
+        marker, ms = ("^", 5) if nested else (".", 3)
         # Break the line wherever this session's ordinals are NOT
         # consecutive: a gap means another session's turns run there (the
         # parent is PAUSED while its `task` sub-agent runs). Drawing one
@@ -705,15 +711,15 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
         prev_i = None
         for i, h in pts:
             if prev_i is not None and i - prev_i > 1:
-                ax_top.plot(seg_x, seg_y, color="tab:blue", marker=".",
-                            ms=3, lw=0.8, zorder=2)
+                ax_top.plot(seg_x, seg_y, color="tab:blue", marker=marker,
+                            ms=ms, lw=0.8, zorder=2)
                 seg_x, seg_y = [], []
             seg_x.append(i)
             seg_y.append(h)
             prev_i = i
         if seg_x:
-            ax_top.plot(seg_x, seg_y, color="tab:blue", marker=".",
-                        ms=3, lw=0.8, zorder=2)
+            ax_top.plot(seg_x, seg_y, color="tab:blue", marker=marker,
+                        ms=ms, lw=0.8, zorder=2)
     ax_top.set_xlim(0, max(len(ordered) - 1, 1))
     ax_top.set_ylim(bottom=0)
     ax_top.set_xlabel("turn")
