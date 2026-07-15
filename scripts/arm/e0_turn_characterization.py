@@ -8,20 +8,20 @@ turn-to-turn, (b) identify which (previous tool, current tool) combos
 produce the SMALL-LLM turns that are CPU-offload candidates, and (c)
 establish the low-load baseline for prefix-cache hit vs GPU KV size.
 
-Four views (each -> CSV always, PDF when matplotlib is present):
+Views (each figure -> PDF when matplotlib is present; CSVs always):
 
 1. fig1_turn_llm_time      per-turn LLM time (llm.end duration_s) as FIXED-
-                           WIDTH thin bars on a TIME axis (x = s from run
-                           start, x starts at 0; width does NOT scale with
-                           LLM time), y clipped to --ymax (default 30s);
-                           red lines at TOP-LEVEL sample starts (>= --min-
-                           turns-boundary turns AND not nested inside another
-                           kept session's window, so `task` sub-agent
-                           sessions don't add lines).
-2. bottom_pct_tools.csv    for the bottom 10/20/30/40% of the LLM-time
-                           distribution (the fastest/smallest turns = CPU-
-                           offload candidates), the distribution and % of
-                           previous-tool and current-tool.
+                           WIDTH thin bars on a TURN-index axis (x = ordinal
+                           turn; width does NOT scale with LLM time), LOG y
+                           over the full range (no clip); red lines at TOP-
+                           LEVEL sample starts (>= --min-turns-boundary turns
+                           AND not nested inside another kept session's
+                           window, so `task` sub-agents don't add lines).
+2. fig2_llm_time_cdf       CDF of per-turn LLM time (log x) — the fast/small
+                           turns (CPU-offload candidates) and the long tail.
+   bottom_pct_tools.csv    for the bottom 10/20/30/40% of the LLM-time
+                           distribution, the distribution and % of previous-
+                           tool and current-tool.
 3. fig3_hit_vs_kv          shared time axis (x from 0) framed by the RUN
                            WINDOW (first..last turn): per-turn prefix-cache
                            hit (left y, PER-SESSION line segments) + GPU
@@ -342,27 +342,51 @@ def _mpl():
     return plt
 
 
-def fig_turn_llm_time(ordered: list, path: Path, *, ymax: float = 30.0,
+def fig_turn_llm_time(ordered: list, path: Path, *,
                       min_turns_boundary: int = 2) -> None:
     """Each turn as a THIN bar on a TURN-index axis (x = ordinal turn
-    number); height = LLM time on a LOG y-axis, clipped at `ymax`. Red
-    lines mark top-level SAMPLE starts (turn granularity)."""
+    number); height = LLM time on a LOG y-axis (full range, no clip).
+    Red lines mark top-level SAMPLE starts (turn granularity)."""
     plt = _mpl()
     heights = []
     for t in ordered:
         wall = t.llm_wall_s if t.llm_wall_s is not None else 0.0
-        heights.append(min(wall, ymax) if wall > 0 else float("nan"))
+        heights.append(wall if wall > 0 else float("nan"))
     xs = list(range(len(heights)))
-    fig, ax = plt.subplots(figsize=(10, 3.5))
+    pos = [h for h in heights if h == h and h > 0]
+    fig, ax = plt.subplots(figsize=(18, 5))
     ax.set_yscale("log")
     ax.vlines(xs, 1e-3, heights, color="tab:blue", linewidth=0.7)
     for b in sample_start_ordinals(ordered, min_turns_boundary):
         ax.axvline(b, color="crimson", linewidth=0.6, alpha=0.7)
     ax.set_xlim(0, max(len(xs) - 1, 1))
-    ax.set_ylim(1e-2, ymax)
+    if pos:
+        ax.set_ylim(min(pos) * 0.8, max(pos) * 1.2)
     ax.set_xlabel("turn")
     ax.set_ylabel("LLM time / turn (s)")
-    ax.set_title(f"Per-turn LLM Time (clipped at {ymax:g}s) vs turn")
+    ax.set_title("Per-turn LLM Time vs turn")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_llm_time_cdf(turns: list, path: Path) -> None:
+    """CDF of per-turn LLM time — the distribution behind fig1's bars, on
+    a log x-axis so the small/fast turns (CPU-offload candidates) and the
+    long tail are both legible."""
+    plt = _mpl()
+    vals = sorted(t.llm_wall_s for t in turns
+                  if t.llm_wall_s is not None and t.llm_wall_s > 0)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    if vals:
+        n = len(vals)
+        ys = [(i + 1) / n for i in range(n)]
+        ax.step(vals, ys, where="post", color="tab:blue")
+        ax.set_xscale("log")
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("LLM time / turn (s)")
+    ax.set_ylabel("cumulative fraction of turns")
+    ax.set_title("Per-turn LLM Time CDF")
+    ax.grid(True, which="both", alpha=0.3)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -394,26 +418,23 @@ def fig_hit_vs_kv(hits: list[tuple[float, float, str]],
     t0 = min(origins) if origins else 0.0
     x_right = 0.0
 
-    fig, ax = plt.subplots(figsize=(9, 3.5))
+    fig, ax = plt.subplots(figsize=(18, 6))
+    # sample_times are ABSOLUTE; subtract this axis's own t0 so they line
+    # up with the hit points (which are on the same absolute clock).
+    for b in (sample_times or []):
+        ax.axvline(b - t0, color="crimson", linewidth=1.0, alpha=0.85,
+                   zorder=1)
     # group kept hits by session, draw each as its own line segment
     by_sess: dict[str, list[tuple[float, float]]] = {}
     for ts, h, sid in kept:
         by_sess.setdefault(sid, []).append((ts, h))
-    first_label = True
     for sid, pts in by_sess.items():
         pts.sort()
         xs = [ts - t0 for ts, _ in pts]
         ys = [h for _, h in pts]
-        ax.plot(xs, ys, color="tab:blue", marker=".", ms=3, lw=0.8,
-                label="prefix hit" if first_label else None)
-        first_label = False
+        ax.plot(xs, ys, color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
         if xs:
             x_right = max(x_right, xs[-1])
-    # sample_times are ABSOLUTE; subtract this axis's own t0 so they line
-    # up with the hit points (which are on the same absolute clock).
-    for b in (sample_times or []):
-        ax.axvline(b - t0, color="crimson", linewidth=0.6, alpha=0.7)
-    ax.legend(fontsize=7, loc="upper left", framealpha=0.7)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("prefix-cache hit ratio", color="tab:blue")
     ax.set_ylim(0, 1)
@@ -487,9 +508,6 @@ def main(argv: list[str] | None = None) -> int:
                     help="bottom-percentile cutoffs (comma list of %); the "
                          "fastest/smallest-LLM-time turns = CPU-offload "
                          "candidates. Default bottom 10,20,30,40%")
-    ap.add_argument("--ymax", type=float, default=30.0,
-                    help="fig1 y-axis (LLM time) clip in seconds; drops the "
-                         "long tail. Default 30.")
     ap.add_argument("--min-turns-boundary", type=int, default=2,
                     help="fig1/fig3: only sessions with >= this many turns get "
                          "a sample-boundary line (filters single-turn title / "
@@ -562,7 +580,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_figures:
         try:
             fig_turn_llm_time(ordered, out_dir / "fig1_turn_llm_time.pdf",
-                              ymax=args.ymax, min_turns_boundary=min_boundary)
+                              min_turns_boundary=min_boundary)
+            fig_llm_time_cdf(turns, out_dir / "fig2_llm_time_cdf.pdf")
             fig_hit_vs_kv(hits, kv, out_dir / "fig3_hit_vs_kv.pdf",
                           min_turns=min_boundary, sample_times=samples_abs)
             fig_gap_vs_hit(cats, out_dir / "fig4_gap_vs_hit.pdf")
