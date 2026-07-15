@@ -28,9 +28,15 @@ Views (each figure -> PDF when matplotlib is present; CSVs always):
                            KV-cache usage (right y, trimmed to the window so
                            an early-started scraper can't shift the origin);
                            red lines at sample starts (as in fig1).
+   fig3-1_worker_hit_kv    (with --worker-log) hit rate + KV usage parsed
+                           STRAIGHT from the vLLM worker log's engine-stats
+                           line — both off one clock, no alignment needed.
 4. fig4_gap_vs_hit         turn gap (llm.start(N) - llm.end(N-1)) vs prefix-
                            cache hit ratio, points COLORED by the previous
                            turn's tool (also gap_hit.csv).
+   zero_turns.csv          turns whose llm.end duration_s is ~0 (buffered-
+                           tool-call steps; see near_zero_turns) — proof
+                           they still generated output_tokens.
 
 Turn data is loaded via the sibling scripts/analyze_turn_scheduling.py
 (TurnRec: llm_wall_s, llm_start_ts/llm_end_ts, prev_tools, tool_names,
@@ -51,6 +57,7 @@ import csv
 import importlib.util
 import json
 import math
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -66,6 +73,59 @@ def _load_ats():
     sys.modules["analyze_turn_scheduling"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def near_zero_turns(profiles_dir: Path, keep_ids: set[str] | None,
+                    threshold_s: float = 0.01) -> list[dict]:
+    """Characterize turns whose llm.end duration_s is ~0 (<= threshold).
+
+    WHY these exist: the profiler's `duration_s` is
+    (AI-SDK `finish` ts | first tool.start | last text-end) - `start-step`.
+    For a BUFFERED tool-call step the AI SDK fires `start-step` only AFTER
+    it has already parsed the tool call out of a stream that finished
+    earlier, so `finish - start-step` collapses to ~0 even though the model
+    really did generate output_tokens. (The patch documents this and added
+    turn.end's wall-clock-anchored `llm_wall_true_s` precisely because
+    `duration_s` under-measures here — see opencode-profile.patch:99-101.)
+    step_duration_s (finish-step - start-step) is a saner per-step wall.
+
+    This dumps each near-zero turn's finish reason, output_tokens (proof the
+    step DID generate), duration_s vs step_duration_s, and tools, so the
+    '0.0001s turns' can be confirmed as buffered-tool-call steps rather than
+    dropped blindly."""
+    rows: list[dict] = []
+    for f in sorted(profiles_dir.glob("*.jsonl")):
+        sid = f.stem
+        if keep_ids is not None and sid not in keep_ids:
+            continue
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("ev") != "llm.end":
+                continue
+            dur = ev.get("duration_s")
+            if dur is None or dur > threshold_s:
+                continue
+            tokens = ev.get("tokens") or {}
+            out = tokens.get("output")
+            if out is None:
+                out = tokens.get("completion_tokens")
+            rows.append({
+                "session_id": sid,
+                "step": ev.get("step"),
+                "duration_s": dur,
+                "step_duration_s": ev.get("step_duration_s"),
+                "post_stream_overhead_s": ev.get("post_stream_overhead_s"),
+                "finish": ev.get("finish"),
+                "output_tokens": out,
+                "request_id": ev.get("request_id"),
+            })
+    return rows
 
 
 def trace_session_ids(trace_path: Path) -> set[str]:
@@ -270,6 +330,65 @@ def kv_usage_series(metrics_path: Path,
     return sorted(out)
 
 
+_WORKER_STATS_RE = re.compile(
+    r"GPU KV cache usage:\s*(?P<kv>[0-9.]+)\s*%"
+    r".*?Prefix cache hit rate:\s*(?P<hit>[0-9.]+)\s*%")
+# leading log timestamp: "MM-DD HH:MM:SS" (vLLM/dynamo default) or ISO / bare
+# "HH:MM:SS". Year is usually absent, so we work in seconds-of-day and undo
+# midnight wraparound to get a monotonic relative time.
+_WORKER_TS_RE = re.compile(
+    r"(?:(?P<md>\d{2}-\d{2})[ T])?(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})"
+    r"(?:[.,](?P<frac>\d+))?")
+
+
+def _worker_line_seconds(line: str) -> float | None:
+    """Seconds-of-day (float, with fractional if present) from a worker log
+    line's leading timestamp, or None if no timestamp is found."""
+    m = _WORKER_TS_RE.search(line[:40])
+    if not m:
+        return None
+    sec = int(m.group("h")) * 3600 + int(m.group("m")) * 60 + int(m.group("s"))
+    if m.group("frac"):
+        sec += float("0." + m.group("frac"))
+    return float(sec)
+
+
+def worker_log_series(log_path: Path,
+                      ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Parse a vLLM/dynamo worker log (e.g. logs/vllm-a0.log) for the
+    periodic engine stats line and return (hit_series, kv_series), each a
+    list of (rel_seconds_from_first_stat, value_fraction).
+
+    vLLM's LoggingStatLogger prints one line per interval carrying BOTH
+    'GPU KV cache usage: X%' and 'Prefix cache hit rate: Y%'. Reading them
+    from the SAME log (same clock) means the two curves need no cross-
+    source alignment. Percentages are converted to 0-1 fractions. Times
+    are seconds-of-day made monotonic across a midnight rollover."""
+    raw: list[tuple[float, float, float]] = []
+    prev = None
+    day = 0.0
+    with log_path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            sm = _WORKER_STATS_RE.search(line)
+            if not sm:
+                continue
+            secs = _worker_line_seconds(line)
+            if secs is None:
+                continue
+            if prev is not None and secs < prev:   # crossed midnight
+                day += 86400.0
+            prev = secs
+            raw.append((secs + day,
+                        float(sm.group("hit")) / 100.0,
+                        float(sm.group("kv")) / 100.0))
+    if not raw:
+        return [], []
+    t0 = raw[0][0]
+    hits = [(t - t0, h) for t, h, _kv in raw]
+    kv = [(t - t0, k) for t, _h, k in raw]
+    return hits, kv
+
+
 def trim_to_window(series: list[tuple[float, float]], lo: float, hi: float,
                    margin_s: float = 5.0) -> list[tuple[float, float]]:
     """Keep only points within [lo - margin, hi + margin] — used to cut a
@@ -452,6 +571,36 @@ def fig_hit_vs_kv(hits: list[tuple[float, float, str]],
     plt.close(fig)
 
 
+def fig_worker_hit_kv(hits: list[tuple[float, float]],
+                      kv: list[tuple[float, float]], path: Path) -> None:
+    """fig3-1: prefix-cache hit rate (left y) and GPU KV-cache usage
+    (right y) parsed DIRECTLY from the vLLM worker log's periodic stats
+    line. Both come from the same log/clock, so they share the x-axis
+    (seconds from the first stats line) with no cross-source alignment."""
+    plt = _mpl()
+    fig, ax = plt.subplots(figsize=(18, 6))
+    x_right = 0.0
+    if hits:
+        hx = [t for t, _ in hits]
+        ax.plot(hx, [v for _, v in hits], color="tab:blue", lw=1.0,
+                marker=".", ms=3)
+        x_right = max(x_right, hx[-1])
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("prefix-cache hit rate", color="tab:blue")
+    ax.set_ylim(0, 1)
+    if kv:
+        ax2 = ax.twinx()
+        kx = [t for t, _ in kv]
+        ax2.plot(kx, [v for _, v in kv], color="tab:orange", lw=1.0)
+        ax2.set_ylabel("GPU KV-cache usage", color="tab:orange")
+        ax2.set_ylim(0, 1)
+        x_right = max(x_right, kx[-1])
+    ax.set_xlim(0, x_right if x_right > 0 else 1)
+    ax.set_title("KV Cache Status vs time (from worker log)")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def fig_gap_vs_hit(cats: list[tuple[float, float, str, str, int]],
                    path: Path) -> None:
     """Scatter of turn gap vs hit, COLORED by the previous turn's tool so
@@ -494,11 +643,43 @@ def _print_bottom(rows: list[dict]) -> None:
             print(f"  {side}_tool: {top}")
 
 
+def _print_zero_turns(rows: list[dict], thr: float, total: int) -> None:
+    print(f"\nnear-zero LLM turns (duration_s <= {thr:g}s): "
+          f"{len(rows)}/{total}")
+    if not rows:
+        return
+    with_out = sum(1 for r in rows
+                   if isinstance(r["output_tokens"], (int, float))
+                   and r["output_tokens"] > 0)
+    fins = Counter(str(r["finish"]) for r in rows)
+    step_durs = [r["step_duration_s"] for r in rows
+                 if isinstance(r["step_duration_s"], (int, float))]
+    print(f"  {with_out}/{len(rows)} DID generate output_tokens>0 -> these are "
+          "NOT idle turns; duration_s collapsed because start-step fired after "
+          "the tool call was already buffered (see zero_turns.csv).")
+    print("  finish reasons: "
+          + ", ".join(f"{k} {v}" for k, v in fins.most_common()))
+    if step_durs:
+        step_durs.sort()
+        med = step_durs[len(step_durs) // 2]
+        print(f"  step_duration_s (finish-step - start-step) of the same turns: "
+              f"median {med:.3f}s, max {max(step_durs):.3f}s "
+              "-> the real per-step wall is here, not in duration_s.")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--profiles", required=True, type=Path)
     ap.add_argument("--metrics", type=Path, default=None,
                     help="vLLM scrape NDJSON for the KV-usage right axis")
+    ap.add_argument("--worker-log", type=Path, default=None,
+                    help="vLLM/dynamo worker log (e.g. logs/vllm-a0.log); "
+                         "fig3-1 plots hit rate + KV usage parsed straight "
+                         "from its periodic engine-stats line")
+    ap.add_argument("--zero-threshold-s", type=float, default=0.01,
+                    help="turns with llm.end duration_s <= this are dumped to "
+                         "zero_turns.csv (the buffered-tool-call steps whose "
+                         "duration_s collapses to ~0). Default 0.01.")
     ap.add_argument("--trace", type=Path, default=None,
                     help="run's trace.jsonl; when given, only turns from its "
                          "session_ids (the MAIN per-sample sessions) are "
@@ -570,10 +751,21 @@ def main(argv: list[str] | None = None) -> int:
         for g, h, c, sid, step in cats:
             w.writerow([sid, step, g, h, c])
 
+    # near-zero-duration turn diagnostic (buffered-tool-call steps)
+    keep_ids = {t.session_id for t in turns}
+    zrows = near_zero_turns(args.profiles, keep_ids, args.zero_threshold_s)
+    with (out_dir / "zero_turns.csv").open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=[
+            "session_id", "step", "duration_s", "step_duration_s",
+            "post_stream_overhead_s", "finish", "output_tokens", "request_id"])
+        w.writeheader()
+        w.writerows(zrows)
+
     n_sessions = len({t.session_id for t in turns})
     print(f"turns: {len(turns)} across {n_sessions} sessions "
           f"({len(samples)} samples with >= {min_boundary} turns)")
     _print_bottom(bottom_rows)
+    _print_zero_turns(zrows, args.zero_threshold_s, len(turns))
     if args.metrics and not kv:
         print("warning: no KV-usage series parsed from --metrics", file=sys.stderr)
 
@@ -585,6 +777,14 @@ def main(argv: list[str] | None = None) -> int:
             fig_hit_vs_kv(hits, kv, out_dir / "fig3_hit_vs_kv.pdf",
                           min_turns=min_boundary, sample_times=samples_abs)
             fig_gap_vs_hit(cats, out_dir / "fig4_gap_vs_hit.pdf")
+            if args.worker_log and args.worker_log.exists():
+                wl_hits, wl_kv = worker_log_series(args.worker_log)
+                if wl_hits or wl_kv:
+                    fig_worker_hit_kv(wl_hits, wl_kv,
+                                      out_dir / "fig3-1_worker_hit_kv.pdf")
+                else:
+                    print("warning: no engine-stats lines parsed from "
+                          f"--worker-log {args.worker_log}", file=sys.stderr)
             print(f"\nwrote figures under {out_dir}")
         except ImportError:
             print("matplotlib not available; wrote CSVs only "

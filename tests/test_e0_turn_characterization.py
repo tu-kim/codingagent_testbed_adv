@@ -183,6 +183,50 @@ def test_trim_to_window(mod):
     assert mod.trim_to_window(series, 8.0, 20.0, margin_s=5.0) == [(10.0, 2.0)]
 
 
+def test_worker_log_series_parses_and_unwraps_midnight(mod, tmp_path):
+    p = tmp_path / "vllm-a0.log"
+    p.write_text(
+        "INFO 07-15 10:00:00 [loggers.py:1] Engine 000: GPU KV cache usage: "
+        "12.5%, Prefix cache hit rate: 88.0%\n"
+        "unrelated line with no stats\n"
+        "INFO 07-15 10:00:10 [loggers.py:1] GPU KV cache usage: 20.0%, "
+        "Prefix cache hit rate: 90.5%\n"
+        # crosses midnight: seconds-of-day drops, must add a day
+        "INFO 07-16 00:00:10 [loggers.py:1] GPU KV cache usage: 6.0%, "
+        "Prefix cache hit rate: 11.0%\n")
+    hits, kv = mod.worker_log_series(p)
+    # % -> fraction, x relative to first stat, midnight unwrapped
+    assert hits == [(0.0, 0.88), (10.0, 0.905),
+                    (pytest.approx(50410.0), 0.11)]
+    assert [round(v, 3) for _t, v in kv] == [0.125, 0.2, 0.06]
+
+
+def test_worker_log_series_empty_when_no_stats(mod, tmp_path):
+    p = tmp_path / "vllm-a0.log"
+    p.write_text("INFO nothing to see here\nanother line\n")
+    assert mod.worker_log_series(p) == ([], [])
+
+
+def test_near_zero_turns_flags_buffered_steps(mod, tmp_path):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    _write_profile(prof, "ses_main",
+                   [{"ev": "llm.end", "step": 1, "duration_s": 5.0,
+                     "step_duration_s": 5.1, "finish": "tool_calls",
+                     "tokens": {"output": 40}},
+                    {"ev": "llm.end", "step": 2, "duration_s": 0.0001,
+                     "step_duration_s": 0.3, "finish": "tool_calls",
+                     "tokens": {"output": 25}, "request_id": "abc"}])
+    # a helper session excluded by keep_ids
+    _write_profile(prof, "ses_title",
+                   [{"ev": "llm.end", "step": 1, "duration_s": 0.0,
+                     "tokens": {"output": 3}}])
+    rows = mod.near_zero_turns(prof, {"ses_main"}, 0.01)
+    assert len(rows) == 1
+    assert rows[0]["step"] == 2
+    assert rows[0]["output_tokens"] == 25          # generated despite ~0 dur
+    assert rows[0]["step_duration_s"] == 0.3
+
+
 def test_kv_usage_series(mod, tmp_path):
     p = tmp_path / "m.ndjson"
     p.write_text("\n".join(json.dumps(r) for r in [
