@@ -83,6 +83,19 @@ def test_llm_end_emits_post_stream_overhead(patch_text):
     assert "post_stream_overhead_s" in patch_text
 
 
+def test_llm_end_emits_request_id(patch_text):
+    """`llm.end` carries response_id + request_id (chatcmpl- prefix
+    stripped) — the exact join key to frontend/SCHED_DELAY logs used by
+    scripts/analyze_turn_scheduling.py."""
+    assert "response_id: info.responseId ?? null" in patch_text
+    assert 'startsWith("chatcmpl-")' in patch_text
+
+
+def test_processor_passes_response_id(patch_text):
+    """finish-step hook forwards the AI SDK response id into the profile."""
+    assert "responseId: (value as { response?: { id?: string } }).response?.id" in patch_text
+
+
 # ---------- processor.ts hooks ----------
 
 

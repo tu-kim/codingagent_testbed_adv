@@ -1,6 +1,6 @@
-From b36c1ef8b1045c5d47ca1a8aa87053e6fd689059 Mon Sep 17 00:00:00 2001
+From cb7ce1cee16eb3b9da8afe88148cff8b460147ae Mon Sep 17 00:00:00 2001
 From: tu-kim <taewoo89.kim@gmail.com>
-Date: Wed, 13 May 2026 22:42:06 +0900
+Date: Tue, 14 Jul 2026 21:22:10 +0900
 Subject: [PATCH] testbed: ENV-gated profile module with step-event
  decomposition
 
@@ -13,19 +13,23 @@ llm.duration_s captures pure LLM streaming time using first tool.start
 or last text-end of the step. llm.step_duration_s separately captures
 the whole AI SDK step bracket. turn.end emits post_overhead_s for the
 non-LLM/non-tool slice.
+
+llm.end additionally records response_id and request_id (dynamo's
+chatcmpl-<uuid> chunk id with prefix stripped) so profile turns join
+exactly to frontend/SCHED_DELAY logs by request_id.
 ---
- packages/opencode/src/profile/profile.ts   | 494 +++++++++++++++++++++
- packages/opencode/src/session/processor.ts |  13 +
- packages/opencode/src/session/prompt.ts    | 234 +++++++-----
- 3 files changed, 654 insertions(+), 87 deletions(-)
+ packages/opencode/src/profile/profile.ts   | 506 +++++++++++++++++++++
+ packages/opencode/src/session/processor.ts |  14 +
+ packages/opencode/src/session/prompt.ts    | 234 ++++++----
+ 3 files changed, 667 insertions(+), 87 deletions(-)
  create mode 100644 packages/opencode/src/profile/profile.ts
 
 diff --git a/packages/opencode/src/profile/profile.ts b/packages/opencode/src/profile/profile.ts
 new file mode 100644
-index 000000000..381a2818f
+index 000000000..ff3d1f94a
 --- /dev/null
 +++ b/packages/opencode/src/profile/profile.ts
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,506 @@
 +// Lightweight, ENV-gated profiling for the agent loop.
 +//
 +// Turn it on with `OPENCODE_PROFILE=1`. When unset/0/false every Profile.*
@@ -42,7 +46,9 @@ index 000000000..381a2818f
 +//   query.start  {ts, sessionID, directory}
 +//   turn.start   {ts, sessionID, step, model, system, messages}
 +//   llm.start    {ts, sessionID, step}
-+//   llm.end      {ts, sessionID, step, finish, duration_s, step_duration_s, tokens}
++//   llm.end      {ts, sessionID, step, finish, duration_s, step_duration_s, tokens,
++//                 response_id, request_id}  # request_id = dynamo Context UUID
++//                 (chatcmpl- prefix stripped); null on non-dynamo providers.
 +//   tool.start   {ts, sessionID, step, callID, name, kind, args_head}
 +//   tool.end     {ts, sessionID, step, callID, name, ok, duration_s, [output_chars | error]}
 +//   turn.end     {ts, sessionID, step, duration_s, llm_wall_s, tool_wall_s, post_overhead_s}
@@ -418,7 +424,7 @@ index 000000000..381a2818f
 +    },
 +    end(
 +      sessionID: string,
-+      info: { finish?: string; tokens: unknown; providerMetadata?: unknown },
++      info: { finish?: string; tokens: unknown; providerMetadata?: unknown; responseId?: string },
 +    ): void {
 +      if (!envEnabled) return
 +      const s = sessions.get(sessionID)
@@ -457,6 +463,16 @@ index 000000000..381a2818f
 +        step_duration_s: roundSec(stepMs),
 +        post_stream_overhead_s: postStreamMs != null ? roundSec(postStreamMs) : null,
 +        tokens: info.tokens,
++        // OpenAI response id from the AI SDK finish-step part. The Dynamo
++        // frontend sets every chunk's id to `chatcmpl-<request_id>` (see
++        // dynamo/lib/llm/src/protocols/openai/chat_completions/delta.rs),
++        // so stripping the prefix yields the SAME request_id that appears
++        // in frontend `request completed` and worker SCHED_DELAY lines —
++        // the exact join key for per-turn scheduling-delay analysis.
++        response_id: info.responseId ?? null,
++        request_id: info.responseId?.startsWith("chatcmpl-")
++          ? info.responseId.slice("chatcmpl-".length)
++          : null,
 +        dynamo: extractDynamoTiming(info.providerMetadata),
 +      })
 +    },
@@ -521,7 +537,7 @@ index 000000000..381a2818f
 +  },
 +}
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index f22da9292..373b7381c 100644
+index f22da9292..465f367c3 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
 @@ -24,6 +24,7 @@ import { EventV2 } from "@/v2/event"
@@ -540,7 +556,7 @@ index f22da9292..373b7381c 100644
              if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
              if (!ctx.assistantMessage.summary) {
                // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-@@ -457,6 +459,11 @@ export const layer: Layer.Layer<
+@@ -457,6 +459,12 @@ export const layer: Layer.Layer<
                usage: value.usage,
                metadata: value.providerMetadata,
              })
@@ -548,11 +564,12 @@ index f22da9292..373b7381c 100644
 +              finish: value.finishReason,
 +              tokens: usage.tokens,
 +              providerMetadata: value.providerMetadata,
++              responseId: (value as { response?: { id?: string } }).response?.id,
 +            })
              if (!ctx.assistantMessage.summary) {
                // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                EventV2.run(SessionEvent.Step.Ended.Sync, {
-@@ -545,6 +552,7 @@ export const layer: Layer.Layer<
+@@ -545,6 +553,7 @@ export const layer: Layer.Layer<
              return
  
            case "text-end":
@@ -560,7 +577,7 @@ index f22da9292..373b7381c 100644
              if (!ctx.currentText) return
              // oxlint-disable-next-line no-self-assign -- reactivity trigger
              ctx.currentText.text = ctx.currentText.text
-@@ -575,6 +583,11 @@ export const layer: Layer.Layer<
+@@ -575,6 +584,11 @@ export const layer: Layer.Layer<
              return
  
            case "finish":
@@ -872,3 +889,6 @@ index fef8c4383..01415fd7c 100644
          yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
          return yield* lastAssistant(sessionID)
        },
+-- 
+2.50.1 (Apple Git-155)
+
