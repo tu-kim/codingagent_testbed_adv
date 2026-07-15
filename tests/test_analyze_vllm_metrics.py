@@ -502,3 +502,90 @@ def test_main_histogram_end_to_end(mod, tmp_path):
     # p90 lands exactly at upper bound of bucket (1.0, cum=90) -> 1.0
     assert float(h_row["p90"]) == pytest.approx(1.0)
     assert float(h_row["delta"]) == pytest.approx(100.0)
+
+
+# ---------- window trimming (--trim-margin-s / --trim-head-s / --trim-tail-s) ----------
+
+
+def _kv_rows(ts_vals):
+    """One agg worker, kv_cache_usage gauge = 0 on the first/last two ticks
+    (idle warmup/cooldown), 0.8 in the middle."""
+    n = len(ts_vals)
+    out = []
+    for i, ts in enumerate(ts_vals):
+        val = 0.0 if (i < 2 or i >= n - 2) else 0.8
+        out.append(_scrape_row(float(ts), "a0", "agg",
+                               {"vllm:kv_cache_usage_perc": _g(val)}))
+    return out
+
+
+def test_main_trim_margin_drops_edge_ticks(mod, tmp_path, capsys):
+    p = tmp_path / "m.ndjson"
+    _write_ndjson(p, _kv_rows(range(100, 111)))   # 11 ticks 100..110
+    out = tmp_path / "o"
+    rc = mod.main(["--metrics", str(p), "--output", str(out), "--trim-margin-s", "2"])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "7 scrape rows across 6.00s" in captured
+    assert "trimmed head=2.0s tail=2.0s" in captured
+    # only the busy 0.8 ticks survive -> mean is 0.8, not diluted by idles
+    row = next(r for r in csv.DictReader((out / "vllm_metrics_stats.csv")
+                                         .read_text().splitlines())
+               if r["metric"] == "vllm:kv_cache_usage_perc" and r["worker"] == "a0")
+    assert float(row["mean"]) == pytest.approx(0.8)
+
+
+def test_main_trim_per_side_overrides_margin(mod, tmp_path, capsys):
+    p = tmp_path / "m.ndjson"
+    _write_ndjson(p, _kv_rows(range(100, 111)))
+    out = tmp_path / "o"
+    rc = mod.main(["--metrics", str(p), "--output", str(out),
+                   "--trim-margin-s", "2", "--trim-head-s", "3", "--trim-tail-s", "1"])
+    assert rc == 0
+    assert "trimmed head=3.0s tail=1.0s" in capsys.readouterr().out
+
+
+def test_main_trim_no_op_when_zero(mod, tmp_path, capsys):
+    p = tmp_path / "m.ndjson"
+    _write_ndjson(p, _kv_rows(range(100, 106)))
+    out = tmp_path / "o"
+    rc = mod.main(["--metrics", str(p), "--output", str(out)])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "6 scrape rows" in captured
+    assert "trimmed" not in captured
+
+
+def test_main_over_trim_returns_1(mod, tmp_path, capsys):
+    p = tmp_path / "m.ndjson"
+    _write_ndjson(p, _kv_rows(range(100, 111)))
+    out = tmp_path / "o"
+    rc = mod.main(["--metrics", str(p), "--output", str(out), "--trim-margin-s", "20"])
+    assert rc == 1
+    assert "exceeds" in capsys.readouterr().err
+
+
+def test_main_negative_trim_returns_2(mod, tmp_path, capsys):
+    p = tmp_path / "m.ndjson"
+    _write_ndjson(p, _kv_rows(range(100, 106)))
+    out = tmp_path / "o"
+    rc = mod.main(["--metrics", str(p), "--output", str(out), "--trim-margin-s", "-1"])
+    assert rc == 2
+    assert "trim values must be >= 0" in capsys.readouterr().err
+
+
+def test_main_trim_session_window(mod, tmp_path, capsys):
+    # session window 100..110; trim 2s both -> 102..108
+    p = tmp_path / "m.ndjson"
+    _write_ndjson(p, _kv_rows(range(100, 111)))
+    profile = tmp_path / "ses.jsonl"
+    profile.write_text(
+        json.dumps({"ev": "query.start", "sessionID": "s1", "ts": 100.0}) + "\n" +
+        json.dumps({"ev": "query.end", "sessionID": "s1", "ts": 110.0}) + "\n")
+    out = tmp_path / "o"
+    rc = mod.main(["--metrics", str(p), "--profile", str(profile),
+                   "--output", str(out), "--trim-margin-s", "2"])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "window=6.00s" in captured
+    assert "trimmed head=2.0s tail=2.0s" in captured

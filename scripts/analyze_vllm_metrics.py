@@ -46,6 +46,11 @@ Usage:
       --metrics logs/vllm_metrics.ndjson \\
       --output results/run1/global_vllm
 
+Window trimming (both modes): after the window is derived, --trim-margin-s
+cuts N seconds off BOTH ends before selecting rows (drops worker warmup /
+cooldown edge ticks — the scraper is often started before the run and
+stopped after it). --trim-head-s / --trim-tail-s override per side.
+
 Outputs:
   vllm_metrics_stats.csv   per (worker, role, metric, labels) stats
   stdout                   pretty table
@@ -608,7 +613,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--session-id", default=None,
                     help="When the profile has multiple sessions, select which "
                          "one. Defaults to the first session in the file.")
+    ap.add_argument("--trim-margin-s", type=float, default=0.0, metavar="SECONDS",
+                    help="After the window is derived (all-points min/max ts or "
+                         "the session query.start→end), cut this many seconds off "
+                         "BOTH ends before selecting scrape rows. Drops "
+                         "worker-warmup / cooldown edge effects. Default 0.")
+    ap.add_argument("--trim-head-s", type=float, default=None, metavar="SECONDS",
+                    help="Per-side head trim; overrides --trim-margin-s for the "
+                         "window START (leading warmup).")
+    ap.add_argument("--trim-tail-s", type=float, default=None, metavar="SECONDS",
+                    help="Per-side tail trim; overrides --trim-margin-s for the "
+                         "window END (trailing drain).")
     args = ap.parse_args(argv)
+
+    head = args.trim_head_s if args.trim_head_s is not None else args.trim_margin_s
+    tail = args.trim_tail_s if args.trim_tail_s is not None else args.trim_margin_s
+    if head < 0 or tail < 0:
+        print("trim values must be >= 0", file=sys.stderr)
+        return 2
 
     if not args.metrics.exists():
         print(f"input not found: {args.metrics}", file=sys.stderr)
@@ -618,16 +640,39 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args.output.mkdir(parents=True, exist_ok=True)
 
+    def _trim(win: tuple[float, float]) -> tuple[float, float] | None:
+        """Shrink [start, end] by head/tail; None if it collapses."""
+        s, e = win[0] + head, win[1] - tail
+        if s >= e:
+            return None
+        return (s, e)
+
     if args.profile is None:
-        rows_in = load_rows(args.metrics, float("-inf"), float("inf"))
-        if not rows_in:
+        # First pass: derive the raw window from ALL ok ticks, then trim
+        # and re-select so warmup/cooldown ticks fall outside.
+        raw = load_rows(args.metrics, float("-inf"), float("inf"))
+        if not raw:
             print("no scrape rows found", file=sys.stderr)
             return 1
-        ts_values = [r["ts"] for r in rows_in]
-        window = (min(ts_values), max(ts_values))
+        ts_values = [r["ts"] for r in raw]
+        raw_window = (min(ts_values), max(ts_values))
+        if head or tail:
+            trimmed = _trim(raw_window)
+            if trimmed is None:
+                print(f"trim head={head}s + tail={tail}s exceeds the "
+                      f"{raw_window[1] - raw_window[0]:.2f}s window", file=sys.stderr)
+                return 1
+            window = trimmed
+            rows_in = [r for r in raw if window[0] <= r["ts"] <= window[1]]
+        else:
+            window, rows_in = raw_window, raw
+        if not rows_in:
+            print("no scrape rows left after trim", file=sys.stderr)
+            return 1
         session_id = "ALL_POINTS"
         print(f"all-points mode: {len(rows_in)} scrape rows across "
-              f"{window[1] - window[0]:.2f}s")
+              f"{window[1] - window[0]:.2f}s"
+              + (f" (trimmed head={head}s tail={tail}s)" if head or tail else ""))
     else:
         windows = load_session_windows(args.profile)
         if not windows:
@@ -645,10 +690,21 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"profile has {len(windows)} sessions; picking "
                       f"{session_id!r}. Pass --session-id to choose another.",
                       file=sys.stderr)
-        window = windows[session_id]
+        raw_window = windows[session_id]
+        if head or tail:
+            trimmed = _trim(raw_window)
+            if trimmed is None:
+                print(f"trim head={head}s + tail={tail}s exceeds the "
+                      f"{raw_window[1] - raw_window[0]:.2f}s session window",
+                      file=sys.stderr)
+                return 1
+            window = trimmed
+        else:
+            window = raw_window
         rows_in = load_rows(args.metrics, *window)
         print(f"window={window[1] - window[0]:.2f}s  matched "
-              f"{len(rows_in)} scrape rows")
+              f"{len(rows_in)} scrape rows"
+              + (f" (trimmed head={head}s tail={tail}s)" if head or tail else ""))
         if not rows_in:
             print("no scrape rows inside the window; was the scraper running?",
                   file=sys.stderr)
