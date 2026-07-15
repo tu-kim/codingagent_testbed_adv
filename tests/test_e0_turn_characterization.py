@@ -87,6 +87,8 @@ def test_sample_start_times_excludes_single_turn_sessions(mod):
     # even at min_turns=1, the titles start INSIDE A's window (top-level
     # filter) so still only A and B remain
     assert len(mod.sample_start_times(ordered, min_turns=1)) == 2
+    # ordinal positions for the turn-indexed fig1
+    assert mod.sample_start_ordinals(ordered, min_turns=2) == [0, 4]
 
 
 def test_t0_uses_first_start(mod):
@@ -174,23 +176,6 @@ def test_sample_start_times_drops_nested_subagent_sessions(mod):
         _T("B", 2, 12.0, 13.0, 1.0, [], []),
     ])
     assert mod.sample_start_times(ordered, min_turns=2) == [0.0, 10.0]
-
-
-def test_scrape_hit_series_windowed_deltas(mod, tmp_path):
-    p = tmp_path / "m.ndjson"
-    q = "vllm:prefix_cache_queries_total"
-    h = "vllm:prefix_cache_hits_total"
-    rows = [
-        {"ts": 1.0, "ok": True, "metrics": {q: [{"value": 100}], h: [{"value": 40}]}},
-        {"ts": 2.0, "ok": True, "metrics": {q: [{"value": 200}], h: [{"value": 120}]}},
-        {"ts": 3.0, "ok": True, "metrics": {q: [{"value": 200}], h: [{"value": 120}]}},  # idle
-        {"ts": 4.0, "ok": True, "metrics": {q: [{"value": 300}], h: [{"value": 130}]}},
-        {"ts": 5.0, "ok": False, "error": "x"},
-    ]
-    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-    s = mod.scrape_hit_series(p)
-    # (2.0, 80/100), idle tick skipped, (4.0, 10/100)
-    assert s == [(2.0, 0.8), (4.0, 0.1)]
 
 
 def test_trim_to_window(mod):
