@@ -71,6 +71,29 @@ def test_session_boundaries(mod):
     assert mod.session_boundaries(ordered) == [2]     # A→B at ordinal 2
 
 
+def test_sample_start_times_excludes_single_turn_sessions(mod):
+    # title1/title2 are single-turn helper sessions between two real samples;
+    # only the >=2-turn sessions become sample boundaries, at times rel to t0.
+    ordered = mod.order_turns([
+        _T("A", 1, 10.0, 15.0, 5.0, [], ["read"]),
+        _T("A", 2, 17.0, 17.5, 0.5, ["read"], []),
+        _T("title1", 1, 16.0, 16.2, 0.2, [], []),
+        _T("title2", 1, 16.3, 16.5, 0.2, [], []),
+        _T("B", 1, 30.0, 33.0, 3.0, [], ["grep"]),
+        _T("B", 2, 35.0, 35.4, 0.4, ["grep"], []),
+    ])
+    # t0 = 10.0 (A's first start); samples A@0.0 and B@20.0; titles excluded
+    assert mod.sample_start_times(ordered, min_turns=2) == [0.0, 20.0]
+    # min_turns=1 would include everything
+    assert len(mod.sample_start_times(ordered, min_turns=1)) == 4
+
+
+def test_t0_uses_first_start(mod):
+    ordered = [_T("A", 1, 5.0, 6.0, 1.0, [], []),
+               _T("B", 1, 8.0, 9.0, 1.0, [], [])]
+    assert mod._t0(ordered) == 5.0
+
+
 # ---------- bottom-percentile tool distribution ----------
 
 
@@ -113,18 +136,56 @@ def test_cur_key_and_none(mod):
 # ---------- series ----------
 
 
-def test_hit_series_sorted_and_filtered(mod):
+def test_hit_series_sorted_filtered_with_session(mod):
     turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], hit=0.75),
              _T("A", 1, 0, 5, 5.0, [], [], hit=None),   # no hit -> dropped
              _T("B", 1, 20, 23, 3.0, [], [], hit=0.0)]
     s = mod.hit_series(turns)
-    assert s == [(7.5, 0.75), (23.0, 0.0)]
+    assert s == [(7.5, 0.75, "A"), (23.0, 0.0, "B")]
 
 
 def test_gap_hit_pairs(mod):
     turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], gap=2.0, hit=0.75),
              _T("A", 1, 0, 5, 5.0, [], [], gap=None, hit=0.0)]  # no gap -> dropped
     assert mod.gap_hit_pairs(turns) == [(2.0, 0.75)]
+
+
+class _TE(_T):
+    """_T plus input_tokens/cache_read so effective_input resolves
+    (categorize_gap_hit needs it for compaction detection)."""
+    def __init__(self, *a, inp=0, cache=0, **kw):
+        super().__init__(*a, **kw)
+        self.input_tokens = inp
+        self.cache_read = cache
+
+    @property
+    def effective_input(self):
+        return self.input_tokens + self.cache_read
+
+
+def test_categorize_gap_hit_prev_tool(mod):
+    # step2 prev=read, step3 prev=bash — normal (no compaction), category=prev tool
+    turns = [
+        _TE("A", 1, 0, 5, 5.0, [], ["read"], gap=None, hit=0.0, inp=2000, cache=0),
+        _TE("A", 2, 7, 7.5, 0.5, ["read"], ["bash"], gap=2.0, hit=0.14, inp=3000, cache=500),
+        _TE("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit=0.89, inp=400, cache=3200),
+    ]
+    cats = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns)}
+    assert cats[2] == "read"       # prev tool of step2
+    assert cats[3] == "bash"
+
+
+def test_categorize_gap_hit_detects_compaction(mod):
+    # step3 effective_input (eff=3600) then step4 drops to 500 (< 0.6*3600) -> compaction?
+    turns = [
+        _TE("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit=0.89, inp=400, cache=3200),
+        _TE("A", 4, 15, 15.3, 0.3, ["read"], [], gap=5.6, hit=0.4, inp=300, cache=200),
+    ]
+    cats = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns, 0.6)}
+    assert cats[4] == "compaction?"
+    # with a lenient ratio the drop no longer qualifies
+    cats2 = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns, 0.05)}
+    assert cats2[4] == "read"
 
 
 def test_kv_usage_series(mod, tmp_path):
