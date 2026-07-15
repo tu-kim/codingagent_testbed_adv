@@ -669,9 +669,10 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
                   sample_times: list[float] | None = None) -> None:
     """Two stacked subplots:
       (top)    prefix-cache HIT TOKENS per turn (tokens.cache.read) on a
-               TURN-index x axis, one line per session (the top-level
-               sample and its nested `task` sub-agent are separate lines,
-               independent KV prefixes); red lines at sample-start ordinals.
+               TURN-index x axis, one line per session, BROKEN wherever a
+               session's ordinals are non-consecutive (the parent is paused
+               while its `task` sub-agent runs, so it draws no line across
+               that stretch); red lines at sample-start ordinals.
       (bottom) GPU KV-cache usage (%) on a TIME x axis (seconds from the
                run window start; the scrape series is TRIMMED to the run
                window so an early/late scraper can't shift the origin);
@@ -693,8 +694,26 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
         ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
     for sid, pts in by_sess.items():
         pts.sort()
-        ax_top.plot([i for i, _ in pts], [h for _, h in pts],
-                    color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
+        # Break the line wherever this session's ordinals are NOT
+        # consecutive: a gap means another session's turns run there (the
+        # parent is PAUSED while its `task` sub-agent runs). Drawing one
+        # connected line would span that gap and cross the sub-agent's
+        # line — the apparent "overlap". Split into contiguous runs so the
+        # paused stretch shows no line, matching the blocking semantics.
+        seg_x: list[int] = []
+        seg_y: list[float] = []
+        prev_i = None
+        for i, h in pts:
+            if prev_i is not None and i - prev_i > 1:
+                ax_top.plot(seg_x, seg_y, color="tab:blue", marker=".",
+                            ms=3, lw=0.8, zorder=2)
+                seg_x, seg_y = [], []
+            seg_x.append(i)
+            seg_y.append(h)
+            prev_i = i
+        if seg_x:
+            ax_top.plot(seg_x, seg_y, color="tab:blue", marker=".",
+                        ms=3, lw=0.8, zorder=2)
     ax_top.set_xlim(0, max(len(ordered) - 1, 1))
     ax_top.set_ylim(bottom=0)
     ax_top.set_xlabel("turn")
