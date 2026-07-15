@@ -557,7 +557,7 @@ def fig_turn_llm_time(ordered: list, path: Path, *,
         llm.append(lw if lw is not None and lw > 0 else float("nan"))
         tool.append(tw if tw is not None and tw > 0 else float("nan"))
         is_task = any(str(name) == "task" for name in t.tool_names)
-        tool_colors.append("tab:red" if is_task else "tab:green")
+        tool_colors.append("tab:orange" if is_task else "tab:green")
         if lw and tw and lw > 0 and tw > 0:
             r = math.log2(lw / tw)     # >0 LLM-bound, <0 tool-bound
             ratio.append(r)
@@ -588,8 +588,8 @@ def fig_turn_llm_time(ordered: list, path: Path, *,
         axes[1].set_ylim(min(tpos) * 0.8, max(tpos) * 1.2)
     axes[1].set_ylabel("tool exec time / turn (s)")
     axes[1].set_title("Per-turn Tool Execution Time vs turn "
-                      "(red = task sub-agent)")
-    axes[1].plot([], [], color="tab:red", label="task tool")
+                      "(orange = task sub-agent)")
+    axes[1].plot([], [], color="tab:orange", label="task tool")
     axes[1].plot([], [], color="tab:green", label="other tools")
     axes[1].legend(fontsize=8, loc="upper right", framealpha=0.7)
 
@@ -653,16 +653,23 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(18, 10))
 
     # ---- top: hit tokens vs turn ordinal, per-session segments ----
+    # Draw ONLY top-level sample sessions. A nested `task` sub-agent (or a
+    # title) session interleaves with its parent on the global ordinal
+    # axis, so plotting every session_id produced TWO overlapping lines in
+    # one turn range: the parent's rising line plus the nested session's
+    # fresh (low cache_read) line starting mid-way. Restricting to the
+    # sample set (same sessions that get boundary lines) removes it.
+    keep = set(sample_sessions(ordered, min_turns))
     by_sess: dict[str, list[tuple[int, float]]] = {}
     for i, t in enumerate(ordered):
+        if keep and t.session_id not in keep:
+            continue
         h = _hit_tokens(t)
         if h is not None:
             by_sess.setdefault(t.session_id, []).append((i, h))
     for b in (sample_ordinals or []):
         ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
     for sid, pts in by_sess.items():
-        if len(pts) < min_turns and len(by_sess) > 1:
-            continue
         ax_top.plot([i for i, _ in pts], [h for _, h in pts],
                     color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
     ax_top.set_xlim(0, max(len(ordered) - 1, 1))
