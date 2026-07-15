@@ -669,9 +669,10 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
                   sample_times: list[float] | None = None) -> None:
     """Two stacked subplots:
       (top)    prefix-cache HIT TOKENS per turn (tokens.cache.read) on a
-               TURN-index x axis, ONE line per sample (nested `task` sub-
-               agent turns merged onto their parent sample so the line is
-               continuous); red lines at sample-start ordinals.
+               TURN-index x axis, one line per session -- the top-level
+               sample (blue) and its nested `task` sub-agent (orange) are
+               drawn SEPARATELY (independent KV prefixes); red lines at
+               sample-start ordinals.
       (bottom) GPU KV-cache usage (%) on a TIME x axis (seconds from the
                run window start; the scrape series is TRIMMED to the run
                window so an early/late scraper can't shift the origin);
@@ -679,26 +680,36 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
     plt = _mpl()
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(18, 10))
 
-    # ---- top: hit tokens vs turn ordinal, one line per SAMPLE ----
-    # Group by the sample each session belongs to: a nested `task`
-    # sub-agent's turns are merged onto their parent sample's line (in
-    # ordinal order) rather than drawn as a separate overlapping line OR
-    # dropped (which broke the parent line when the sub-agent ran the
-    # middle stretch of turns). The dip where the sub-agent's fresh KV
-    # prefix begins is real (independent prefix chain), not an artifact.
+    # ---- top: hit tokens vs turn ordinal, ONE line per session ----
+    # Parent sample and its nested `task` sub-agent are drawn as SEPARATE
+    # lines (each session_id its own line, in ordinal order): blue for the
+    # top-level sample, orange for a nested sub-agent. They have
+    # independent KV prefixes, so keeping them separate is honest — a
+    # sub-agent's line starting low is its own fresh prefix, not a dip in
+    # the parent's.
     assign = sample_assignment(ordered, min_turns)
-    by_sample: dict[str, list[tuple[int, float]]] = {}
+    by_sess: dict[str, list[tuple[int, float]]] = {}
     for i, t in enumerate(ordered):
         h = _hit_tokens(t)
         if h is not None:
-            by_sample.setdefault(assign.get(t.session_id, t.session_id),
-                                 []).append((i, h))
+            by_sess.setdefault(t.session_id, []).append((i, h))
     for b in (sample_ordinals or []):
         ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
-    for sid, pts in by_sample.items():
+    drew_sample = drew_sub = False
+    for sid, pts in by_sess.items():
         pts.sort()
+        nested = assign.get(sid, sid) != sid
+        color = "tab:orange" if nested else "tab:blue"
+        label = None
+        if nested and not drew_sub:
+            label, drew_sub = "task sub-agent", True
+        elif not nested and not drew_sample:
+            label, drew_sample = "sample", True
         ax_top.plot([i for i, _ in pts], [h for _, h in pts],
-                    color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
+                    color=color, marker=".", ms=3, lw=0.8, zorder=2,
+                    label=label)
+    if drew_sub:
+        ax_top.legend(fontsize=8, loc="upper right", framealpha=0.7)
     ax_top.set_xlim(0, max(len(ordered) - 1, 1))
     ax_top.set_ylim(bottom=0)
     ax_top.set_xlabel("turn")

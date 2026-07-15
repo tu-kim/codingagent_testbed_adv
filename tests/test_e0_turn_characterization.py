@@ -175,9 +175,9 @@ def test_gap_reuse_pairs_drops_first_and_gapless(mod):
     assert mod.gap_reuse_pairs(turns) == []
 
 
-def test_sample_assignment_merges_nested_subagent_into_parent(mod):
+def test_sample_assignment_maps_nested_subagent_to_parent(mod):
     # M (main) spawns task subagent S in the middle of its window;
-    # S must map to M so fig3 draws one continuous line.
+    # S maps to M (!= S) so fig3 can color it as a nested sub-agent line.
     ordered = mod.order_turns([
         _T("M", 1, 0.0, 1.0, 1.0, [], ["task"]),
         _T("S", 1, 1.1, 1.3, 0.2, [], []),
