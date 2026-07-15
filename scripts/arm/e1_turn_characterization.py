@@ -73,6 +73,154 @@ def session_first_times_abs(ordered: list) -> list[float]:
     return sorted(first.values())
 
 
+# ---------- eviction evidence ----------
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return sxy / (sxx ** 0.5 * syy ** 0.5)
+
+
+def eviction_events(turns: list, compaction_drop_ratio: float = 0.6,
+                    min_shortfall: int = 128) -> list[dict]:
+    """Per-turn re-use shortfall, labeled eviction vs compaction.
+
+    For turn N with a resolvable previous turn N-1 in the SAME session:
+      prev_cached = effective_input(N-1) + output(N-1)   # KV that WAS cached
+      shortfall   = prev_cached - cache_read(N)           # what it failed to reuse
+    A shortfall means the session did NOT reuse KV it had produced. WHY:
+      * compaction — the prompt SHRANK (effective_input(N) < ratio *
+        effective_input(N-1)); opencode summarized the history.
+      * eviction   — the prompt did NOT shrink (still growing) yet the
+        middle KV was gone, so it had to be re-prefilled. This is the LRU
+        overwrite we want to prove; GPU-usage never hitting 100% does not
+        rule it out because freed-but-cached blocks aren't counted in usage.
+    `away_displaced_tokens` (KV other sessions allocated during this turn's
+    away window) is the displacement pressure that drives the eviction."""
+    by_key = {(t.session_id, t.step): t for t in turns}
+    out: list[dict] = []
+    for t in turns:
+        prev = by_key.get((t.session_id, t.step - 1))
+        if prev is None:
+            continue
+        pe = prev.effective_input
+        if pe is None:
+            continue
+        prev_cached = pe + (prev.output_tokens or 0)
+        if prev_cached <= 0:
+            continue
+        cr = t.cache_read or 0
+        shortfall = prev_cached - cr
+        ce = t.effective_input
+        compaction = (ce is not None and pe > 0
+                      and ce < compaction_drop_ratio * pe)
+        is_evict = (not compaction) and shortfall > min_shortfall
+        out.append({
+            "session_id": t.session_id,
+            "step": t.step,
+            "prev_cached": prev_cached,
+            "cache_read": cr,
+            "shortfall": shortfall,
+            "eff_prev": pe,
+            "eff_cur": ce,
+            "label": "compaction" if compaction
+                     else ("eviction" if is_evict else "ok"),
+            "away_s": t.away_s,
+            "displaced": t.away_displaced_tokens,
+        })
+    return out
+
+
+def fig_reuse_shortfall(events: list[dict], turns: list, path: Path,
+                        e0) -> None:
+    """Per session block (sessions in start order): prev_cached (what was
+    cached) vs cache_read (what was reused). The gap between them = KV the
+    session failed to reuse; eviction turns (prompt did not shrink) are
+    marked red, compaction turns (prompt shrank) grey. Shows the reuse
+    collapse happens WHILE the cached total keeps growing = eviction, not
+    compaction."""
+    plt = e0._mpl()
+    fig, ax = plt.subplots(figsize=(18, 6))
+    # session start order
+    starts: dict[str, float] = {}
+    for t in turns:
+        st = t.llm_start_ts if t.llm_start_ts is not None else t.llm_end_ts
+        if st is not None and t.session_id not in starts:
+            starts[t.session_id] = st
+    ev_by_sess: dict[str, list[dict]] = {}
+    for e in events:
+        ev_by_sess.setdefault(e["session_id"], []).append(e)
+    offset = 0
+    first = True
+    for sid in sorted(ev_by_sess, key=lambda s: starts.get(s, 0.0)):
+        evs = sorted(ev_by_sess[sid], key=lambda e: e["step"])
+        xs = [offset + j for j in range(len(evs))]
+        ax.axvline(offset, color="crimson", linewidth=0.4, alpha=0.5, zorder=1)
+        ax.plot(xs, [e["prev_cached"] for e in evs], color="tab:orange",
+                lw=0.8, marker=".", ms=2, zorder=2,
+                label="prev_cached (was cached)" if first else None)
+        ax.plot(xs, [e["cache_read"] for e in evs], color="tab:blue",
+                lw=0.8, marker=".", ms=2, zorder=2,
+                label="cache_read (reused)" if first else None)
+        # mark reuse collapses
+        for x, e in zip(xs, evs):
+            if e["label"] == "eviction":
+                ax.plot([x, x], [e["cache_read"], e["prev_cached"]],
+                        color="red", lw=0.8, alpha=0.6, zorder=3)
+            elif e["label"] == "compaction":
+                ax.plot([x, x], [e["cache_read"], e["prev_cached"]],
+                        color="grey", lw=0.8, alpha=0.5, zorder=3)
+        first = False
+        offset += len(evs)
+    ax.plot([], [], color="red", lw=1.0, label="eviction gap (prompt grew)")
+    ax.plot([], [], color="grey", lw=1.0, label="compaction gap (prompt shrank)")
+    ax.set_xlim(0, max(offset - 1, 1))
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("turn (sessions in start order, one block each)")
+    ax.set_ylabel("tokens")
+    ax.set_title("Cached-vs-reused per turn: gap = KV not reused "
+                 "(red = eviction, grey = compaction)")
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.7)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_eviction_vs_displacement(events: list[dict], path: Path, e0) -> None:
+    """Scatter: eviction shortfall (tokens the session had to re-prefill,
+    NON-compaction turns only) vs away_displaced_tokens (KV other sessions
+    allocated during this turn's away window). A positive correlation is
+    the causal evidence that the reuse collapse is LRU eviction driven by
+    concurrent traffic — not compaction, and not visible in GPU usage."""
+    plt = e0._mpl()
+    pts = [(e["displaced"], e["shortfall"]) for e in events
+           if e["label"] == "eviction"
+           and isinstance(e["displaced"], (int, float))]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    r = None
+    if pts:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        ax.scatter(xs, ys, s=16, alpha=0.6, color="tab:red")
+        r = _pearson(xs, ys)
+    ax.set_xlabel("away_displaced_tokens (other sessions' KV during the gap)")
+    ax.set_ylabel("eviction shortfall (re-prefilled tokens)")
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0)
+    rtxt = f"  (pearson r={r:.3f}, n={len(pts)})" if r is not None else ""
+    ax.set_title("Eviction shortfall vs displacement pressure" + rtxt)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ---------- concurrent-run figures ----------
 
 
@@ -221,6 +369,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="vLLM scrape NDJSON for the KV-usage panel")
     ap.add_argument("--worker-log", type=Path, default=None,
                     help="vLLM worker log for fig3-1")
+    ap.add_argument("--compaction-drop-ratio", type=float, default=0.6,
+                    help="fig5/6: a reuse shortfall is COMPACTION (not "
+                         "eviction) when effective_input(N) < ratio * "
+                         "effective_input(N-1). Default 0.6")
+    ap.add_argument("--min-shortfall", type=int, default=128,
+                    help="fig5/6: ignore reuse shortfalls <= this many "
+                         "tokens (block-granularity noise). Default 128")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -251,11 +406,28 @@ def main(argv: list[str] | None = None) -> int:
     sample_ords = session_first_ordinals(ordered)
     samples_abs = session_first_times_abs(ordered)
     reuse = e0.gap_reuse_pairs(turns)
+    events = eviction_events(turns, args.compaction_drop_ratio,
+                             args.min_shortfall)
     have_metrics = args.metrics is not None and args.metrics.exists()
     kv = e0.kv_usage_series(args.metrics) if have_metrics else []
 
     out_dir = args.out or (args.profiles / "e1")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # eviction evidence summary (this is the analysis the run is for)
+    n_ev = sum(1 for e in events if e["label"] == "eviction")
+    n_cp = sum(1 for e in events if e["label"] == "compaction")
+    ev_disp = [(e["displaced"], e["shortfall"]) for e in events
+               if e["label"] == "eviction"
+               and isinstance(e["displaced"], (int, float))]
+    print(f"reuse-shortfall turns: eviction {n_ev}, compaction {n_cp}, "
+          f"ok {len(events) - n_ev - n_cp} (of {len(events)})")
+    if ev_disp:
+        r = _pearson([p[0] for p in ev_disp], [p[1] for p in ev_disp])
+        tot = sum(p[1] for p in ev_disp)
+        print(f"eviction shortfall total {tot} tokens over {len(ev_disp)} "
+              f"turns; corr(shortfall, displaced) = "
+              f"{r:.3f}" if r is not None else "n/a")
 
     if not args.no_figures:
         try:
@@ -265,6 +437,10 @@ def main(argv: list[str] | None = None) -> int:
             fig_hit_vs_kv(e0, ordered, kv, out_dir / "fig3_hit_vs_kv.pdf",
                           sample_ords, samples_abs)
             e0.fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
+            fig_reuse_shortfall(events, turns,
+                                out_dir / "fig5_reuse_shortfall.pdf", e0)
+            fig_eviction_vs_displacement(
+                events, out_dir / "fig6_eviction_vs_displacement.pdf", e0)
             if args.worker_log and args.worker_log.exists():
                 wl_hits, wl_kv = e0.worker_log_series(args.worker_log)
                 if wl_hits or wl_kv:

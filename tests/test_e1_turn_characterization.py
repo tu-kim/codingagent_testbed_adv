@@ -73,6 +73,44 @@ def test_main_interleaved_sessions_no_figures(mod, tmp_path):
     assert not list(out.glob("*.csv"))
 
 
+class _TE:
+    def __init__(self, sid, step, inp, cache, out, away=None, disp=None):
+        self.session_id = sid
+        self.step = step
+        self.input_tokens = inp
+        self.cache_read = cache
+        self.output_tokens = out
+        self.away_s = away
+        self.away_displaced_tokens = disp
+        self.llm_start_ts = float(step)
+        self.llm_end_ts = float(step) + 0.5
+
+    @property
+    def effective_input(self):
+        return None if self.input_tokens is None else self.input_tokens + self.cache_read
+
+
+def test_eviction_events_discriminates_eviction_vs_compaction(mod):
+    # step1: prev_cached = 1000 + 100 = 1100
+    # step2: prompt GREW (eff 1600 > 1000) but cache_read 200 -> eviction
+    # step3: prompt SHRANK (eff 300 < 0.6*1600) -> compaction
+    turns = [_TE("A", 1, 1000, 0, 100),
+             _TE("A", 2, 1400, 200, 80, away=5.0, disp=4000),
+             _TE("A", 3, 300, 0, 50, away=2.0, disp=100)]
+    ev = {e["step"]: e for e in mod.eviction_events(turns)}
+    assert ev[2]["label"] == "eviction"
+    assert ev[2]["shortfall"] == 1100 - 200
+    assert ev[3]["label"] == "compaction"
+
+
+def test_eviction_events_min_shortfall_noise_is_ok(mod):
+    # a tiny shortfall (block granularity) is neither eviction nor compaction
+    turns = [_TE("A", 1, 1000, 0, 0),
+             _TE("A", 2, 1050, 950, 0)]     # prev_cached 1000, cr 950 -> short 50
+    ev = mod.eviction_events(turns, min_shortfall=128)
+    assert ev[0]["label"] == "ok"
+
+
 def test_main_missing_trace_returns_2(mod, tmp_path):
     prof = tmp_path / "profiles"; prof.mkdir()
     rc = mod.main(["--profiles", str(prof), "--trace", str(tmp_path / "no")])
