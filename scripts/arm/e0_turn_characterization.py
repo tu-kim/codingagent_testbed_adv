@@ -751,7 +751,7 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
     if kv:
         kx = [t - t0 for t, _ in kv]
         ax_bot.plot(kx, [v * 100.0 for _, v in kv], color="tab:green",
-                    lw=1.0, zorder=2)
+                    lw=0.5, zorder=2)
         x_right = kx[-1]
     if ts_all:
         x_right = max(x_right, hi - t0)
