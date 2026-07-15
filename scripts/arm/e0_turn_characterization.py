@@ -207,16 +207,12 @@ def session_boundaries(ordered: list) -> list[int]:
     return out
 
 
-def sample_sessions(ordered: list, min_turns: int = 1) -> list[str]:
-    """Ordered list of top-level SAMPLE session_ids.
-
-    Two filters combine:
-    1. >= min_turns turns. With `--trace` every remaining session already
-       IS a main sample, so pass min_turns=1 (don't drop 1-turn samples).
-       Without trace it defaults to 2 to shed single-turn helpers.
-    2. TOP-LEVEL only: a session whose first turn starts INSIDE another
-       kept session's [first_start, last_end) window is a nested helper
-       (`task` sub-agent spawned mid-sample) and is dropped."""
+def _sample_windows(ordered: list, min_turns: int = 1
+                    ) -> list[tuple[float, float, str]]:
+    """(first_start, last_end, session_id) for each TOP-LEVEL sample: a
+    >= min_turns session whose first turn does NOT start inside another
+    kept session's window. Nested `task` sub-agent sessions are excluded
+    here (they get merged into their parent by sample_assignment)."""
     if not ordered:
         return []
     counts: dict[str, int] = {}
@@ -232,15 +228,45 @@ def sample_sessions(ordered: list, min_turns: int = 1) -> list[str]:
             last_end[t.session_id] = max(last_end.get(t.session_id, en), en)
     cands = sorted((first[s], last_end.get(s, first[s]), s)
                    for s, c in counts.items() if c >= min_turns and s in first)
-    out: list[str] = []
+    out: list[tuple[float, float, str]] = []
     win_end = -math.inf
     for st, en, s in cands:
         if st < win_end:            # starts inside a kept session -> nested
             win_end = max(win_end, en)
             continue
-        out.append(s)
+        out.append((st, en, s))
         win_end = en
     return out
+
+
+def sample_sessions(ordered: list, min_turns: int = 1) -> list[str]:
+    """Ordered list of top-level SAMPLE session_ids (see _sample_windows)."""
+    return [s for _st, _en, s in _sample_windows(ordered, min_turns)]
+
+
+def sample_assignment(ordered: list, min_turns: int = 1) -> dict:
+    """Map EVERY session_id to the sample it belongs to: a nested `task`
+    sub-agent session (whose first turn falls inside a sample's window) is
+    assigned to that enclosing sample; a top-level session maps to itself.
+
+    This is what keeps a sample's fig3 line continuous: the sub-agent's
+    turns are part of the SAME sample's timeline, so they must be drawn on
+    the parent's line, not as a separate (overlapping) or dropped series."""
+    windows = _sample_windows(ordered, min_turns)
+    first: dict[str, float] = {}
+    for t in ordered:
+        st = t.llm_start_ts if t.llm_start_ts is not None else t.llm_end_ts
+        if st is not None and t.session_id not in first:
+            first[t.session_id] = st
+    mapping: dict[str, str] = {}
+    for sid, st in first.items():
+        assigned = sid
+        for ws, we, ss in windows:
+            if ws <= st <= we:
+                assigned = ss
+                break
+        mapping[sid] = assigned
+    return mapping
 
 
 def sample_start_times_abs(ordered: list, min_turns: int = 2) -> list[float]:
@@ -643,8 +669,9 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
                   sample_times: list[float] | None = None) -> None:
     """Two stacked subplots:
       (top)    prefix-cache HIT TOKENS per turn (tokens.cache.read) on a
-               TURN-index x axis, drawn PER SESSION so no segment crosses
-               a session boundary; red lines at sample-start ordinals.
+               TURN-index x axis, ONE line per sample (nested `task` sub-
+               agent turns merged onto their parent sample so the line is
+               continuous); red lines at sample-start ordinals.
       (bottom) GPU KV-cache usage (%) on a TIME x axis (seconds from the
                run window start; the scrape series is TRIMMED to the run
                window so an early/late scraper can't shift the origin);
@@ -652,24 +679,24 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
     plt = _mpl()
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(18, 10))
 
-    # ---- top: hit tokens vs turn ordinal, per-session segments ----
-    # Draw ONLY top-level sample sessions. A nested `task` sub-agent (or a
-    # title) session interleaves with its parent on the global ordinal
-    # axis, so plotting every session_id produced TWO overlapping lines in
-    # one turn range: the parent's rising line plus the nested session's
-    # fresh (low cache_read) line starting mid-way. Restricting to the
-    # sample set (same sessions that get boundary lines) removes it.
-    keep = set(sample_sessions(ordered, min_turns))
-    by_sess: dict[str, list[tuple[int, float]]] = {}
+    # ---- top: hit tokens vs turn ordinal, one line per SAMPLE ----
+    # Group by the sample each session belongs to: a nested `task`
+    # sub-agent's turns are merged onto their parent sample's line (in
+    # ordinal order) rather than drawn as a separate overlapping line OR
+    # dropped (which broke the parent line when the sub-agent ran the
+    # middle stretch of turns). The dip where the sub-agent's fresh KV
+    # prefix begins is real (independent prefix chain), not an artifact.
+    assign = sample_assignment(ordered, min_turns)
+    by_sample: dict[str, list[tuple[int, float]]] = {}
     for i, t in enumerate(ordered):
-        if keep and t.session_id not in keep:
-            continue
         h = _hit_tokens(t)
         if h is not None:
-            by_sess.setdefault(t.session_id, []).append((i, h))
+            by_sample.setdefault(assign.get(t.session_id, t.session_id),
+                                 []).append((i, h))
     for b in (sample_ordinals or []):
         ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
-    for sid, pts in by_sess.items():
+    for sid, pts in by_sample.items():
+        pts.sort()
         ax_top.plot([i for i, _ in pts], [h for _, h in pts],
                     color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
     ax_top.set_xlim(0, max(len(ordered) - 1, 1))
