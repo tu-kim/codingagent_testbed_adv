@@ -369,3 +369,64 @@ def test_run_scraper_records_error_when_worker_unreachable(mod, tmp_path):
     assert row["ok"] is False
     assert "ECONNREFUSED" in row["error"]
     assert "metrics" not in row
+
+
+# ---------- KVBM scrape targets ----------
+
+
+def _write_agg_kvbm_yaml(path, *, enabled=True, metrics_port_base=6880):
+    import yaml
+    yaml.dump({
+        "vllm": {
+            "system_port_base": 21000,
+            "agg_workers": [
+                {"name": "a0", "host": "127.0.0.1", "gpus": "0,1", "tp": 2, "pp": 1},
+                {"name": "a1", "host": "127.0.0.1", "gpus": "2,3", "tp": 2, "pp": 1},
+            ],
+            "kvbm": {"enabled": enabled, "cpu_cache_gb": 20,
+                     "metrics_port_base": metrics_port_base},
+        }
+    }, path.open("w"))
+
+
+def test_load_workers_adds_kvbm_targets_for_agg(mod, tmp_path):
+    pytest.importorskip("yaml")
+    p = tmp_path / "testbed.yaml"
+    _write_agg_kvbm_yaml(p)
+    workers = mod.load_workers(p)
+    assert workers == [
+        {"worker": "a0", "role": "agg",  "host": "127.0.0.1", "port": 21000},
+        {"worker": "a0", "role": "kvbm", "host": "127.0.0.1", "port": 6880},
+        {"worker": "a1", "role": "agg",  "host": "127.0.0.1", "port": 21001},
+        {"worker": "a1", "role": "kvbm", "host": "127.0.0.1", "port": 6881},
+    ]
+
+
+def test_load_workers_no_kvbm_targets_when_disabled(mod, tmp_path):
+    pytest.importorskip("yaml")
+    p = tmp_path / "testbed.yaml"
+    _write_agg_kvbm_yaml(p, enabled=False)
+    assert all(w["role"] != "kvbm" for w in mod.load_workers(p))
+
+
+def test_load_workers_no_kvbm_targets_when_port_disabled(mod, tmp_path):
+    pytest.importorskip("yaml")
+    p = tmp_path / "testbed.yaml"
+    _write_agg_kvbm_yaml(p, metrics_port_base=0)
+    assert all(w["role"] != "kvbm" for w in mod.load_workers(p))
+
+
+def test_kvbm_metric_names_cover_tier_signals(mod):
+    for name in ("kvbm_host_cache_hit_rate", "kvbm_disk_cache_hit_rate",
+                 "kvbm_offload_blocks_d2h", "kvbm_onboard_blocks_h2d",
+                 "kvbm_matched_tokens"):
+        assert name in mod.KVBM_METRIC_NAMES
+
+
+def test_kvbm_names_parse_through_own_allowlist(mod):
+    text = ("kvbm_host_cache_hit_rate 0.83\n"
+            "kvbm_offload_blocks_d2h 120\n"
+            "vllm:kv_cache_usage_perc 0.5\n")
+    parsed = mod.parse_prometheus(text, mod.KVBM_METRIC_NAMES)
+    assert "kvbm_host_cache_hit_rate" in parsed
+    assert "vllm:kv_cache_usage_perc" not in parsed

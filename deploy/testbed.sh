@@ -215,8 +215,17 @@ spawn_worker() {
   #     prefill (dynamo/components/src/dynamo/vllm/args.py:213-223), and
   #     passing NixlConnector without a transfer peer just stands up dead
   #     transfer machinery.
+  #   agg + vllm.kvbm.enabled: the ONE exception to "agg has no
+  #     kv-transfer-config" -- KVBM host/disk KV tiering is selected by
+  #     naming connector class DynamoConnector in that same flag
+  #     (kv_role=kv_both, module kvbm.vllm_integration.connector; exact
+  #     shape from dynamo/examples/backends/vllm/launch/agg_kvbm.sh).
+  #     This is the offload connector, not disagg transport. Tier sizes +
+  #     observability ride DYN_KVBM_* env vars (environment_names.rs).
+  #     config.py rejects kvbm.enabled on disagg topologies.
   local disagg_mode kv_role=""
   local -a kv_args=()
+  local -a kvbm_env=()
   if [[ "$role" == "prefill" ]]; then
     disagg_mode=prefill; kv_role=kv_producer
   elif [[ "$role" == "decode" ]]; then
@@ -231,6 +240,55 @@ spawn_worker() {
     local kv_connector
     kv_connector=$(cfg_get_env VLLM__KV_CONNECTOR '.vllm.kv_connector // "NixlConnector"')
     kv_args=(--kv-transfer-config "{\"kv_connector\":\"$kv_connector\",\"kv_role\":\"$kv_role\"}")
+  elif [[ "$(cfg_bool VLLM__KVBM__ENABLED '.vllm.kvbm.enabled // ""')" == "true" ]]; then
+    local kvbm_cpu_gb kvbm_disk_gb kvbm_metrics_base kvbm_pub_base kvbm_ack_base
+    kvbm_cpu_gb=$(cfg_get_env VLLM__KVBM__CPU_CACHE_GB '.vllm.kvbm.cpu_cache_gb // 0')
+    kvbm_disk_gb=$(cfg_get_env VLLM__KVBM__DISK_CACHE_GB '.vllm.kvbm.disk_cache_gb // 0')
+    kvbm_metrics_base=$(cfg_get_env VLLM__KVBM__METRICS_PORT_BASE '.vllm.kvbm.metrics_port_base // 6880')
+    kvbm_pub_base=$(cfg_get_env VLLM__KVBM__LEADER_ZMQ_PUB_PORT_BASE '.vllm.kvbm.leader_zmq_pub_port_base // 56001')
+    kvbm_ack_base=$(cfg_get_env VLLM__KVBM__LEADER_ZMQ_ACK_PORT_BASE '.vllm.kvbm.leader_zmq_ack_port_base // 56101')
+    # Numeric guards: these feed $((...)) / env values under set -u.
+    local v
+    for v in "cpu_cache_gb=$kvbm_cpu_gb" "disk_cache_gb=$kvbm_disk_gb"; do
+      if [[ ! "${v#*=}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "worker $name: vllm.kvbm.${v%%=*}=${v#*=} is not a number" >&2
+        return 2
+      fi
+    done
+    for v in "metrics_port_base=$kvbm_metrics_base" \
+             "leader_zmq_pub_port_base=$kvbm_pub_base" \
+             "leader_zmq_ack_port_base=$kvbm_ack_base"; do
+      if [[ ! "${v#*=}" =~ ^-?[0-9]+$ ]]; then
+        echo "worker $name: vllm.kvbm.${v%%=*}=${v#*=} is not an integer" >&2
+        return 2
+      fi
+    done
+    # config.py enforces cpu_cache_gb > 0; mirror it shell-side (testbed.sh
+    # reads the yaml directly) so a bad yaml fails here, not inside KVBM.
+    if ! awk -v x="$kvbm_cpu_gb" 'BEGIN { exit !(x > 0) }'; then
+      echo "worker $name: vllm.kvbm.enabled requires cpu_cache_gb > 0" >&2
+      return 2
+    fi
+    kv_args=(--kv-transfer-config '{"kv_connector":"DynamoConnector","kv_connector_module_path":"kvbm.vllm_integration.connector","kv_role":"kv_both"}')
+    kvbm_env=(
+      "DYN_KVBM_CPU_CACHE_GB=$kvbm_cpu_gb"
+      # Unique per co-located KVBM worker (rank offset) -- same collision
+      # class as NIXL side-channel ports.
+      "DYN_KVBM_LEADER_ZMQ_PUB_PORT=$((kvbm_pub_base + rank))"
+      "DYN_KVBM_LEADER_ZMQ_ACK_PORT=$((kvbm_ack_base + rank))"
+    )
+    # Disk tier only when sized > 0 (disk-only is rejected above via cpu>0).
+    if awk -v x="$kvbm_disk_gb" 'BEGIN { exit !(x > 0) }'; then
+      kvbm_env+=("DYN_KVBM_DISK_CACHE_GB=$kvbm_disk_gb")
+    fi
+    if [[ "$kvbm_metrics_base" -gt 0 ]]; then
+      kvbm_env+=(
+        "DYN_KVBM_METRICS=true"
+        "DYN_KVBM_METRICS_PORT=$((kvbm_metrics_base + rank))"
+      )
+    fi
+    echo "vllm-${name}: KVBM enabled cpu=${kvbm_cpu_gb}GB disk=${kvbm_disk_gb}GB" \
+         "metrics_port=$((kvbm_metrics_base + rank))"
   fi
 
   # --dyn-tool-call-parser applies to every NON-PREFILL worker: the branch in
@@ -409,6 +467,7 @@ spawn_worker() {
     "NATS_SERVER=$nats_url" \
     "ETCD_ENDPOINTS=$etcd_endpoints" \
     ${sys_env[@]+"${sys_env[@]}"} \
+    ${kvbm_env[@]+"${kvbm_env[@]}"} \
     ${prompt_dump_envs[@]+"${prompt_dump_envs[@]}"} \
     -- \
     python -m dynamo.vllm \

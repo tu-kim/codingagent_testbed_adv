@@ -190,6 +190,60 @@ class VLLMRoleCfg(_Strict):
     kv_cache_dtype: KVCacheDtype = "auto"
 
 
+class KvbmCfg(_Strict):
+    """Dynamo KVBM (KV Block Manager): tiers KV cache to host memory (G2)
+    and disk (G3) beyond the GPU pool.
+
+    Enabled by selecting vLLM connector class "DynamoConnector" via
+    --kv-transfer-config (module path kvbm.vllm_integration.connector,
+    kv_role kv_both — dynamo/examples/backends/vllm/launch/agg_kvbm.sh);
+    tier sizes ride env vars DYN_KVBM_CPU_CACHE_GB / DYN_KVBM_DISK_CACHE_GB
+    (dynamo/lib/runtime/src/config/environment_names.rs:180-269).
+
+    Testbed scope: AGG (colocation) workers only. The disagg shape nests
+    DynamoConnector+NixlConnector under vLLM's PdConnector on the PREFILL
+    worker (disagg_kvbm.sh) with kv_role=kv_both on both sides — a different
+    role contract from our kv_producer/kv_consumer wiring, so it is rejected
+    here until that path is validated on this tag.
+
+    Prereq: the kvbm python extension (lib/bindings/kvbm, separate CUDA
+    wheel) must be importable on the worker host; dynamo's consolidator
+    degrades with only a warning when it is missing (main.py:593-599), but
+    the vLLM connector itself then fails — build the wheel first.
+    """
+
+    enabled: bool = False
+    # Host-tier size in GB. REQUIRED > 0 when enabled: without a CPU cache
+    # KVBM has no tier to offload into. Vendor guidance: must meaningfully
+    # exceed the GPU KV pool or offload churn DEGRADES performance
+    # (docs/components/kvbm/kvbm-guide.md:272).
+    cpu_cache_gb: float = 0.0
+    # Disk-tier size in GB. 0 = no disk tier. Disk-only (cpu=0, disk>0)
+    # is experimental upstream and rejected here.
+    disk_cache_gb: float = 0.0
+    # KVBM prometheus endpoint (kvbm_host_cache_hit_rate,
+    # kvbm_offload_blocks_d2h, kvbm_onboard_blocks_h2d, ...). Per-worker
+    # port = base + rank; <= 0 disables DYN_KVBM_METRICS.
+    metrics_port_base: int = 6880
+    # Leader coordination ZMQ ports; must be unique per co-located KVBM
+    # worker (same collision class as NIXL side channels). Per-worker
+    # pub = pub_base + rank, ack = ack_base + rank.
+    leader_zmq_pub_port_base: int = 56001
+    leader_zmq_ack_port_base: int = 56101
+
+    @model_validator(mode="after")
+    def _validate_kvbm(self) -> "KvbmCfg":
+        if self.enabled:
+            if self.cpu_cache_gb <= 0:
+                raise ValueError(
+                    "kvbm.enabled requires cpu_cache_gb > 0 (disk-only "
+                    "tiering is experimental upstream and unsupported here)"
+                )
+            if self.disk_cache_gb < 0:
+                raise ValueError("kvbm.disk_cache_gb must be >= 0")
+        return self
+
+
 class VLLMCfg(_Strict):
     kv_connector: str = "NixlConnector"
     nixl_port_base: int = 6000
@@ -265,6 +319,8 @@ class VLLMCfg(_Strict):
     prefill: VLLMRoleCfg | None = None
     decode: VLLMRoleCfg | None = None
     agg: VLLMRoleCfg | None = None
+    # KVBM host/disk KV tiering — agg-only (see KvbmCfg docstring).
+    kvbm: KvbmCfg = Field(default_factory=KvbmCfg)
     extra_args: str = ""
 
     @field_validator("prefill_workers", "decode_workers", "agg_workers")
@@ -308,6 +364,15 @@ class VLLMCfg(_Strict):
                 )
         if agg and self.agg is None:
             raise ValueError("agg_workers requires the 'agg:' role section")
+        if self.kvbm.enabled and disagg:
+            raise ValueError(
+                "vllm.kvbm is currently supported for agg (colocation) "
+                "workers only: the disagg shape needs PdConnector-nested "
+                "DynamoConnector+NixlConnector with kv_role=kv_both on the "
+                "prefill worker (dynamo disagg_kvbm.sh), which conflicts "
+                "with our kv_producer/kv_consumer wiring and is not "
+                "validated on this tag. Use agg_workers or disable kvbm."
+            )
         return self
 
 

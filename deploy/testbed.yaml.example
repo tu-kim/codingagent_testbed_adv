@@ -148,6 +148,24 @@ vllm:
   #   gpu_memory_utilization: 0.90
   #   kv_cache_dtype: auto
 
+  # KVBM: dynamo KV Block Manager — tiers KV cache beyond the GPU pool into
+  # host memory (G2) and disk (G3). AGG (colocation) workers ONLY — config.py
+  # rejects kvbm.enabled with a disagg topology (the disagg shape needs
+  # PdConnector nesting, unvalidated on this tag). Wire-in: replaces the
+  # agg worker's absent --kv-transfer-config with connector class
+  # DynamoConnector (kv_role kv_both); sizes/observability ride DYN_KVBM_*
+  # env. PREREQ: the kvbm python extension (dynamo/lib/bindings/kvbm,
+  # separate CUDA wheel) must be importable on the worker host.
+  # CAUTION: cpu_cache_gb must meaningfully exceed the GPU KV pool or
+  # offload churn DEGRADES performance (vendor kvbm-guide.md).
+  kvbm:
+    enabled: false
+    cpu_cache_gb: 0              # host tier GB; REQUIRED > 0 when enabled
+    disk_cache_gb: 0             # disk tier GB; 0 = no disk tier
+    metrics_port_base: 6880      # per-worker :base+rank /metrics (kvbm_host_cache_hit_rate, offload/onboard counters); <=0 disables
+    leader_zmq_pub_port_base: 56001   # KVBM leader coordination; unique per co-located worker (base+rank)
+    leader_zmq_ack_port_base: 56101
+
   extra_args: "--trust-remote-code --moe-backend triton"   # appended to every vLLM serve invocation (MiniMax M2 is a custom-code sparse-MoE; text-only, no --enable-multimodal)
 
 dynamo:

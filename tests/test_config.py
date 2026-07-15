@@ -435,3 +435,60 @@ def test_override_generation_config_env_without_yaml_bypasses_default_factory(tm
     cfg = cfg_mod.load(_write(tmp_path, _BASE_YAML), environ=env)
     # NOT the four-key default -- just the single key.
     assert cfg.vllm.override_generation_config == {"repetition_penalty": 1.0}
+
+
+# ---------- vllm.kvbm (host/disk KV tiering; agg-only) ----------
+
+
+def _agg_with_kvbm(kvbm: dict) -> str:
+    d = yaml.safe_load(_AGG_YAML)
+    d["vllm"]["kvbm"] = kvbm
+    return yaml.dump(d)
+
+
+def test_kvbm_defaults_off(tmp_path: Path):
+    cfg = cfg_mod.load(_write(tmp_path, _AGG_YAML))
+    assert cfg.vllm.kvbm.enabled is False
+    assert cfg.vllm.kvbm.cpu_cache_gb == 0.0
+    assert cfg.vllm.kvbm.metrics_port_base == 6880
+
+
+def test_kvbm_enabled_on_agg_accepted(tmp_path: Path):
+    cfg = cfg_mod.load(_write(tmp_path, _agg_with_kvbm(
+        {"enabled": True, "cpu_cache_gb": 20, "disk_cache_gb": 40})))
+    assert cfg.vllm.kvbm.enabled is True
+    assert cfg.vllm.kvbm.cpu_cache_gb == 20
+    assert cfg.vllm.kvbm.disk_cache_gb == 40
+
+
+def test_kvbm_enabled_requires_cpu_cache(tmp_path: Path):
+    with pytest.raises(ValidationError, match="cpu_cache_gb > 0"):
+        cfg_mod.load(_write(tmp_path, _agg_with_kvbm({"enabled": True})))
+
+
+def test_kvbm_negative_disk_rejected(tmp_path: Path):
+    with pytest.raises(ValidationError, match="disk_cache_gb"):
+        cfg_mod.load(_write(tmp_path, _agg_with_kvbm(
+            {"enabled": True, "cpu_cache_gb": 20, "disk_cache_gb": -1})))
+
+
+def test_kvbm_rejected_on_disagg_topology(tmp_path: Path):
+    d = yaml.safe_load(_BASE_YAML)
+    d["vllm"]["kvbm"] = {"enabled": True, "cpu_cache_gb": 20}
+    with pytest.raises(ValidationError, match="agg \\(colocation\\) workers only"):
+        cfg_mod.load(_write(tmp_path, yaml.dump(d)))
+
+
+def test_kvbm_disabled_on_disagg_is_fine(tmp_path: Path):
+    d = yaml.safe_load(_BASE_YAML)
+    d["vllm"]["kvbm"] = {"enabled": False, "cpu_cache_gb": 0}
+    cfg = cfg_mod.load(_write(tmp_path, yaml.dump(d)))
+    assert cfg.vllm.kvbm.enabled is False
+
+
+def test_kvbm_env_override(tmp_path: Path):
+    env = {"TESTBED__VLLM__KVBM__ENABLED": "true",
+           "TESTBED__VLLM__KVBM__CPU_CACHE_GB": "32"}
+    cfg = cfg_mod.load(_write(tmp_path, _AGG_YAML), environ=env)
+    assert cfg.vllm.kvbm.enabled is True
+    assert cfg.vllm.kvbm.cpu_cache_gb == 32

@@ -108,6 +108,24 @@ DEFAULT_METRIC_NAMES = frozenset({
     "vllm:generation_tokens_total",
 })
 
+# KVBM (dynamo KV Block Manager) exposes a SEPARATE Prometheus endpoint
+# per worker (DYN_KVBM_METRICS=true, port = vllm.kvbm.metrics_port_base +
+# rank — set by testbed.sh spawn_worker when vllm.kvbm.enabled). These are
+# the host/disk tier-hit + offload/onboard signals (dynamo
+# docs/components/kvbm/kvbm-guide.md:344-353). KVBM scrape targets use
+# this allowlist instead of the vLLM one (which would filter them out);
+# --keep-all / --metric-names apply to vLLM targets only.
+KVBM_METRIC_NAMES = frozenset({
+    "kvbm_matched_tokens",
+    "kvbm_offload_blocks_d2h",     # device -> host offloads
+    "kvbm_offload_blocks_h2d",
+    "kvbm_offload_blocks_d2d",
+    "kvbm_onboard_blocks_h2d",     # host -> device onboarding (tier hit served)
+    "kvbm_onboard_blocks_d2d",
+    "kvbm_host_cache_hit_rate",    # 0.0-1.0
+    "kvbm_disk_cache_hit_rate",    # 0.0-1.0
+})
+
 # Prometheus text-format line (no labels): metric value [ts]
 # With labels:                              metric{labels} value [ts]
 _METRIC_LINE = re.compile(
@@ -174,6 +192,13 @@ def load_workers(testbed_yaml: Path) -> list[dict]:
         )
     workers: list[dict] = []
     rank = 0
+    # KVBM: when vllm.kvbm.enabled, each AGG worker additionally exposes a
+    # KVBM prometheus endpoint at kvbm.metrics_port_base + rank (testbed.sh
+    # spawn_worker sets DYN_KVBM_METRICS). Emit a second scrape target per
+    # agg worker with role "kvbm" and its own metric allowlist.
+    kvbm = vllm.get("kvbm") or {}
+    kvbm_enabled = bool(kvbm.get("enabled"))
+    kvbm_base = kvbm.get("metrics_port_base", 6880)
     # Order MUST match testbed.sh up_workers spawn order (prefill -> decode
     # -> agg); rank feeds the same system_port_base + rank math.
     for role, key in (("prefill", "prefill_workers"),
@@ -186,6 +211,14 @@ def load_workers(testbed_yaml: Path) -> list[dict]:
                 "host": w.get("host", "127.0.0.1"),
                 "port": base + rank,
             })
+            if (role == "agg" and kvbm_enabled
+                    and isinstance(kvbm_base, int) and kvbm_base > 0):
+                workers.append({
+                    "worker": w.get("name", f"{role}{rank}"),
+                    "role": "kvbm",
+                    "host": w.get("host", "127.0.0.1"),
+                    "port": kvbm_base + rank,
+                })
             rank += 1
     if not workers:
         raise SystemExit("no vllm workers configured in testbed.yaml")
@@ -217,7 +250,10 @@ def run_scraper(workers: list[dict], interval_s: float, output: Path,
         while not stop_fn():
             tick_ts = time.time()
             for w in workers:
-                ok, payload = scrape_one(w["host"], w["port"], timeout_s, keep_names)
+                # KVBM targets have their own allowlist (kvbm_* names);
+                # the vLLM allowlist would drop every KVBM metric.
+                target_keep = KVBM_METRIC_NAMES if w["role"] == "kvbm" else keep_names
+                ok, payload = scrape_one(w["host"], w["port"], timeout_s, target_keep)
                 row = {
                     "ts": tick_ts,
                     "interval_s": interval_s,
