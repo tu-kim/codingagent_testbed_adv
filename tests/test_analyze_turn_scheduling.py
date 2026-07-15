@@ -96,6 +96,24 @@ def test_load_turns_effective_input_includes_cache(mod, tmp_path):
     assert t.effective_input == 1000
 
 
+def test_load_turns_llm_wall_true_and_llm_time_preference(mod, tmp_path):
+    # buffered tool-call step: duration_s ~0, turn.end carries the anchored
+    # wall; llm_time_s prefers dynamo elapsed_s > llm_wall_true_s > duration_s
+    _write_profile(tmp_path, "ses1", [
+        {"ev": "llm.end", "ts": 10.0, "step": 1, "duration_s": 0.0001,
+         "tokens": {"input": 100, "output": 20, "cache": {"read": 0}},
+         "dynamo": {}},
+        {"ev": "turn.end", "ts": 11.0, "step": 1, "duration_s": 2.0,
+         "llm_wall_s": 0.0001, "tool_wall_s": 0.5, "llm_wall_true_s": 1.4},
+        _llm_end(2, elapsed_s=3.0, duration_s=0.9),
+    ])
+    t1, t2 = mod.load_turns(tmp_path)
+    assert t1.llm_wall_true_s == 1.4
+    assert t1.llm_time_s == 1.4          # true wall, not the collapsed 0.0001
+    assert t2.llm_time_s == 3.0          # dynamo elapsed_s wins when present
+    assert t2.llm_wall_s == 0.9          # stream field untouched
+
+
 def test_load_turns_classic_usage_shape(mod, tmp_path):
     ev = {"ev": "llm.end", "ts": 0, "step": 1, "duration_s": 1.0,
           "tokens": {"prompt_tokens": 42, "completion_tokens": 7}}

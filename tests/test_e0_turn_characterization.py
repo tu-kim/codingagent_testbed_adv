@@ -31,10 +31,11 @@ def mod():
     return module
 
 
-# minimal stand-in matching the TurnRec attributes the script reads
+# minimal stand-in matching the TurnRec attributes the script reads.
+# hit_tokens=None means "no usage data" (input_tokens stays None).
 class _T:
     def __init__(self, session_id, step, start, end, wall, prev, cur,
-                 gap=None, hit=None):
+                 gap=None, hit_tokens=None):
         self.session_id = session_id
         self.step = step
         self.llm_start_ts = start
@@ -43,15 +44,12 @@ class _T:
         self.prev_tools = tuple(prev)
         self.tool_names = list(cur)
         self.away_s = gap
-        self._hit = hit
+        self.input_tokens = None if hit_tokens is None else 100
+        self.cache_read = hit_tokens or 0
 
     @property
     def prev_key(self):
         return "+".join(sorted(set(self.prev_tools))) if self.prev_tools else "(none)"
-
-    @property
-    def cache_hit_ratio(self):
-        return self._hit
 
 
 # ---------- ordering / boundaries ----------
@@ -140,25 +138,26 @@ def test_cur_key_and_none(mod):
 
 
 def test_hit_series_sorted_filtered_with_session(mod):
-    turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], hit=0.75),
-             _T("A", 1, 0, 5, 5.0, [], [], hit=None),   # no hit -> dropped
-             _T("B", 1, 20, 23, 3.0, [], [], hit=0.0)]
+    # y is now HIT TOKENS (cache.read), not a ratio; no-usage turns dropped
+    turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], hit_tokens=1500),
+             _T("A", 1, 0, 5, 5.0, [], [], hit_tokens=None),  # no usage -> dropped
+             _T("B", 1, 20, 23, 3.0, [], [], hit_tokens=0)]
     s = mod.hit_series(turns)
-    assert s == [(7.5, 0.75, "A"), (23.0, 0.0, "B")]
+    assert s == [(7.5, 1500, "A"), (23.0, 0, "B")]
 
 
 def test_gap_hit_pairs(mod):
-    turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], gap=2.0, hit=0.75),
-             _T("A", 1, 0, 5, 5.0, [], [], gap=None, hit=0.0)]  # no gap -> dropped
-    assert mod.gap_hit_pairs(turns) == [(2.0, 0.75)]
+    turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], gap=2.0, hit_tokens=1500),
+             _T("A", 1, 0, 5, 5.0, [], [], gap=None, hit_tokens=0)]  # no gap -> dropped
+    assert mod.gap_hit_pairs(turns) == [(2.0, 1500)]
 
 
 def test_categorize_gap_hit_prev_tool(mod):
     # category is simply the previous turn's tool key; no-gap turns dropped
     turns = [
-        _T("A", 1, 0, 5, 5.0, [], ["read"], gap=None, hit=0.0),
-        _T("A", 2, 7, 7.5, 0.5, ["read"], ["bash"], gap=2.0, hit=0.14),
-        _T("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit=0.89),
+        _T("A", 1, 0, 5, 5.0, [], ["read"], gap=None, hit_tokens=0),
+        _T("A", 2, 7, 7.5, 0.5, ["read"], ["bash"], gap=2.0, hit_tokens=400),
+        _T("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit_tokens=3200),
     ]
     cats = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns)}
     assert cats == {2: "read", 3: "bash"}

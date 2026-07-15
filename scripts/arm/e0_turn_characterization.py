@@ -24,15 +24,16 @@ Views (each figure -> PDF when matplotlib is present; CSVs always):
                            tool and current-tool.
 3. fig3_hit_vs_kv          shared time axis (x from 0) framed by the RUN
                            WINDOW (first..last turn): per-turn prefix-cache
-                           hit (left y, PER-SESSION line segments) + GPU
-                           KV-cache usage (right y, trimmed to the window so
-                           an early-started scraper can't shift the origin);
-                           red lines at sample starts (as in fig1).
+                           HIT TOKENS (tokens.cache.read; left y, PER-SESSION
+                           line segments) + GPU KV-cache usage (right y,
+                           trimmed to the window so an early-started scraper
+                           can't shift the origin); red lines at sample
+                           starts (as in fig1).
    fig3-1_worker_hit_kv    (with --worker-log) hit rate + KV usage parsed
                            STRAIGHT from the vLLM worker log's engine-stats
                            line — both off one clock, no alignment needed.
 4. fig4_gap_vs_hit         turn gap (llm.start(N) - llm.end(N-1)) vs prefix-
-                           cache hit ratio, points COLORED by the previous
+                           cache HIT TOKENS, points COLORED by the previous
                            turn's tool (also gap_hit.csv).
    zero_turns.csv          turns whose llm.end duration_s is ~0 (buffered-
                            tool-call steps; see near_zero_turns) — proof
@@ -153,6 +154,15 @@ def _cur_key(turn) -> str:
     return "+".join(sorted(set(turn.tool_names))) if turn.tool_names else "(none)"
 
 
+def _llm_time(turn) -> float | None:
+    """Per-turn LLM time via TurnRec.llm_time_s (dynamo elapsed_s >
+    llm_wall_true_s > duration_s), so buffered tool-call steps whose
+    stream-based duration_s collapsed to ~0 get their REAL wall.
+    Falls back to llm_wall_s for stand-ins without the property."""
+    v = getattr(turn, "llm_time_s", None)
+    return v if v is not None else turn.llm_wall_s
+
+
 # ---------- ordering + variation ----------
 
 
@@ -262,15 +272,16 @@ def _percentile_value(vals: list[float], q: float) -> float:
 
 
 def bottom_pct_tool_dist(turns: list, cutoffs: list[float]) -> list[dict]:
-    """For each cutoff q (e.g. 0.9), take turns whose llm_wall_s is in the
-    bottom q of the distribution, and report the count + % of each
-    previous-tool and current-tool key within that subset."""
-    walls = [t.llm_wall_s for t in turns if t.llm_wall_s is not None]
+    """For each cutoff q (e.g. 0.9), take turns whose LLM time (llm_time_s
+    preference chain) is in the bottom q of the distribution, and report
+    the count + % of each previous-tool and current-tool key within that
+    subset."""
+    walls = [w for w in (_llm_time(t) for t in turns) if w is not None]
     rows: list[dict] = []
     for q in cutoffs:
         thr = _percentile_value(walls, q)
         subset = [t for t in turns
-                  if t.llm_wall_s is not None and t.llm_wall_s <= thr]
+                  if _llm_time(t) is not None and _llm_time(t) <= thr]
         n = len(subset)
         prev_c = Counter(t.prev_key for t in subset)
         cur_c = Counter(_cur_key(t) for t in subset)
@@ -291,14 +302,24 @@ def bottom_pct_tool_dist(turns: list, cutoffs: list[float]) -> list[dict]:
 # ---------- time series: hit ratio + KV usage ----------
 
 
+def _hit_tokens(turn):
+    """Prefix-cache HIT TOKEN COUNT for this turn (tokens.cache.read), or
+    None when the turn carries no usage data. Absolute tokens, not a
+    ratio — the actual KV volume reused from cache."""
+    if getattr(turn, "input_tokens", None) is None:
+        return None
+    return getattr(turn, "cache_read", 0) or 0
+
+
 def hit_series(turns: list) -> list[tuple[float, float, str]]:
-    """(llm_end_ts, cache_hit_ratio, session_id) for turns with both,
-    sorted by ts. Session id is kept so the plot can break the line at
-    session boundaries (a 0.9 continuation turn followed by the next
-    session's 0 first-turn is NOT a real fluctuation) and drop single-
-    turn helper sessions."""
-    out = [(t.llm_end_ts, t.cache_hit_ratio, t.session_id) for t in turns
-           if t.llm_end_ts is not None and t.cache_hit_ratio is not None]
+    """(llm_end_ts, hit_tokens, session_id) for turns with both, sorted
+    by ts. Session id is kept so the plot can break the line at session
+    boundaries and drop single-turn helper sessions."""
+    out = []
+    for t in turns:
+        h = _hit_tokens(t)
+        if t.llm_end_ts is not None and h is not None:
+            out.append((t.llm_end_ts, h, t.session_id))
     return sorted(out)
 
 
@@ -402,24 +423,28 @@ def trim_to_window(series: list[tuple[float, float]], lo: float, hi: float,
 
 
 def gap_hit_pairs(turns: list) -> list[tuple[float, float]]:
-    """(turn_gap_s, cache_hit_ratio); turn_gap == away_s."""
-    return [(t.away_s, t.cache_hit_ratio) for t in turns
-            if t.away_s is not None and t.cache_hit_ratio is not None]
+    """(turn_gap_s, hit_tokens); turn_gap == away_s."""
+    out = []
+    for t in turns:
+        h = _hit_tokens(t)
+        if t.away_s is not None and h is not None:
+            out.append((t.away_s, h))
+    return out
 
 
 def categorize_gap_hit(turns: list) -> list[tuple[float, float, str, str, int]]:
-    """(turn_gap, hit, category, session_id, step) for turns with gap+hit.
+    """(turn_gap, hit_tokens, category, session_id, step) for turns with
+    gap + usage data.
 
     category = the previous turn's tool key (prev_key): in sequential runs
     the turn gap is ~the preceding tool's exec time, so coloring by prev
-    tool explains most of the vertical spread at a given gap ("read"
-    injects large new content -> lower hit than "bash")."""
+    tool explains most of the vertical spread at a given gap."""
     out = []
     for t in turns:
-        if t.away_s is None or t.cache_hit_ratio is None:
+        h = _hit_tokens(t)
+        if t.away_s is None or h is None:
             continue
-        out.append((t.away_s, t.cache_hit_ratio, t.prev_key,
-                    t.session_id, t.step))
+        out.append((t.away_s, h, t.prev_key, t.session_id, t.step))
     return out
 
 
@@ -430,12 +455,14 @@ def write_ordered_csv(path: Path, ordered: list) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["ordinal", "session_id", "step", "llm_start_ts",
-                    "llm_end_ts", "llm_wall_s", "prev_tools", "cur_tools",
-                    "turn_gap_s", "cache_hit_ratio"])
+                    "llm_end_ts", "llm_time_s", "llm_wall_s", "prev_tools",
+                    "cur_tools", "turn_gap_s", "cache_hit_ratio"])
         for i, t in enumerate(ordered):
+            lt = _llm_time(t)
             w.writerow([i, t.session_id, t.step,
                         t.llm_start_ts if t.llm_start_ts is not None else "",
                         t.llm_end_ts if t.llm_end_ts is not None else "",
+                        lt if lt is not None else "",
                         t.llm_wall_s if t.llm_wall_s is not None else "",
                         t.prev_key, _cur_key(t),
                         t.away_s if t.away_s is not None else "",
@@ -469,7 +496,8 @@ def fig_turn_llm_time(ordered: list, path: Path, *,
     plt = _mpl()
     heights = []
     for t in ordered:
-        wall = t.llm_wall_s if t.llm_wall_s is not None else 0.0
+        w = _llm_time(t)
+        wall = w if w is not None else 0.0
         heights.append(wall if wall > 0 else float("nan"))
     xs = list(range(len(heights)))
     pos = [h for h in heights if h == h and h > 0]
@@ -493,8 +521,8 @@ def fig_llm_time_cdf(turns: list, path: Path) -> None:
     a log x-axis so the small/fast turns (CPU-offload candidates) and the
     long tail are both legible."""
     plt = _mpl()
-    vals = sorted(t.llm_wall_s for t in turns
-                  if t.llm_wall_s is not None and t.llm_wall_s > 0)
+    vals = sorted(w for w in (_llm_time(t) for t in turns)
+                  if w is not None and w > 0)
     fig, ax = plt.subplots(figsize=(8, 5))
     if vals:
         n = len(vals)
@@ -514,8 +542,9 @@ def fig_hit_vs_kv(hits: list[tuple[float, float, str]],
                   kv: list[tuple[float, float]], path: Path,
                   *, min_turns: int = 2,
                   sample_times: list[float] | None = None) -> None:
-    """Prefix-cache hit ratio (left y) vs GPU KV usage (right y) on a
-    SHARED time axis. The RUN WINDOW (first..last turn hit point) frames
+    """Prefix-cache HIT TOKENS per turn (left y, tokens.cache.read — the
+    absolute KV volume reused) vs GPU KV usage (right y) on a SHARED
+    time axis. The RUN WINDOW (first..last turn hit point) frames
     it: the KV series is TRIMMED to that window so an early/late scraper
     can't shift the origin, and both start together at x=0. The per-turn
     hit line is drawn PER SESSION (no segment crosses a session boundary)
@@ -555,8 +584,8 @@ def fig_hit_vs_kv(hits: list[tuple[float, float, str]],
         if xs:
             x_right = max(x_right, xs[-1])
     ax.set_xlabel("time (s)")
-    ax.set_ylabel("prefix-cache hit ratio", color="tab:blue")
-    ax.set_ylim(0, 1)
+    ax.set_ylabel("prefix-cache hit tokens / turn", color="tab:blue")
+    ax.set_ylim(bottom=0)
     if kv:
         ax2 = ax.twinx()
         kx = [t - t0 for t, _ in kv]
@@ -603,8 +632,8 @@ def fig_worker_hit_kv(hits: list[tuple[float, float]],
 
 def fig_gap_vs_hit(cats: list[tuple[float, float, str, str, int]],
                    path: Path) -> None:
-    """Scatter of turn gap vs hit, COLORED by the previous turn's tool so
-    the vertical spread at a given gap is explained."""
+    """Scatter of turn gap vs hit tokens, COLORED by the previous turn's
+    tool so the vertical spread at a given gap is explained."""
     plt = _mpl()
     fig, ax = plt.subplots(figsize=(6.5, 4))
     groups: dict[str, list[tuple[float, float]]] = {}
@@ -616,11 +645,11 @@ def fig_gap_vs_hit(cats: list[tuple[float, float, str, str, int]],
         hs = [p[1] for p in pts]
         ax.scatter(gs, hs, s=14, alpha=0.6, label=f"{c} ({len(pts)})")
     ax.set_xlabel("turn gap (s)")
-    ax.set_ylabel("prefix-cache hit ratio")
-    ax.set_ylim(0, 1)
+    ax.set_ylabel("prefix-cache hit tokens")
+    ax.set_ylim(bottom=0)
     if groups:
         ax.legend(fontsize=7, loc="best", framealpha=0.7)
-    ax.set_title("Prefix-cache hit vs turn gap")
+    ax.set_title("Prefix-cache hit tokens vs turn gap")
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -747,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
     write_bottom_pct_csv(out_dir / "bottom_pct_tools.csv", bottom_rows)
     with (out_dir / "gap_hit.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["session_id", "step", "turn_gap_s", "cache_hit_ratio", "category"])
+        w.writerow(["session_id", "step", "turn_gap_s", "cache_hit_tokens", "category"])
         for g, h, c, sid, step in cats:
             w.writerow([sid, step, g, h, c])
 

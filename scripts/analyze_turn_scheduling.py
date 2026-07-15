@@ -84,6 +84,11 @@ class TurnRec:
     input_tokens: int | None = None
     cache_read: int = 0
     llm_wall_s: float | None = None    # llm.end duration_s (stream wall)
+    # turn.end llm_wall_true_s: wall-clock-anchored LLM wall
+    # (llm.end - turn.start - tool_wall). Correct even for BUFFERED
+    # tool-call steps, where the AI SDK fires start-step only after the
+    # stream already finished so duration_s collapses to ~0.
+    llm_wall_true_s: float | None = None
     llm_start_ts: float | None = None  # llm.start event ts (unix s)
     llm_end_ts: float | None = None    # llm.end event ts (unix s)
     tool_names: list[str] = field(default_factory=list)  # tools run IN this step
@@ -121,6 +126,19 @@ class TurnRec:
     @property
     def prev_key(self) -> str:
         return "+".join(sorted(set(self.prev_tools))) if self.prev_tools else "(none)"
+
+    @property
+    def llm_time_s(self) -> float | None:
+        """Best-available per-turn LLM time:
+        dynamo elapsed_s (server-side wall, immune to client hook timing)
+        > llm_wall_true_s (wall-clock-anchored client wall)
+        > llm_wall_s (stream-based duration_s; collapses to ~0 on
+        buffered tool-call steps — last resort only)."""
+        if self.elapsed_s is not None and self.elapsed_s > 0:
+            return self.elapsed_s
+        if self.llm_wall_true_s is not None and self.llm_wall_true_s > 0:
+            return self.llm_wall_true_s
+        return self.llm_wall_s
 
 
 def load_turns(profiles_dir: Path) -> list[TurnRec]:
@@ -169,6 +187,10 @@ def load_turns(profiles_dir: Path) -> list[TurnRec]:
                 t.input_tokens = inp
                 t.output_tokens = out
                 t.cache_read = (cache.get("read") if isinstance(cache, dict) else 0) or 0
+            elif ev_type == "turn.end":
+                t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))
+                if ev.get("llm_wall_true_s") is not None:
+                    t.llm_wall_true_s = float(ev["llm_wall_true_s"])
             elif ev_type == "tool.end":
                 t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))
                 name = ev.get("name")
