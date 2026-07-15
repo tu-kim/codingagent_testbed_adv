@@ -297,7 +297,9 @@ def _turn_events(step, start, end, inp, out, cache, tool):
     return evs
 
 
-def test_main_writes_csvs_no_figures(mod, tmp_path, capsys):
+def test_main_no_figures_writes_no_files(mod, tmp_path):
+    # figures-only: --no-figures produces neither PDFs nor CSVs (the CSV
+    # side-outputs and stdout digest were intentionally dropped).
     prof = tmp_path / "profiles"; prof.mkdir()
     _write_profile(prof, "A",
                    _turn_events(1, 0, 5, 2000, 300, 0, "read")
@@ -309,16 +311,10 @@ def test_main_writes_csvs_no_figures(mod, tmp_path, capsys):
                    "--out", str(out), "--no-figures"])
     assert rc == 0
     assert not list(out.glob("*.pdf"))
-    ordered = list(csv.DictReader((out / "turns_ordered.csv").open()))
-    assert [r["step"] for r in ordered] == ["1", "2"]
-    assert ordered[1]["prev_tools"] == "read"
-    assert ordered[1]["turn_gap_s"] == "2.0"
-    bottom = list(csv.DictReader((out / "bottom_pct_tools.csv").open()))
-    assert {r["side"] for r in bottom} == {"prev", "cur"}
-    assert "2 sample boundaries" not in capsys.readouterr().out  # only 1 session
+    assert not list(out.glob("*.csv"))
 
 
-def test_main_trace_filter_drops_helper_sessions(mod, tmp_path, capsys):
+def test_main_trace_filter_runs_quietly(mod, tmp_path, capsys):
     prof = tmp_path / "profiles"; prof.mkdir()
     _write_profile(prof, "ses_main",
                    _turn_events(1, 0, 5, 2000, 300, 0, "read")
@@ -330,9 +326,7 @@ def test_main_trace_filter_drops_helper_sessions(mod, tmp_path, capsys):
     rc = mod.main(["--profiles", str(prof), "--trace", str(trace),
                    "--out", str(out), "--no-figures"])
     assert rc == 0
-    assert "kept 1/2 sessions" in capsys.readouterr().out
-    ordered = list(csv.DictReader((out / "turns_ordered.csv").open()))
-    assert {r["session_id"] for r in ordered} == {"ses_main"}
+    assert capsys.readouterr().out == ""      # no stdout digest
 
 
 def test_main_trace_missing_returns_2(mod, tmp_path, capsys):

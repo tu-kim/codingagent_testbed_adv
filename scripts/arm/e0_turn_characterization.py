@@ -870,13 +870,7 @@ def main(argv: list[str] | None = None) -> int:
     if not main_ids:
         print("error: no session_id in trace.jsonl", file=sys.stderr)
         return 2
-    before = len({t.session_id for t in turns})
     turns = [t for t in turns if t.session_id in main_ids]
-    kept = {t.session_id for t in turns}
-    print(f"trace filter: kept {len(kept)}/{before} sessions "
-          f"({len(main_ids)} main sessions in trace"
-          + (f"; {len(main_ids - kept)} with no profile" if main_ids - kept
-             else "") + ")")
     if not turns:
         print("error: no turns left after trace filter", file=sys.stderr)
         return 2
@@ -886,42 +880,17 @@ def main(argv: list[str] | None = None) -> int:
     min_boundary = 1
 
     ordered = order_turns(turns)
-    samples = sample_start_times(ordered, min_boundary)
     samples_abs = sample_start_times_abs(ordered, min_boundary)
     sample_ords = sample_start_ordinals(ordered, min_boundary)
-    bottom_rows = bottom_pct_tool_dist(turns, cutoffs)
     reuse = gap_reuse_pairs(turns)
     have_metrics = args.metrics is not None and args.metrics.exists()
     kv = kv_usage_series(args.metrics) if have_metrics else []
 
     out_dir = args.out or (args.profiles / "e0")
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_ordered_csv(out_dir / "turns_ordered.csv", ordered)
-    write_bottom_pct_csv(out_dir / "bottom_pct_tools.csv", bottom_rows)
-    with (out_dir / "gap_hit.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["session_id", "step", "turn_gap_s", "prev_turn_kv_reuse_ratio"])
-        for g, r, sid, step in reuse:
-            w.writerow([sid, step, g, r])
 
-    # near-zero-duration turn diagnostic (buffered-tool-call steps)
-    keep_ids = {t.session_id for t in turns}
-    zrows = near_zero_turns(args.profiles, keep_ids, args.zero_threshold_s)
-    with (out_dir / "zero_turns.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=[
-            "session_id", "step", "duration_s", "step_duration_s",
-            "post_stream_overhead_s", "finish", "output_tokens", "request_id"])
-        w.writeheader()
-        w.writerows(zrows)
-
-    n_sessions = len({t.session_id for t in turns})
-    print(f"turns: {len(turns)} across {n_sessions} sessions "
-          f"({len(samples)} samples with >= {min_boundary} turns)")
-    _print_bottom(bottom_rows)
-    _print_zero_turns(zrows, args.zero_threshold_s, len(turns))
-    if args.metrics and not kv:
-        print("warning: no KV-usage series parsed from --metrics", file=sys.stderr)
-
+    # Figures only. CSV side-outputs and the stdout digest are intentionally
+    # omitted for now (analyzed later off the figures / raw profiles).
     if not args.no_figures:
         try:
             fig_turn_llm_time(ordered, out_dir / "fig1_turn_llm_time.pdf",
@@ -937,16 +906,10 @@ def main(argv: list[str] | None = None) -> int:
                 if wl_hits or wl_kv:
                     fig_worker_hit_kv(wl_hits, wl_kv,
                                       out_dir / "fig3-1_worker_hit_kv.pdf")
-                else:
-                    print("warning: no engine-stats lines parsed from "
-                          f"--worker-log {args.worker_log}", file=sys.stderr)
-            print(f"\nwrote figures under {out_dir}")
         except ImportError:
-            print("matplotlib not available; wrote CSVs only "
-                  "(--no-figures to silence)", file=sys.stderr)
-
-    print(f"wrote {out_dir / 'turns_ordered.csv'}")
-    print(f"wrote {out_dir / 'bottom_pct_tools.csv'}")
+            print("matplotlib not available (no figures written)",
+                  file=sys.stderr)
+            return 2
     return 0
 
 
