@@ -251,7 +251,9 @@ def main(argv: list[str] | None = None) -> int:
     if fresh:
         avg = sum(r["child_first_hit_ratio"] for r in fresh) / len(fresh)
         print(f"sub-agent FIRST-turn hit ratio: mean {avg:.3f} over "
-              f"{len(fresh)} (near 0 => fresh prefix, no KV shared w/ parent)")
+              f"{len(fresh)} (only the shared boilerplate prefix -- system "
+              "prompt/tools -- hits; the parent's CONVERSATION KV is not "
+              "reused, so a fresh sub-agent prompt is mostly re-prefilled)")
     mism = [r for r in child_rows if r["spawn_had_task"] is False]
     if mism:
         print(f"note: {len(mism)} sub-agent(s) whose spawning parent turn did "
@@ -262,8 +264,8 @@ def main(argv: list[str] | None = None) -> int:
     if resumes:
         avg_r = sum(r["resume_hit_ratio"] for r in resumes) / len(resumes)
         print(f"parent RESUME-turn hit ratio after the excursion: mean "
-              f"{avg_r:.3f} over {len(resumes)} (low => parent's KV was "
-              "evicted while the sub-agent ran)")
+              f"{avg_r:.3f} over {len(resumes)} (HIGH => parent's KV "
+              "survived the sub-agent run; LOW => it was evicted)")
     print(f"wrote {out_dir / 'session_summary.csv'}")
     print(f"wrote {out_dir / 'session_nesting.csv'}")
     print(f"wrote {out_dir / 'ordinal_map.csv'}")
