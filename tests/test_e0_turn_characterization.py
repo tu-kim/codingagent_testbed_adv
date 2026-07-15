@@ -84,8 +84,9 @@ def test_sample_start_times_excludes_single_turn_sessions(mod):
     ])
     # t0 = 10.0 (A's first start); samples A@0.0 and B@20.0; titles excluded
     assert mod.sample_start_times(ordered, min_turns=2) == [0.0, 20.0]
-    # min_turns=1 would include everything
-    assert len(mod.sample_start_times(ordered, min_turns=1)) == 4
+    # even at min_turns=1, the titles start INSIDE A's window (top-level
+    # filter) so still only A and B remain
+    assert len(mod.sample_start_times(ordered, min_turns=1)) == 2
 
 
 def test_t0_uses_first_start(mod):
@@ -150,42 +151,51 @@ def test_gap_hit_pairs(mod):
     assert mod.gap_hit_pairs(turns) == [(2.0, 0.75)]
 
 
-class _TE(_T):
-    """_T plus input_tokens/cache_read so effective_input resolves
-    (categorize_gap_hit needs it for compaction detection)."""
-    def __init__(self, *a, inp=0, cache=0, **kw):
-        super().__init__(*a, **kw)
-        self.input_tokens = inp
-        self.cache_read = cache
-
-    @property
-    def effective_input(self):
-        return self.input_tokens + self.cache_read
-
-
 def test_categorize_gap_hit_prev_tool(mod):
-    # step2 prev=read, step3 prev=bash — normal (no compaction), category=prev tool
+    # category is simply the previous turn's tool key; no-gap turns dropped
     turns = [
-        _TE("A", 1, 0, 5, 5.0, [], ["read"], gap=None, hit=0.0, inp=2000, cache=0),
-        _TE("A", 2, 7, 7.5, 0.5, ["read"], ["bash"], gap=2.0, hit=0.14, inp=3000, cache=500),
-        _TE("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit=0.89, inp=400, cache=3200),
+        _T("A", 1, 0, 5, 5.0, [], ["read"], gap=None, hit=0.0),
+        _T("A", 2, 7, 7.5, 0.5, ["read"], ["bash"], gap=2.0, hit=0.14),
+        _T("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit=0.89),
     ]
     cats = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns)}
-    assert cats[2] == "read"       # prev tool of step2
-    assert cats[3] == "bash"
+    assert cats == {2: "read", 3: "bash"}
 
 
-def test_categorize_gap_hit_detects_compaction(mod):
-    # step3 effective_input (eff=3600) then step4 drops to 500 (< 0.6*3600) -> compaction?
-    turns = [
-        _TE("A", 3, 9, 9.4, 0.4, ["bash"], ["read"], gap=1.5, hit=0.89, inp=400, cache=3200),
-        _TE("A", 4, 15, 15.3, 0.3, ["read"], [], gap=5.6, hit=0.4, inp=300, cache=200),
+def test_sample_start_times_drops_nested_subagent_sessions(mod):
+    # sub is a 2-turn task-subagent session running INSIDE A's window —
+    # min_turns alone would keep it; the top-level filter must drop it.
+    ordered = mod.order_turns([
+        _T("A", 1, 0.0, 2.0, 2.0, [], []),
+        _T("sub", 1, 3.0, 4.0, 1.0, [], []),
+        _T("sub", 2, 4.5, 5.0, 0.5, [], []),
+        _T("A", 2, 6.0, 8.0, 2.0, [], []),
+        _T("B", 1, 10.0, 11.0, 1.0, [], []),
+        _T("B", 2, 12.0, 13.0, 1.0, [], []),
+    ])
+    assert mod.sample_start_times(ordered, min_turns=2) == [0.0, 10.0]
+
+
+def test_scrape_hit_series_windowed_deltas(mod, tmp_path):
+    p = tmp_path / "m.ndjson"
+    q = "vllm:prefix_cache_queries_total"
+    h = "vllm:prefix_cache_hits_total"
+    rows = [
+        {"ts": 1.0, "ok": True, "metrics": {q: [{"value": 100}], h: [{"value": 40}]}},
+        {"ts": 2.0, "ok": True, "metrics": {q: [{"value": 200}], h: [{"value": 120}]}},
+        {"ts": 3.0, "ok": True, "metrics": {q: [{"value": 200}], h: [{"value": 120}]}},  # idle
+        {"ts": 4.0, "ok": True, "metrics": {q: [{"value": 300}], h: [{"value": 130}]}},
+        {"ts": 5.0, "ok": False, "error": "x"},
     ]
-    cats = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns, 0.6)}
-    assert cats[4] == "compaction?"
-    # with a lenient ratio the drop no longer qualifies
-    cats2 = {step: c for _g, _h, c, _s, step in mod.categorize_gap_hit(turns, 0.05)}
-    assert cats2[4] == "read"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    s = mod.scrape_hit_series(p)
+    # (2.0, 80/100), idle tick skipped, (4.0, 10/100)
+    assert s == [(2.0, 0.8), (4.0, 0.1)]
+
+
+def test_trim_to_window(mod):
+    series = [(0.0, 1.0), (10.0, 2.0), (100.0, 3.0)]
+    assert mod.trim_to_window(series, 8.0, 20.0, margin_s=5.0) == [(10.0, 2.0)]
 
 
 def test_kv_usage_series(mod, tmp_path):
@@ -201,6 +211,15 @@ def test_kv_usage_series(mod, tmp_path):
     ]) + "\n")
     s = mod.kv_usage_series(p)
     assert s == [(1.0, 0.2), (2.0, 0.5)]                  # sorted, mean of 0.4/0.6
+
+
+def test_trace_session_ids(mod, tmp_path):
+    p = tmp_path / "trace.jsonl"
+    p.write_text(json.dumps({"session_id": "ses_a", "success": True}) + "\n"
+                 + json.dumps({"session_id": "ses_b", "success": False}) + "\n"
+                 + "not json\n"
+                 + json.dumps({"no_sid": 1}) + "\n")
+    assert mod.trace_session_ids(p) == {"ses_a", "ses_b"}
 
 
 # ---------- main() ----------
@@ -238,6 +257,32 @@ def test_main_writes_csvs_no_figures(mod, tmp_path, capsys):
     bottom = list(csv.DictReader((out / "bottom_pct_tools.csv").open()))
     assert {r["side"] for r in bottom} == {"prev", "cur"}
     assert "2 sample boundaries" not in capsys.readouterr().out  # only 1 session
+
+
+def test_main_trace_filter_drops_helper_sessions(mod, tmp_path, capsys):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    _write_profile(prof, "ses_main",
+                   _turn_events(1, 0, 5, 2000, 300, 0, "read")
+                   + _turn_events(2, 7, 7.5, 500, 20, 1500, None))
+    _write_profile(prof, "ses_title", _turn_events(1, 6, 6.2, 100, 10, 0, None))
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(json.dumps({"session_id": "ses_main"}) + "\n")
+    out = tmp_path / "o"
+    rc = mod.main(["--profiles", str(prof), "--trace", str(trace),
+                   "--out", str(out), "--no-figures"])
+    assert rc == 0
+    assert "kept 1/2 sessions" in capsys.readouterr().out
+    ordered = list(csv.DictReader((out / "turns_ordered.csv").open()))
+    assert {r["session_id"] for r in ordered} == {"ses_main"}
+
+
+def test_main_trace_missing_returns_2(mod, tmp_path, capsys):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    _write_profile(prof, "A", _turn_events(1, 0, 5, 2000, 300, 0, None))
+    rc = mod.main(["--profiles", str(prof),
+                   "--trace", str(tmp_path / "nope.jsonl"), "--no-figures"])
+    assert rc == 2
+    assert "trace not found" in capsys.readouterr().err
 
 
 def test_main_missing_profiles_returns_2(mod, tmp_path, capsys):
