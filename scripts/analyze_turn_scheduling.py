@@ -89,6 +89,9 @@ class TurnRec:
     # tool-call steps, where the AI SDK fires start-step only after the
     # stream already finished so duration_s collapses to ~0.
     llm_wall_true_s: float | None = None
+    tool_wall_s: float | None = None   # turn.end tool_wall_s (wall of this
+                                       # step's tool executions)
+    tool_dur_sum_s: float = 0.0        # sum of tool.end duration_s (fallback)
     llm_start_ts: float | None = None  # llm.start event ts (unix s)
     llm_end_ts: float | None = None    # llm.end event ts (unix s)
     tool_names: list[str] = field(default_factory=list)  # tools run IN this step
@@ -139,6 +142,17 @@ class TurnRec:
         if self.llm_wall_true_s is not None and self.llm_wall_true_s > 0:
             return self.llm_wall_true_s
         return self.llm_wall_s
+
+    @property
+    def tool_time_s(self) -> float | None:
+        """Tool execution wall of this step: turn.end tool_wall_s when
+        present, else the sum of tool.end duration_s. None if no tool ran
+        (or no timing was recorded)."""
+        if self.tool_wall_s is not None and self.tool_wall_s > 0:
+            return self.tool_wall_s
+        if self.tool_dur_sum_s > 0:
+            return self.tool_dur_sum_s
+        return None
 
 
 def load_turns(profiles_dir: Path) -> list[TurnRec]:
@@ -191,11 +205,15 @@ def load_turns(profiles_dir: Path) -> list[TurnRec]:
                 t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))
                 if ev.get("llm_wall_true_s") is not None:
                     t.llm_wall_true_s = float(ev["llm_wall_true_s"])
+                if ev.get("tool_wall_s") is not None:
+                    t.tool_wall_s = float(ev["tool_wall_s"])
             elif ev_type == "tool.end":
                 t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))
                 name = ev.get("name")
                 if name:
                     t.tool_names.append(str(name))
+                if ev.get("duration_s") is not None:
+                    t.tool_dur_sum_s += float(ev["duration_s"])
     # adjacency: preceding tools of turn N = tools executed in step N-1;
     # away_s = llm.start(N) - llm.end(N-1) = time the session spent OFF the
     # GPU (tool execution + scaffold) before re-entering.

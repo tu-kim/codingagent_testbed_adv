@@ -146,10 +146,14 @@ def test_hit_series_sorted_filtered_with_session(mod):
     assert s == [(7.5, 1500, "A"), (23.0, 0, "B")]
 
 
-def test_gap_hit_pairs(mod):
+def test_gap_hit_pairs_returns_ratio(mod):
+    # fig4 is ratio-based: _T has input_tokens=100, so ratio = ht/(100+ht)
     turns = [_T("A", 2, 7, 7.5, 0.5, ["read"], [], gap=2.0, hit_tokens=1500),
              _T("A", 1, 0, 5, 5.0, [], [], gap=None, hit_tokens=0)]  # no gap -> dropped
-    assert mod.gap_hit_pairs(turns) == [(2.0, 1500)]
+    pairs = mod.gap_hit_pairs(turns)
+    assert len(pairs) == 1
+    assert pairs[0][0] == 2.0
+    assert pairs[0][1] == pytest.approx(1500 / 1600)
 
 
 def test_categorize_gap_hit_prev_tool(mod):

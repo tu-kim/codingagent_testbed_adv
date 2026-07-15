@@ -10,10 +10,10 @@ establish the low-load baseline for prefix-cache hit vs GPU KV size.
 
 Views (each figure -> PDF when matplotlib is present; CSVs always):
 
-1. fig1_turn_llm_time      per-turn LLM time (llm.end duration_s) as FIXED-
-                           WIDTH thin bars on a TURN-index axis (x = ordinal
-                           turn; width does NOT scale with LLM time), LOG y
-                           over the full range (no clip); red lines at TOP-
+1. fig1_turn_llm_time      THREE stacked panels on a shared TURN-index axis
+                           (thin fixed-width bars, LOG y): (a) per-turn LLM
+                           time, (b) per-turn tool execution time, (c) LLM/
+                           tool ratio (dashed line at 1.0); red lines at TOP-
                            LEVEL sample starts (>= --min-turns-boundary turns
                            AND not nested inside another kept session's
                            window, so `task` sub-agents don't add lines).
@@ -22,18 +22,17 @@ Views (each figure -> PDF when matplotlib is present; CSVs always):
    bottom_pct_tools.csv    for the bottom 10/20/30/40% of the LLM-time
                            distribution, the distribution and % of previous-
                            tool and current-tool.
-3. fig3_hit_vs_kv          shared time axis (x from 0) framed by the RUN
-                           WINDOW (first..last turn): per-turn prefix-cache
-                           HIT TOKENS (tokens.cache.read; left y, PER-SESSION
-                           line segments) + GPU KV-cache usage (right y,
-                           trimmed to the window so an early-started scraper
-                           can't shift the origin); red lines at sample
-                           starts (as in fig1).
+3. fig3_hit_vs_kv          TWO stacked panels: (top) prefix-cache HIT TOKENS
+                           per turn (tokens.cache.read) on a TURN-index axis,
+                           per-session line segments; (bottom) GPU KV-cache
+                           usage (%) on a TIME axis (scrape series trimmed to
+                           the run window so an early-started scraper can't
+                           shift the origin); red sample-start lines on both.
    fig3-1_worker_hit_kv    (with --worker-log) hit rate + KV usage parsed
                            STRAIGHT from the vLLM worker log's engine-stats
                            line — both off one clock, no alignment needed.
 4. fig4_gap_vs_hit         turn gap (llm.start(N) - llm.end(N-1)) vs prefix-
-                           cache HIT TOKENS, points COLORED by the previous
+                           cache hit RATIO, points COLORED by the previous
                            turn's tool (also gap_hit.csv).
    zero_turns.csv          turns whose llm.end duration_s is ~0 (buffered-
                            tool-call steps; see near_zero_turns) — proof
@@ -152,6 +151,27 @@ def trace_session_ids(trace_path: Path) -> set[str]:
 
 def _cur_key(turn) -> str:
     return "+".join(sorted(set(turn.tool_names))) if turn.tool_names else "(none)"
+
+
+def _tool_time(turn) -> float | None:
+    """Per-turn tool execution wall via TurnRec.tool_time_s (turn.end
+    tool_wall_s > sum of tool.end duration_s); None when no tool ran."""
+    return getattr(turn, "tool_time_s", None)
+
+
+def _hit_ratio(turn) -> float | None:
+    """Prefix-cache hit RATIO (cache.read / effective input); falls back
+    to computing it from input_tokens/cache_read for stand-ins without
+    the TurnRec property."""
+    r = getattr(turn, "cache_hit_ratio", None)
+    if r is not None:
+        return r
+    inp = getattr(turn, "input_tokens", None)
+    if inp is None:
+        return None
+    cache = getattr(turn, "cache_read", 0) or 0
+    eff = inp + cache
+    return (cache / eff) if eff else None
 
 
 def _llm_time(turn) -> float | None:
@@ -423,17 +443,17 @@ def trim_to_window(series: list[tuple[float, float]], lo: float, hi: float,
 
 
 def gap_hit_pairs(turns: list) -> list[tuple[float, float]]:
-    """(turn_gap_s, hit_tokens); turn_gap == away_s."""
+    """(turn_gap_s, hit_ratio); turn_gap == away_s."""
     out = []
     for t in turns:
-        h = _hit_tokens(t)
+        h = _hit_ratio(t)
         if t.away_s is not None and h is not None:
             out.append((t.away_s, h))
     return out
 
 
 def categorize_gap_hit(turns: list) -> list[tuple[float, float, str, str, int]]:
-    """(turn_gap, hit_tokens, category, session_id, step) for turns with
+    """(turn_gap, hit_ratio, category, session_id, step) for turns with
     gap + usage data.
 
     category = the previous turn's tool key (prev_key): in sequential runs
@@ -441,7 +461,7 @@ def categorize_gap_hit(turns: list) -> list[tuple[float, float, str, str, int]]:
     tool explains most of the vertical spread at a given gap."""
     out = []
     for t in turns:
-        h = _hit_tokens(t)
+        h = _hit_ratio(t)
         if t.away_s is None or h is None:
             continue
         out.append((t.away_s, h, t.prev_key, t.session_id, t.step))
@@ -490,28 +510,49 @@ def _mpl():
 
 def fig_turn_llm_time(ordered: list, path: Path, *,
                       min_turns_boundary: int = 2) -> None:
-    """Each turn as a THIN bar on a TURN-index axis (x = ordinal turn
-    number); height = LLM time on a LOG y-axis (full range, no clip).
-    Red lines mark top-level SAMPLE starts (turn granularity)."""
+    """Three stacked subplots on a shared TURN-index x axis (thin vline
+    bars, width does not scale with value; log y):
+      (a) per-turn LLM time,
+      (b) per-turn tool execution time,
+      (c) LLM time / tool execution ratio (turns with both).
+    Red lines mark top-level SAMPLE starts on every panel."""
     plt = _mpl()
-    heights = []
+    n = len(ordered)
+    xs = list(range(n))
+    llm, tool, ratio = [], [], []
     for t in ordered:
-        w = _llm_time(t)
-        wall = w if w is not None else 0.0
-        heights.append(wall if wall > 0 else float("nan"))
-    xs = list(range(len(heights)))
-    pos = [h for h in heights if h == h and h > 0]
-    fig, ax = plt.subplots(figsize=(18, 5))
-    ax.set_yscale("log")
-    ax.vlines(xs, 1e-3, heights, color="tab:blue", linewidth=0.7)
-    for b in sample_start_ordinals(ordered, min_turns_boundary):
-        ax.axvline(b, color="crimson", linewidth=0.6, alpha=0.7)
-    ax.set_xlim(0, max(len(xs) - 1, 1))
-    if pos:
-        ax.set_ylim(min(pos) * 0.8, max(pos) * 1.2)
-    ax.set_xlabel("turn")
-    ax.set_ylabel("LLM time / turn (s)")
-    ax.set_title("Per-turn LLM Time vs turn")
+        lw = _llm_time(t)
+        tw = _tool_time(t)
+        llm.append(lw if lw is not None and lw > 0 else float("nan"))
+        tool.append(tw if tw is not None and tw > 0 else float("nan"))
+        ratio.append(lw / tw if lw and tw and lw > 0 and tw > 0
+                     else float("nan"))
+    bounds = sample_start_ordinals(ordered, min_turns_boundary)
+
+    fig, axes = plt.subplots(3, 1, figsize=(18, 12), sharex=True)
+    panels = [
+        (axes[0], llm, "tab:blue", "LLM time / turn (s)",
+         "Per-turn LLM Time vs turn"),
+        (axes[1], tool, "tab:green", "tool exec time / turn (s)",
+         "Per-turn Tool Execution Time vs turn"),
+        (axes[2], ratio, "tab:purple", "LLM time / tool exec",
+         "LLM Time / Tool Execution vs turn"),
+    ]
+    for ax, ys, color, ylabel, title in panels:
+        pos = [v for v in ys if v == v and v > 0]
+        ax.set_yscale("log")
+        ax.vlines(xs, min(pos) if pos else 1e-3, ys, color=color,
+                  linewidth=0.7)
+        for b in bounds:
+            ax.axvline(b, color="crimson", linewidth=0.6, alpha=0.7)
+        if pos:
+            ax.set_ylim(min(pos) * 0.8, max(pos) * 1.2)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+    # ratio panel: mark the 1.0 crossover (LLM-bound above, tool-bound below)
+    axes[2].axhline(1.0, color="gray", linewidth=0.8, ls="--", alpha=0.7)
+    axes[2].set_xlabel("turn")
+    axes[2].set_xlim(0, max(n - 1, 1))
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -538,64 +579,67 @@ def fig_llm_time_cdf(turns: list, path: Path) -> None:
     plt.close(fig)
 
 
-def fig_hit_vs_kv(hits: list[tuple[float, float, str]],
-                  kv: list[tuple[float, float]], path: Path,
+def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
                   *, min_turns: int = 2,
+                  sample_ordinals: list[int] | None = None,
                   sample_times: list[float] | None = None) -> None:
-    """Prefix-cache HIT TOKENS per turn (left y, tokens.cache.read — the
-    absolute KV volume reused) vs GPU KV usage (right y) on a SHARED
-    time axis. The RUN WINDOW (first..last turn hit point) frames
-    it: the KV series is TRIMMED to that window so an early/late scraper
-    can't shift the origin, and both start together at x=0. The per-turn
-    hit line is drawn PER SESSION (no segment crosses a session boundary)
-    and sub-`min_turns` helper sessions are dropped. Red vertical lines
-    mark top-level SAMPLE starts (times relative to the same origin, as
-    in fig1)."""
+    """Two stacked subplots:
+      (top)    prefix-cache HIT TOKENS per turn (tokens.cache.read) on a
+               TURN-index x axis, drawn PER SESSION so no segment crosses
+               a session boundary; red lines at sample-start ordinals.
+      (bottom) GPU KV-cache usage (%) on a TIME x axis (seconds from the
+               run window start; the scrape series is TRIMMED to the run
+               window so an early/late scraper can't shift the origin);
+               red lines at sample-start times."""
     plt = _mpl()
-    # keep only sessions with >= min_turns hit points
-    counts: dict[str, int] = {}
-    for _ts, _h, sid in hits:
-        counts[sid] = counts.get(sid, 0) + 1
-    kept = [(ts, h, sid) for ts, h, sid in hits if counts[sid] >= min_turns]
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(18, 10))
 
-    if kept:
-        lo = min(p[0] for p in kept)
-        hi = max(p[0] for p in kept)
-        kv = trim_to_window(kv, lo, hi)
-    origins = [p[0] for p in kept] + [p[0] for p in kv]
-    t0 = min(origins) if origins else 0.0
-    x_right = 0.0
-
-    fig, ax = plt.subplots(figsize=(18, 6))
-    # sample_times are ABSOLUTE; subtract this axis's own t0 so they line
-    # up with the hit points (which are on the same absolute clock).
-    for b in (sample_times or []):
-        ax.axvline(b - t0, color="crimson", linewidth=1.0, alpha=0.85,
-                   zorder=1)
-    # group kept hits by session, draw each as its own line segment
-    by_sess: dict[str, list[tuple[float, float]]] = {}
-    for ts, h, sid in kept:
-        by_sess.setdefault(sid, []).append((ts, h))
+    # ---- top: hit tokens vs turn ordinal, per-session segments ----
+    by_sess: dict[str, list[tuple[int, float]]] = {}
+    for i, t in enumerate(ordered):
+        h = _hit_tokens(t)
+        if h is not None:
+            by_sess.setdefault(t.session_id, []).append((i, h))
+    for b in (sample_ordinals or []):
+        ax_top.axvline(b, color="crimson", linewidth=1.0, alpha=0.85, zorder=1)
     for sid, pts in by_sess.items():
-        pts.sort()
-        xs = [ts - t0 for ts, _ in pts]
-        ys = [h for _, h in pts]
-        ax.plot(xs, ys, color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
-        if xs:
-            x_right = max(x_right, xs[-1])
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("prefix-cache hit tokens / turn", color="tab:blue")
-    ax.set_ylim(bottom=0)
+        if len(pts) < min_turns and len(by_sess) > 1:
+            continue
+        ax_top.plot([i for i, _ in pts], [h for _, h in pts],
+                    color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
+    ax_top.set_xlim(0, max(len(ordered) - 1, 1))
+    ax_top.set_ylim(bottom=0)
+    ax_top.set_xlabel("turn")
+    ax_top.set_ylabel("prefix-cache hit tokens / turn")
+    ax_top.set_title("Prefix-cache Hit Tokens vs turn")
+
+    # ---- bottom: GPU KV usage (%) vs time ----
+    # run window from the turns' own clock; trim + rebase the scrape series
+    ts_all = [t.llm_end_ts for t in ordered if t.llm_end_ts is not None] + \
+             [t.llm_start_ts for t in ordered if t.llm_start_ts is not None]
+    if ts_all:
+        lo, hi = min(ts_all), max(ts_all)
+        kv = trim_to_window(kv, lo, hi)
+        t0 = min([lo] + [p[0] for p in kv])
+    else:
+        t0 = min((p[0] for p in kv), default=0.0)
+    x_right = 0.0
+    for b in (sample_times or []):
+        ax_bot.axvline(b - t0, color="crimson", linewidth=1.0, alpha=0.85,
+                       zorder=1)
     if kv:
-        ax2 = ax.twinx()
         kx = [t - t0 for t, _ in kv]
-        ax2.plot(kx, [v for _, v in kv], color="tab:orange", lw=1.0,
-                 label="KV usage")
-        ax2.set_ylabel("GPU KV-cache usage", color="tab:orange")
-        if kx:
-            x_right = max(x_right, kx[-1])
-    ax.set_xlim(0, x_right if x_right > 0 else 1)
-    ax.set_title("KV Cache Status vs time")
+        ax_bot.plot(kx, [v * 100.0 for _, v in kv], color="tab:orange",
+                    lw=1.0, zorder=2)
+        x_right = kx[-1]
+    if ts_all:
+        x_right = max(x_right, hi - t0)
+    ax_bot.set_xlim(0, x_right if x_right > 0 else 1)
+    ax_bot.set_ylim(bottom=0)
+    ax_bot.set_xlabel("time (s)")
+    ax_bot.set_ylabel("GPU KV-cache usage (%)")
+    ax_bot.set_title("GPU KV-cache Usage vs time")
+
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -632,7 +676,7 @@ def fig_worker_hit_kv(hits: list[tuple[float, float]],
 
 def fig_gap_vs_hit(cats: list[tuple[float, float, str, str, int]],
                    path: Path) -> None:
-    """Scatter of turn gap vs hit tokens, COLORED by the previous turn's
+    """Scatter of turn gap vs hit ratio, COLORED by the previous turn's
     tool so the vertical spread at a given gap is explained."""
     plt = _mpl()
     fig, ax = plt.subplots(figsize=(6.5, 4))
@@ -645,11 +689,11 @@ def fig_gap_vs_hit(cats: list[tuple[float, float, str, str, int]],
         hs = [p[1] for p in pts]
         ax.scatter(gs, hs, s=14, alpha=0.6, label=f"{c} ({len(pts)})")
     ax.set_xlabel("turn gap (s)")
-    ax.set_ylabel("prefix-cache hit tokens")
-    ax.set_ylim(bottom=0)
+    ax.set_ylabel("prefix-cache hit ratio")
+    ax.set_ylim(0, 1)
     if groups:
         ax.legend(fontsize=7, loc="best", framealpha=0.7)
-    ax.set_title("Prefix-cache hit tokens vs turn gap")
+    ax.set_title("Prefix-cache hit vs turn gap")
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -764,8 +808,8 @@ def main(argv: list[str] | None = None) -> int:
     ordered = order_turns(turns)
     samples = sample_start_times(ordered, min_boundary)
     samples_abs = sample_start_times_abs(ordered, min_boundary)
+    sample_ords = sample_start_ordinals(ordered, min_boundary)
     bottom_rows = bottom_pct_tool_dist(turns, cutoffs)
-    hits = hit_series(turns)
     cats = categorize_gap_hit(turns)
     have_metrics = args.metrics is not None and args.metrics.exists()
     kv = kv_usage_series(args.metrics) if have_metrics else []
@@ -776,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
     write_bottom_pct_csv(out_dir / "bottom_pct_tools.csv", bottom_rows)
     with (out_dir / "gap_hit.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["session_id", "step", "turn_gap_s", "cache_hit_tokens", "category"])
+        w.writerow(["session_id", "step", "turn_gap_s", "cache_hit_ratio", "category"])
         for g, h, c, sid, step in cats:
             w.writerow([sid, step, g, h, c])
 
@@ -803,8 +847,10 @@ def main(argv: list[str] | None = None) -> int:
             fig_turn_llm_time(ordered, out_dir / "fig1_turn_llm_time.pdf",
                               min_turns_boundary=min_boundary)
             fig_llm_time_cdf(turns, out_dir / "fig2_llm_time_cdf.pdf")
-            fig_hit_vs_kv(hits, kv, out_dir / "fig3_hit_vs_kv.pdf",
-                          min_turns=min_boundary, sample_times=samples_abs)
+            fig_hit_vs_kv(ordered, kv, out_dir / "fig3_hit_vs_kv.pdf",
+                          min_turns=min_boundary,
+                          sample_ordinals=sample_ords,
+                          sample_times=samples_abs)
             fig_gap_vs_hit(cats, out_dir / "fig4_gap_vs_hit.pdf")
             if args.worker_log and args.worker_log.exists():
                 wl_hits, wl_kv = worker_log_series(args.worker_log)
