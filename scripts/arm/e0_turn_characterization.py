@@ -511,46 +511,76 @@ def _mpl():
 def fig_turn_llm_time(ordered: list, path: Path, *,
                       min_turns_boundary: int = 2) -> None:
     """Three stacked subplots on a shared TURN-index x axis (thin vline
-    bars, width does not scale with value; log y):
-      (a) per-turn LLM time,
-      (b) per-turn tool execution time,
-      (c) LLM time / tool execution ratio (turns with both).
+    bars, width does not scale with value):
+      (a) per-turn LLM time (log y),
+      (b) per-turn tool execution time (log y); turns that ran the `task`
+          sub-agent tool are drawn in a distinct color,
+      (c) signed log2(LLM / tool): 0 = equal, POSITIVE (LLM-bound) bars
+          go up in one color, NEGATIVE (tool-bound) go down in another,
+          so the balance flips visibly around the zero line.
     Red lines mark top-level SAMPLE starts on every panel."""
     plt = _mpl()
     n = len(ordered)
     xs = list(range(n))
-    llm, tool, ratio = [], [], []
+    llm, tool, tool_colors, ratio, ratio_colors = [], [], [], [], []
     for t in ordered:
         lw = _llm_time(t)
         tw = _tool_time(t)
         llm.append(lw if lw is not None and lw > 0 else float("nan"))
         tool.append(tw if tw is not None and tw > 0 else float("nan"))
-        ratio.append(lw / tw if lw and tw and lw > 0 and tw > 0
-                     else float("nan"))
+        is_task = any(str(name) == "task" for name in t.tool_names)
+        tool_colors.append("tab:red" if is_task else "tab:green")
+        if lw and tw and lw > 0 and tw > 0:
+            r = math.log2(lw / tw)     # >0 LLM-bound, <0 tool-bound
+            ratio.append(r)
+            ratio_colors.append("tab:blue" if r >= 0 else "tab:orange")
+        else:
+            ratio.append(float("nan"))
+            ratio_colors.append("none")
     bounds = sample_start_ordinals(ordered, min_turns_boundary)
 
     fig, axes = plt.subplots(3, 1, figsize=(18, 12), sharex=True)
-    panels = [
-        (axes[0], llm, "tab:blue", "LLM time / turn (s)",
-         "Per-turn LLM Time vs turn"),
-        (axes[1], tool, "tab:green", "tool exec time / turn (s)",
-         "Per-turn Tool Execution Time vs turn"),
-        (axes[2], ratio, "tab:purple", "LLM time / tool exec",
-         "LLM Time / Tool Execution vs turn"),
-    ]
-    for ax, ys, color, ylabel, title in panels:
-        pos = [v for v in ys if v == v and v > 0]
-        ax.set_yscale("log")
-        ax.vlines(xs, min(pos) if pos else 1e-3, ys, color=color,
-                  linewidth=0.7)
+
+    # (a) LLM time — log y
+    lpos = [v for v in llm if v == v and v > 0]
+    axes[0].set_yscale("log")
+    axes[0].vlines(xs, min(lpos) if lpos else 1e-3, llm, color="tab:blue",
+                   linewidth=0.7)
+    if lpos:
+        axes[0].set_ylim(min(lpos) * 0.8, max(lpos) * 1.2)
+    axes[0].set_ylabel("LLM time / turn (s)")
+    axes[0].set_title("Per-turn LLM Time vs turn")
+
+    # (b) tool exec time — log y, task-tool turns colored distinctly
+    tpos = [v for v in tool if v == v and v > 0]
+    axes[1].set_yscale("log")
+    axes[1].vlines(xs, min(tpos) if tpos else 1e-3, tool, color=tool_colors,
+                   linewidth=0.7)
+    if tpos:
+        axes[1].set_ylim(min(tpos) * 0.8, max(tpos) * 1.2)
+    axes[1].set_ylabel("tool exec time / turn (s)")
+    axes[1].set_title("Per-turn Tool Execution Time vs turn "
+                      "(red = task sub-agent)")
+    axes[1].plot([], [], color="tab:red", label="task tool")
+    axes[1].plot([], [], color="tab:green", label="other tools")
+    axes[1].legend(fontsize=8, loc="upper right", framealpha=0.7)
+
+    # (c) signed log2 ratio — linear y around 0, up/down by sign+color
+    axes[2].vlines(xs, 0.0, ratio, color=ratio_colors, linewidth=0.7)
+    axes[2].axhline(0.0, color="gray", linewidth=0.8, alpha=0.7)
+    rpos = [v for v in ratio if v == v]
+    if rpos:
+        lim = max(abs(min(rpos)), abs(max(rpos))) * 1.1 or 1.0
+        axes[2].set_ylim(-lim, lim)
+    axes[2].set_ylabel("log2(LLM / tool)  +up LLM-bound / -down tool-bound")
+    axes[2].set_title("LLM Time / Tool Execution vs turn")
+    axes[2].plot([], [], color="tab:blue", label="LLM-bound (>0)")
+    axes[2].plot([], [], color="tab:orange", label="tool-bound (<0)")
+    axes[2].legend(fontsize=8, loc="upper right", framealpha=0.7)
+
+    for ax in axes:
         for b in bounds:
             ax.axvline(b, color="crimson", linewidth=0.6, alpha=0.7)
-        if pos:
-            ax.set_ylim(min(pos) * 0.8, max(pos) * 1.2)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-    # ratio panel: mark the 1.0 crossover (LLM-bound above, tool-bound below)
-    axes[2].axhline(1.0, color="gray", linewidth=0.8, ls="--", alpha=0.7)
     axes[2].set_xlabel("turn")
     axes[2].set_xlim(0, max(n - 1, 1))
     fig.savefig(path, dpi=200, bbox_inches="tight")
