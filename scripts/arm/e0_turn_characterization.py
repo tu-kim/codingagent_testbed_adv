@@ -696,10 +696,17 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
             by_sess.setdefault(t.session_id, []).append((i, h))
     for b in (sample_ordinals or []):
         ax_top.axvline(b, color="crimson", linewidth=0.5, alpha=0.7, zorder=1)
+    drew_sample = drew_sub = False
     for sid, pts in by_sess.items():
         pts.sort()
         nested = assign.get(sid, sid) != sid
-        marker, ms = ("^", 5) if nested else (".", 3)
+        marker, ms = ("^", 2.5) if nested else (".", 3)
+        # add each marker style to the legend exactly once
+        label = None
+        if nested and not drew_sub:
+            label, drew_sub = "task sub-agent", True
+        elif not nested and not drew_sample:
+            label, drew_sample = "sample", True
         # Break the line wherever this session's ordinals are NOT
         # consecutive: a gap means another session's turns run there (the
         # parent is PAUSED while its `task` sub-agent runs). Drawing one
@@ -712,16 +719,19 @@ def fig_hit_vs_kv(ordered: list, kv: list[tuple[float, float]], path: Path,
         for i, h in pts:
             if prev_i is not None and i - prev_i > 1:
                 ax_top.plot(seg_x, seg_y, color="tab:blue", marker=marker,
-                            ms=ms, lw=0.8, zorder=2)
+                            ms=ms, lw=0.8, zorder=2, label=label)
+                label = None            # label only the first segment
                 seg_x, seg_y = [], []
             seg_x.append(i)
             seg_y.append(h)
             prev_i = i
         if seg_x:
             ax_top.plot(seg_x, seg_y, color="tab:blue", marker=marker,
-                        ms=ms, lw=0.8, zorder=2)
+                        ms=ms, lw=0.8, zorder=2, label=label)
     ax_top.set_xlim(0, max(len(ordered) - 1, 1))
     ax_top.set_ylim(bottom=0)
+    if drew_sample or drew_sub:
+        ax_top.legend(fontsize=8, loc="upper right", framealpha=0.7)
     ax_top.set_xlabel("turn")
     ax_top.set_ylabel("prefix-cache hit tokens / turn")
     ax_top.set_title("Prefix-cache Hit Tokens vs turn")
