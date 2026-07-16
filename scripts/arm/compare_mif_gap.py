@@ -76,16 +76,19 @@ def gap_rows(profiles: Path, trace: Path, e0, ats,
                                           # prefill leaking into the gap
                                           # (start-step is consumed only when
                                           # the response stream begins)
-    A large server_s means the gap inflation is NOT host contention at all
-    but LLM-side queueing miscounted into the gap.
-
-    Receive-timestamp source, in order:
-      1. recv_ts (nvext in-band) when present;
-      2. FALLBACK when --logs is given: worker SCHED_DELAY `queued_ts`
-         joined EXACTLY by the profile's request_id (engine-queue entry;
-         a hair later than HTTP receipt, so `client` is a slight over-
-         estimate — fine for a 60x split).
-    Both None when neither source resolves."""
+    Two independent server-side signals (either may be absent):
+      * client_s / server_s from nvext recv_ts (unix, same clock as the
+        profile): client = recv - llm.end(N-1) (host-side scaffold+tool
+        window), server = llm.start(N) - recv (frontend queue + engine
+        queue + prefill leaking into the gap). Precise but needs recv_ts.
+      * queue_s from --logs SCHED_DELAY `queue_ms` joined by request_id:
+        the ENGINE scheduling delay (scheduled_ts - queued_ts), a clock-
+        INDEPENDENT DURATION. This is the safe fallback — the SCHED_DELAY
+        `queued_ts` is a vLLM MONOTONIC clock, NOT unix, so its absolute
+        value must never be subtracted from the profile's unix timestamps
+        (that produced epoch-sized nonsense); only the queue_ms duration
+        is meaningful. queue_s is a LOWER BOUND on server-side time (it
+        excludes frontend + prefill)."""
     turns = ats.load_turns(profiles)
     ids = e0.trace_session_ids(trace)
     turns = [t for t in turns if t.session_id in ids]
@@ -98,17 +101,18 @@ def gap_rows(profiles: Path, trace: Path, e0, ats,
         prev = by_key.get((t.session_id, t.step - 1))
         tool = (getattr(prev, "tool_time_s", None) or 0.0) if prev else 0.0
         gap = t.away_s
-        recv = t.recv_ts
-        if recv is None and t.request_id and t.request_id in sched:
-            recv = sched[t.request_id].anchor_ts
         client_s = server_s = None
-        if (recv is not None and t.llm_start_ts is not None
+        if (t.recv_ts is not None and t.llm_start_ts is not None
                 and prev is not None and prev.llm_end_ts is not None):
-            client_s = max(0.0, recv - prev.llm_end_ts)
-            server_s = max(0.0, t.llm_start_ts - recv)
+            client_s = max(0.0, t.recv_ts - prev.llm_end_ts)
+            server_s = max(0.0, t.llm_start_ts - t.recv_ts)
+        queue_s = None
+        if t.request_id and t.request_id in sched:
+            queue_s = sched[t.request_id].total_queue_ms / 1000.0
         rows.append({"gap": gap, "tool": tool,
                      "others": max(0.0, gap - tool),
-                     "client": client_s, "server": server_s})
+                     "client": client_s, "server": server_s,
+                     "queue": queue_s})
     return rows
 
 
@@ -139,7 +143,7 @@ def tool_durations(profiles: Path, keep_ids: set[str]) -> dict[str, list[float]]
 
 def summarize(rows: list[dict]) -> dict:
     out = {}
-    for k in ("gap", "tool", "others", "client", "server"):
+    for k in ("gap", "tool", "others", "client", "server", "queue"):
         vals = [r[k] for r in rows if r.get(k) is not None]
         out[k] = {"n": len(vals),
                   "p50": _pct(vals, 0.5),
@@ -263,21 +267,26 @@ def main(argv: list[str] | None = None) -> int:
         for label, rows in runs:
             s = summarize(rows)
             print(f"\n[{label}]  turns={len(rows)}")
-            for comp in ("gap", "tool", "others", "client", "server"):
+            for comp in ("gap", "tool", "others", "client", "server", "queue"):
                 c = s[comp]
                 if c["n"] == 0:
                     if comp in ("client", "server"):
-                        print(f"  {comp:7s} (no recv_ts — dynamo nvext "
-                              "timing absent)")
+                        print(f"  {comp:7s} (no nvext recv_ts)")
+                    elif comp == "queue":
+                        print(f"  {comp:7s} (no SCHED_DELAY match — pass "
+                              "--logs and check request_id)")
                     continue
                 print(f"  {comp:7s} p50={c['p50']:.3f}  p90={c['p90']:.3f}  "
                       f"p99={c['p99']:.3f}  mean={c['mean']:.3f}  n={c['n']}")
                 w.writerow([label, comp, c["n"], f"{c['p50']:.4f}",
                             f"{c['p90']:.4f}", f"{c['p99']:.4f}",
                             f"{c['mean']:.4f}"])
-        print("\nclient = llm.end(N-1) -> server RECEIVED request (true "
-              "host-side scaffold+tool window)\nserver = request at server "
-              "-> llm.start fired (LLM queue/prefill leaking into the gap)")
+        print("\nclient/server (need nvext recv_ts): client = llm.end(N-1) -> "
+              "server received; server = -> llm.start (frontend+queue+prefill)"
+              "\nqueue (from SCHED_DELAY queue_ms, clock-independent): ENGINE "
+              "scheduling delay = LOWER BOUND on server-side time. If queue "
+              "p50 ~ others p50, the gap is queue-dominated (LLM-side), not "
+              "host contention.")
 
     if not args.no_figures:
         try:
