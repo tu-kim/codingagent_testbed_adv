@@ -59,8 +59,25 @@ def _pct(vals: list[float], q: float) -> float:
 
 
 def gap_rows(profiles: Path, trace: Path, e0, ats) -> list[dict]:
-    """Per-turn (gap, tool, others) for the run's MAIN sessions. tool is
-    the PREVIOUS step's tool wall (the tools that ran during this gap)."""
+    """Per-turn gap decomposition for the run's MAIN sessions.
+
+    gap = tool + others, with `tool` = the PREVIOUS step's tool wall.
+
+    `others` is further split using dynamo's server-side receive timestamp
+    (llm.end.dynamo.request_received_unix_s of THIS turn, recv_ts):
+      client_s = recv_ts - llm.end(N-1)   # true client-side scaffold window
+                                          # (post-processing, event loop,
+                                          # request build) up to the moment
+                                          # the server RECEIVED the request
+      server_s = llm.start(N) - recv_ts   # request was already AT the server
+                                          # but the profile hook hadn't fired:
+                                          # frontend queue + engine queue +
+                                          # prefill leaking into the gap
+                                          # (start-step is consumed only when
+                                          # the response stream begins)
+    A large server_s means the gap inflation is NOT host contention at all
+    but LLM-side queueing miscounted into the gap. None when recv_ts is
+    missing (non-dynamo or unpatched runs)."""
     turns = ats.load_turns(profiles)
     ids = e0.trace_session_ids(trace)
     turns = [t for t in turns if t.session_id in ids]
@@ -72,8 +89,14 @@ def gap_rows(profiles: Path, trace: Path, e0, ats) -> list[dict]:
         prev = by_key.get((t.session_id, t.step - 1))
         tool = (getattr(prev, "tool_time_s", None) or 0.0) if prev else 0.0
         gap = t.away_s
+        client_s = server_s = None
+        if (t.recv_ts is not None and t.llm_start_ts is not None
+                and prev is not None and prev.llm_end_ts is not None):
+            client_s = max(0.0, t.recv_ts - prev.llm_end_ts)
+            server_s = max(0.0, t.llm_start_ts - t.recv_ts)
         rows.append({"gap": gap, "tool": tool,
-                     "others": max(0.0, gap - tool)})
+                     "others": max(0.0, gap - tool),
+                     "client": client_s, "server": server_s})
     return rows
 
 
@@ -103,14 +126,15 @@ def tool_durations(profiles: Path, keep_ids: set[str]) -> dict[str, list[float]]
 
 
 def summarize(rows: list[dict]) -> dict:
-    def col(k):
-        return [r[k] for r in rows]
-    return {k: {"n": len(rows),
-                "p50": _pct(col(k), 0.5),
-                "p90": _pct(col(k), 0.9),
-                "p99": _pct(col(k), 0.99),
-                "mean": (sum(col(k)) / len(rows)) if rows else float("nan")}
-            for k in ("gap", "tool", "others")}
+    out = {}
+    for k in ("gap", "tool", "others", "client", "server"):
+        vals = [r[k] for r in rows if r.get(k) is not None]
+        out[k] = {"n": len(vals),
+                  "p50": _pct(vals, 0.5),
+                  "p90": _pct(vals, 0.9),
+                  "p99": _pct(vals, 0.99),
+                  "mean": (sum(vals) / len(vals)) if vals else float("nan")}
+    return out
 
 
 # ---------- figures ----------
@@ -220,13 +244,21 @@ def main(argv: list[str] | None = None) -> int:
         for label, rows in runs:
             s = summarize(rows)
             print(f"\n[{label}]  turns={len(rows)}")
-            for comp in ("gap", "tool", "others"):
+            for comp in ("gap", "tool", "others", "client", "server"):
                 c = s[comp]
+                if c["n"] == 0:
+                    if comp in ("client", "server"):
+                        print(f"  {comp:7s} (no recv_ts — dynamo nvext "
+                              "timing absent)")
+                    continue
                 print(f"  {comp:7s} p50={c['p50']:.3f}  p90={c['p90']:.3f}  "
-                      f"p99={c['p99']:.3f}  mean={c['mean']:.3f}")
+                      f"p99={c['p99']:.3f}  mean={c['mean']:.3f}  n={c['n']}")
                 w.writerow([label, comp, c["n"], f"{c['p50']:.4f}",
                             f"{c['p90']:.4f}", f"{c['p99']:.4f}",
                             f"{c['mean']:.4f}"])
+        print("\nclient = llm.end(N-1) -> server RECEIVED request (true "
+              "host-side scaffold+tool window)\nserver = request at server "
+              "-> llm.start fired (LLM queue/prefill leaking into the gap)")
 
     if not args.no_figures:
         try:

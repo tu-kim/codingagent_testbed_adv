@@ -1962,6 +1962,21 @@ def main(argv: list[str] | None = None) -> int:
         print("no sessions parsed from input", file=sys.stderr)
         return 1
 
+    # --trace also FILTERS to the run's MAIN (parent-agent) sessions:
+    # profiles/ additionally holds title-generation and `task` sub-agent
+    # sessions, which would otherwise pollute every distribution.
+    if args.trace is not None and args.trace.is_file():
+        main_ids = set(_load_trace_repo_map(args.trace).keys())
+        if main_ids:
+            before = len(sessions)
+            sessions = {sid: s for sid, s in sessions.items()
+                        if sid in main_ids}
+            print(f"--trace filter: kept {len(sessions)}/{before} sessions "
+                  f"(main sessions in trace: {len(main_ids)})")
+            if not sessions:
+                print("no sessions left after --trace filter", file=sys.stderr)
+                return 1
+
     n_turns = sum(len(s.turns) for s in sessions.values())
     n_tools = sum(len(t.tools) for s in sessions.values() for t in s.turns.values())
     n_excl = sum(1 for s in sessions.values() for t in s.turns.values()
