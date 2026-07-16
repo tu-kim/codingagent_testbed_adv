@@ -107,12 +107,18 @@ def gap_rows(profiles: Path, trace: Path, e0, ats,
             client_s = max(0.0, t.recv_ts - prev.llm_end_ts)
             server_s = max(0.0, t.llm_start_ts - t.recv_ts)
         queue_s = None
+        host_ub = None
+        others = max(0.0, gap - tool)
         if t.request_id and t.request_id in sched:
             queue_s = sched[t.request_id].total_queue_ms / 1000.0
-        rows.append({"gap": gap, "tool": tool,
-                     "others": max(0.0, gap - tool),
+            # host UPPER bound: gap minus tool minus engine queue. Still
+            # includes frontend queue + prefill (server-side), so it OVER-
+            # estimates host scaffold. Computed per turn (never subtract
+            # percentiles).
+            host_ub = max(0.0, others - queue_s)
+        rows.append({"gap": gap, "tool": tool, "others": others,
                      "client": client_s, "server": server_s,
-                     "queue": queue_s})
+                     "queue": queue_s, "host_ub": host_ub})
     return rows
 
 
@@ -143,7 +149,7 @@ def tool_durations(profiles: Path, keep_ids: set[str]) -> dict[str, list[float]]
 
 def summarize(rows: list[dict]) -> dict:
     out = {}
-    for k in ("gap", "tool", "others", "client", "server", "queue"):
+    for k in ("gap", "tool", "others", "client", "server", "queue", "host_ub"):
         vals = [r[k] for r in rows if r.get(k) is not None]
         out[k] = {"n": len(vals),
                   "p50": _pct(vals, 0.5),
@@ -267,12 +273,12 @@ def main(argv: list[str] | None = None) -> int:
         for label, rows in runs:
             s = summarize(rows)
             print(f"\n[{label}]  turns={len(rows)}")
-            for comp in ("gap", "tool", "others", "client", "server", "queue"):
+            for comp in ("gap", "tool", "others", "client", "server", "queue", "host_ub"):
                 c = s[comp]
                 if c["n"] == 0:
                     if comp in ("client", "server"):
                         print(f"  {comp:7s} (no nvext recv_ts)")
-                    elif comp == "queue":
+                    elif comp in ("queue", "host_ub"):
                         print(f"  {comp:7s} (no SCHED_DELAY match — pass "
                               "--logs and check request_id)")
                     continue
@@ -286,7 +292,10 @@ def main(argv: list[str] | None = None) -> int:
               "\nqueue (from SCHED_DELAY queue_ms, clock-independent): ENGINE "
               "scheduling delay = LOWER BOUND on server-side time. If queue "
               "p50 ~ others p50, the gap is queue-dominated (LLM-side), not "
-              "host contention.")
+              "host contention."
+              "\nhost_ub (per turn = others - queue): UPPER bound on host-side "
+              "time (still includes frontend queue + prefill). Small host_ub "
+              "== host contention negligible; the gap is LLM-side.")
 
     if not args.no_figures:
         try:
