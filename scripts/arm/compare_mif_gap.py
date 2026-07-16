@@ -58,7 +58,8 @@ def _pct(vals: list[float], q: float) -> float:
     return s[idx]
 
 
-def gap_rows(profiles: Path, trace: Path, e0, ats) -> list[dict]:
+def gap_rows(profiles: Path, trace: Path, e0, ats,
+             logs: Path | None = None) -> list[dict]:
     """Per-turn gap decomposition for the run's MAIN sessions.
 
     gap = tool + others, with `tool` = the PREVIOUS step's tool wall.
@@ -76,11 +77,19 @@ def gap_rows(profiles: Path, trace: Path, e0, ats) -> list[dict]:
                                           # (start-step is consumed only when
                                           # the response stream begins)
     A large server_s means the gap inflation is NOT host contention at all
-    but LLM-side queueing miscounted into the gap. None when recv_ts is
-    missing (non-dynamo or unpatched runs)."""
+    but LLM-side queueing miscounted into the gap.
+
+    Receive-timestamp source, in order:
+      1. recv_ts (nvext in-band) when present;
+      2. FALLBACK when --logs is given: worker SCHED_DELAY `queued_ts`
+         joined EXACTLY by the profile's request_id (engine-queue entry;
+         a hair later than HTTP receipt, so `client` is a slight over-
+         estimate — fine for a 60x split).
+    Both None when neither source resolves."""
     turns = ats.load_turns(profiles)
     ids = e0.trace_session_ids(trace)
     turns = [t for t in turns if t.session_id in ids]
+    sched = ats.load_sched(logs) if logs is not None and logs.exists() else {}
     by_key = {(t.session_id, t.step): t for t in turns}
     rows: list[dict] = []
     for t in turns:
@@ -89,11 +98,14 @@ def gap_rows(profiles: Path, trace: Path, e0, ats) -> list[dict]:
         prev = by_key.get((t.session_id, t.step - 1))
         tool = (getattr(prev, "tool_time_s", None) or 0.0) if prev else 0.0
         gap = t.away_s
+        recv = t.recv_ts
+        if recv is None and t.request_id and t.request_id in sched:
+            recv = sched[t.request_id].anchor_ts
         client_s = server_s = None
-        if (t.recv_ts is not None and t.llm_start_ts is not None
+        if (recv is not None and t.llm_start_ts is not None
                 and prev is not None and prev.llm_end_ts is not None):
-            client_s = max(0.0, t.recv_ts - prev.llm_end_ts)
-            server_s = max(0.0, t.llm_start_ts - t.recv_ts)
+            client_s = max(0.0, recv - prev.llm_end_ts)
+            server_s = max(0.0, t.llm_start_ts - recv)
         rows.append({"gap": gap, "tool": tool,
                      "others": max(0.0, gap - tool),
                      "client": client_s, "server": server_s})
@@ -213,6 +225,12 @@ def main(argv: list[str] | None = None) -> int:
                     "PROFILES", "TRACE"), required=True,
                     help="a run to compare: <label> <profiles_dir> "
                          "<trace.jsonl>; repeatable (one per mif)")
+    ap.add_argument("--logs", action="append", nargs=2, metavar=("LABEL",
+                    "LOGS_DIR"), default=[],
+                    help="worker-log dir for a run (SCHED_DELAY queued_ts "
+                         "fallback for the client/server split when the "
+                         "profile carries no nvext recv_ts); label must "
+                         "match a --run label")
     ap.add_argument("--out", type=Path, default=Path("mif_gap"))
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -220,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     ats = _load("analyze_turn_scheduling", _ATS_PATH)
     e0 = _load("e0_turn_characterization", _E0_PATH)
 
+    logs_by_label = {label: Path(p) for label, p in args.logs}
     runs: list[tuple[str, list[dict]]] = []
     runs_tools: list[tuple[str, dict[str, list[float]]]] = []
     for label, prof_s, trace_s in args.run:
@@ -230,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         if not trace.is_file():
             print(f"error: trace not found: {trace}", file=sys.stderr)
             return 2
-        rows = gap_rows(prof, trace, e0, ats)
+        rows = gap_rows(prof, trace, e0, ats, logs=logs_by_label.get(label))
         runs.append((label, rows))
         runs_tools.append((label,
                            tool_durations(prof, e0.trace_session_ids(trace))))
