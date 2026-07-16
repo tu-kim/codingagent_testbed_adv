@@ -1,28 +1,46 @@
 #!/usr/bin/env python3
 """Compare the turn-GAP decomposition across max-in-flight (mif) settings
-to locate the cause of gap inflation:
+to locate the cause of gap inflation.
 
-  gap    = away_s(N) = llm.start(N) - llm.end(N-1)   (off-GPU time)
-  tool   = tool execution wall of the PREVIOUS step (the tools that ran
-           in this gap)                              -> CPU-contention signal
-  others = max(0, gap - tool)                        -> scaffold / post-
-           processing (opencode snapshot, DB writes, git, event loop)
+CANONICAL DEFINITION (prefill is NOT part of the gap — it is real GPU
+compute, not waiting/overhead, so it is subtracted out):
 
-If tool time itself inflates with mif -> CPU contention on tool execution.
-If only `others` inflates -> opencode post-processing / event-loop
-contention (the single server servicing more sessions).
+  turn_gap = tool + scaffold + queue_wait
+
+    tool        tool execution wall of the PREVIOUS step (host, off-GPU)
+    scaffold    gap_full - tool - ttft   (host: opencode post-processing,
+                snapshot/DB/git, event loop, request build)
+    queue_wait  vLLM ENGINE queue delay  (SCHED_DELAY queue_ms; server,
+                waiting to be scheduled)
+
+  where the raw full gap and the removed prefill are:
+    gap_full = away_s(N) = llm.start(N) - llm.end(N-1)   (includes prefill)
+    ttft     = server receive -> first token (frontend ttft_ms)
+    prefill  = ttft - queue_wait                          (on-GPU compute)
+    turn_gap = gap_full - prefill
+
+Component sources: `tool` from profiles; `queue_wait` from --logs
+SCHED_DELAY (clock-independent duration); `ttft` (-> prefill, scaffold,
+turn_gap) from --frontend. Without --frontend only `host_ub` = gap_full -
+tool - queue_wait is available (scaffold upper bound: still includes
+prefill). All joins are by request_id.
+
+If tool inflates with mif -> CPU contention on tool execution.
+If scaffold inflates -> opencode post-processing / event-loop contention.
+If queue_wait inflates -> LLM serving saturation (not host-side at all).
 
 CRITICAL: across mif settings the processing ORDER differs and the run is
 non-deterministic, so the SAME session's turns / llm / tool internals all
-differ. We therefore compare DISTRIBUTIONS (percentiles, CDFs), never
-paired per-turn, and additionally break tool time out PER TOOL NAME so a
-mif that merely happened to run more expensive tools is not mistaken for
-contention.
+differ. We compare DISTRIBUTIONS (percentiles, CDFs), never paired
+per-turn, and break tool time out PER TOOL NAME so a mif that merely ran
+more expensive tools is not mistaken for contention.
 
 Usage:
   scripts/arm/compare_mif_gap.py \\
-      --run mif1 <profiles_dir> <trace.jsonl> \\
-      --run mif4 <profiles_dir> <trace.jsonl> \\
+      --run  mif4  <profiles> <trace.jsonl> \\
+      --logs mif4  <logs_dir> --frontend mif4 <logs_dir>/frontend.log \\
+      --run  mif16 <profiles> <trace.jsonl> \\
+      --logs mif16 <logs_dir> --frontend mif16 <logs_dir>/frontend.log \\
       [--out <dir>] [--no-figures]
 """
 
@@ -85,35 +103,20 @@ def _pct(vals: list[float], q: float) -> float:
 def gap_rows(profiles: Path, trace: Path, e0, ats,
              logs: Path | None = None,
              frontend: Path | None = None) -> list[dict]:
-    """Per-turn gap decomposition for the run's MAIN sessions.
+    """Per-turn CANONICAL gap decomposition for the run's MAIN sessions:
 
-    gap = tool + others, with `tool` = the PREVIOUS step's tool wall.
+        turn_gap = tool + scaffold + queue_wait   (prefill removed)
 
-    `others` is further split using dynamo's server-side receive timestamp
-    (llm.end.dynamo.request_received_unix_s of THIS turn, recv_ts):
-      client_s = recv_ts - llm.end(N-1)   # true client-side scaffold window
-                                          # (post-processing, event loop,
-                                          # request build) up to the moment
-                                          # the server RECEIVED the request
-      server_s = llm.start(N) - recv_ts   # request was already AT the server
-                                          # but the profile hook hadn't fired:
-                                          # frontend queue + engine queue +
-                                          # prefill leaking into the gap
-                                          # (start-step is consumed only when
-                                          # the response stream begins)
-    Two independent server-side signals (either may be absent):
-      * client_s / server_s from nvext recv_ts (unix, same clock as the
-        profile): client = recv - llm.end(N-1) (host-side scaffold+tool
-        window), server = llm.start(N) - recv (frontend queue + engine
-        queue + prefill leaking into the gap). Precise but needs recv_ts.
-      * queue_s from --logs SCHED_DELAY `queue_ms` joined by request_id:
-        the ENGINE scheduling delay (scheduled_ts - queued_ts), a clock-
-        INDEPENDENT DURATION. This is the safe fallback — the SCHED_DELAY
-        `queued_ts` is a vLLM MONOTONIC clock, NOT unix, so its absolute
-        value must never be subtracted from the profile's unix timestamps
-        (that produced epoch-sized nonsense); only the queue_ms duration
-        is meaningful. queue_s is a LOWER BOUND on server-side time (it
-        excludes frontend + prefill)."""
+    Columns per row (None when the needed source is absent):
+      gap_full   away_s(N) = llm.start(N) - llm.end(N-1)  (raw, incl prefill)
+      tool       previous step's tool wall
+      queue_wait vLLM engine queue delay (SCHED_DELAY queue_ms, needs --logs)
+      prefill    ttft - queue_wait   (on-GPU compute, needs --frontend)
+      scaffold   gap_full - tool - ttft   (host residual, needs --frontend)
+      turn_gap   tool + scaffold + queue_wait = gap_full - prefill
+      host_ub    gap_full - tool - queue_wait  (scaffold upper bound when no
+                 --frontend; still includes prefill)
+    See the module docstring for the definition and clock caveats."""
     turns = ats.load_turns(profiles)
     ids = e0.trace_session_ids(trace)
     turns = [t for t in turns if t.session_id in ids]
@@ -126,36 +129,26 @@ def gap_rows(profiles: Path, trace: Path, e0, ats,
             continue
         prev = by_key.get((t.session_id, t.step - 1))
         tool = (getattr(prev, "tool_time_s", None) or 0.0) if prev else 0.0
-        gap = t.away_s
-        client_s = server_s = None
-        if (t.recv_ts is not None and t.llm_start_ts is not None
-                and prev is not None and prev.llm_end_ts is not None):
-            client_s = max(0.0, t.recv_ts - prev.llm_end_ts)
-            server_s = max(0.0, t.llm_start_ts - t.recv_ts)
-        queue_s = None
-        others = max(0.0, gap - tool)
+        gap_full = t.away_s
         rid = t.request_id
-        if rid and rid in sched:
-            queue_s = sched[rid].total_queue_ms / 1000.0
-        # ttft_ms (server-side receive -> first token) = queue + prefill.
+        queue_wait = (sched[rid].total_queue_ms / 1000.0
+                      if rid and rid in sched else None)
+        # ttft_ms (server receive -> first token) = queue_wait + prefill
         ttft_s = (ttfts[rid] / 1000.0) if rid and rid in ttfts else None
-        # prefill = ttft - queue (both durations, clock-independent).
-        prefill_s = None
-        if ttft_s is not None and queue_s is not None:
-            prefill_s = max(0.0, ttft_s - queue_s)
-        # gap with the whole SERVER-side chunk removed:
-        #   gap - tool - ttft = gap - tool - (queue + prefill)
-        #   = the host-side residual (scaffold + frontend build) ONLY,
-        #     with engine queue AND prefill compute both taken out.
-        gap_no_server = None
-        if ttft_s is not None:
-            gap_no_server = max(0.0, gap - tool - ttft_s)
-        # host UPPER bound when we only have the engine queue (no ttft):
-        host_ub = max(0.0, others - queue_s) if queue_s is not None else None
-        rows.append({"gap": gap, "tool": tool, "others": others,
-                     "client": client_s, "server": server_s,
-                     "queue": queue_s, "prefill": prefill_s,
-                     "gap_no_server": gap_no_server, "host_ub": host_ub})
+        prefill = (max(0.0, ttft_s - queue_wait)
+                   if ttft_s is not None and queue_wait is not None else None)
+        # scaffold = gap_full - tool - ttft (host residual; server chunk out)
+        scaffold = (max(0.0, gap_full - tool - ttft_s)
+                    if ttft_s is not None else None)
+        # canonical turn_gap = tool + scaffold + queue_wait = gap_full-prefill
+        turn_gap = (max(0.0, gap_full - prefill)
+                    if prefill is not None else None)
+        # fallback scaffold upper bound when no --frontend (still incl prefill)
+        host_ub = (max(0.0, gap_full - tool - queue_wait)
+                   if queue_wait is not None else None)
+        rows.append({"turn_gap": turn_gap, "gap_full": gap_full, "tool": tool,
+                     "scaffold": scaffold, "queue_wait": queue_wait,
+                     "prefill": prefill, "host_ub": host_ub})
     return rows
 
 
@@ -186,7 +179,7 @@ def tool_durations(profiles: Path, keep_ids: set[str]) -> dict[str, list[float]]
 
 def summarize(rows: list[dict]) -> dict:
     out = {}
-    for k in ("gap", "tool", "others", "client", "server", "queue", "prefill", "gap_no_server", "host_ub"):
+    for k in ("turn_gap", "gap_full", "tool", "scaffold", "queue_wait", "prefill", "host_ub"):
         vals = [r[k] for r in rows if r.get(k) is not None]
         out[k] = {"n": len(vals),
                   "p50": _pct(vals, 0.5),
@@ -215,13 +208,16 @@ def _cdf(ax, vals: list[float], label: str) -> None:
 
 
 def fig_gap_cdfs(runs: list[tuple[str, list[dict]]], path: Path) -> None:
+    """CDFs of the canonical components: turn_gap = tool + scaffold +
+    queue_wait (and queue_wait separately)."""
     plt = _mpl()
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for key, ax, title in zip(("gap", "tool", "others"), axes,
-                              ("turn gap", "tool time (prev step)",
-                               "others (gap - tool)")):
+    keys = ("turn_gap", "tool", "scaffold", "queue_wait")
+    titles = ("turn_gap (= tool+scaffold+queue_wait)", "tool (host)",
+              "scaffold (host)", "queue_wait (vLLM engine queue)")
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    for key, ax, title in zip(keys, axes, titles):
         for label, rows in runs:
-            _cdf(ax, [r[key] for r in rows], label)
+            _cdf(ax, [r[key] for r in rows if r.get(key) is not None], label)
         ax.set_xscale("log")
         ax.set_xlabel(f"{title} (s)")
         ax.set_ylabel("cumulative fraction of turns")
@@ -229,7 +225,8 @@ def fig_gap_cdfs(runs: list[tuple[str, list[dict]]], path: Path) -> None:
         ax.grid(True, which="both", alpha=0.3)
         ax.legend(fontsize=8, loc="lower right", framealpha=0.7)
         ax.set_title(title)
-    fig.suptitle("Turn-gap decomposition CDFs by max-in-flight")
+    fig.suptitle("Turn-gap decomposition CDFs by max-in-flight "
+                 "(turn_gap = tool + scaffold + queue_wait; prefill removed)")
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -318,38 +315,34 @@ def main(argv: list[str] | None = None) -> int:
         for label, rows in runs:
             s = summarize(rows)
             print(f"\n[{label}]  turns={len(rows)}")
-            for comp in ("gap", "tool", "others", "client", "server", "queue", "prefill", "gap_no_server", "host_ub"):
+            for comp in ("turn_gap", "gap_full", "tool", "scaffold",
+                         "queue_wait", "prefill", "host_ub"):
                 c = s[comp]
                 if c["n"] == 0:
-                    if comp in ("client", "server"):
-                        print(f"  {comp:7s} (no nvext recv_ts)")
-                    elif comp in ("queue", "host_ub"):
-                        print(f"  {comp:7s} (no SCHED_DELAY match — pass "
+                    if comp in ("queue_wait", "host_ub"):
+                        print(f"  {comp:10s} (no SCHED_DELAY match — pass "
                               "--logs and check request_id)")
-                    elif comp in ("prefill", "gap_no_server"):
-                        print(f"  {comp:12s} (needs --frontend ttft_ms "
+                    elif comp in ("prefill", "scaffold", "turn_gap"):
+                        print(f"  {comp:10s} (needs --frontend ttft_ms "
                               "+ --logs queue)")
                     continue
-                print(f"  {comp:7s} p50={c['p50']:.3f}  p90={c['p90']:.3f}  "
+                print(f"  {comp:10s} p50={c['p50']:.3f}  p90={c['p90']:.3f}  "
                       f"p99={c['p99']:.3f}  mean={c['mean']:.3f}  n={c['n']}")
                 w.writerow([label, comp, c["n"], f"{c['p50']:.4f}",
                             f"{c['p90']:.4f}", f"{c['p99']:.4f}",
                             f"{c['mean']:.4f}"])
-        print("\nclient/server (need nvext recv_ts): client = llm.end(N-1) -> "
-              "server received; server = -> llm.start (frontend+queue+prefill)"
-              "\nqueue (from SCHED_DELAY queue_ms, clock-independent): ENGINE "
-              "scheduling delay = LOWER BOUND on server-side time. If queue "
-              "p50 ~ others p50, the gap is queue-dominated (LLM-side), not "
-              "host contention."
-              "\nhost_ub (per turn = others - queue): UPPER bound on host-side "
-              "time (still includes frontend queue + prefill). Small host_ub "
-              "== host contention negligible; the gap is LLM-side."
-              "\nprefill (= ttft - queue, needs --frontend): the GPU prefill "
-              "compute that rides in the gap (on-GPU, not waiting)."
-              "\ngap_no_server (= gap - tool - ttft): gap with the ENTIRE "
-              "server chunk (queue + prefill) removed -> pure host-side "
-              "residual (scaffold + request build). This is the tightest "
-              "host-side estimate.")
+        print("\nturn_gap = tool + scaffold + queue_wait  (= gap_full - "
+              "prefill; prefill is on-GPU compute, not gap)."
+              "\n  tool       host: previous step's tool execution."
+              "\n  scaffold   host: opencode post-processing + request build "
+              "(gap_full - tool - ttft)."
+              "\n  queue_wait vLLM engine queue delay (SCHED_DELAY queue_ms)."
+              "\n  prefill    on-GPU prompt compute (ttft - queue_wait); "
+              "removed from turn_gap."
+              "\n  host_ub    fallback scaffold upper bound (gap_full - tool - "
+              "queue_wait) when --frontend absent; still includes prefill."
+              "\nRead: tool/scaffold up = host contention; queue_wait up = "
+              "LLM serving saturation.")
 
     if not args.no_figures:
         try:
