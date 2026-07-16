@@ -32,8 +32,32 @@ import argparse
 import csv
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
+
+# frontend "request completed" line: request_id + ttft_ms (server-side time
+# to first token = frontend/engine queue + prefill). ANSI-stripped.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHJ]")
+_REQID_RE = re.compile(r'(?:\b|")request_id\b"?\s*[=:]\s*"?(?P<v>[^\s",}]+)"?')
+_TTFT_RE = re.compile(r'(?:\b|")ttft_ms\b"?\s*[=:]\s*"?(?P<v>[\d.]+)"?')
+
+
+def parse_frontend_ttft(path: Path) -> dict[str, float]:
+    """request_id -> ttft_ms from the dynamo frontend log."""
+    out: dict[str, float] = {}
+    if not path.exists():
+        return out
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if "request completed" not in line:
+                continue
+            line = _ANSI_RE.sub("", line)
+            rid = _REQID_RE.search(line)
+            ttft = _TTFT_RE.search(line)
+            if rid and ttft:
+                out[rid.group("v")] = float(ttft.group("v"))
+    return out
 
 _HERE = Path(__file__).resolve().parent
 _ATS_PATH = _HERE.parent / "analyze_turn_scheduling.py"
@@ -59,7 +83,8 @@ def _pct(vals: list[float], q: float) -> float:
 
 
 def gap_rows(profiles: Path, trace: Path, e0, ats,
-             logs: Path | None = None) -> list[dict]:
+             logs: Path | None = None,
+             frontend: Path | None = None) -> list[dict]:
     """Per-turn gap decomposition for the run's MAIN sessions.
 
     gap = tool + others, with `tool` = the PREVIOUS step's tool wall.
@@ -93,6 +118,7 @@ def gap_rows(profiles: Path, trace: Path, e0, ats,
     ids = e0.trace_session_ids(trace)
     turns = [t for t in turns if t.session_id in ids]
     sched = ats.load_sched(logs) if logs is not None and logs.exists() else {}
+    ttfts = parse_frontend_ttft(frontend) if frontend is not None else {}
     by_key = {(t.session_id, t.step): t for t in turns}
     rows: list[dict] = []
     for t in turns:
@@ -107,18 +133,29 @@ def gap_rows(profiles: Path, trace: Path, e0, ats,
             client_s = max(0.0, t.recv_ts - prev.llm_end_ts)
             server_s = max(0.0, t.llm_start_ts - t.recv_ts)
         queue_s = None
-        host_ub = None
         others = max(0.0, gap - tool)
-        if t.request_id and t.request_id in sched:
-            queue_s = sched[t.request_id].total_queue_ms / 1000.0
-            # host UPPER bound: gap minus tool minus engine queue. Still
-            # includes frontend queue + prefill (server-side), so it OVER-
-            # estimates host scaffold. Computed per turn (never subtract
-            # percentiles).
-            host_ub = max(0.0, others - queue_s)
+        rid = t.request_id
+        if rid and rid in sched:
+            queue_s = sched[rid].total_queue_ms / 1000.0
+        # ttft_ms (server-side receive -> first token) = queue + prefill.
+        ttft_s = (ttfts[rid] / 1000.0) if rid and rid in ttfts else None
+        # prefill = ttft - queue (both durations, clock-independent).
+        prefill_s = None
+        if ttft_s is not None and queue_s is not None:
+            prefill_s = max(0.0, ttft_s - queue_s)
+        # gap with the whole SERVER-side chunk removed:
+        #   gap - tool - ttft = gap - tool - (queue + prefill)
+        #   = the host-side residual (scaffold + frontend build) ONLY,
+        #     with engine queue AND prefill compute both taken out.
+        gap_no_server = None
+        if ttft_s is not None:
+            gap_no_server = max(0.0, gap - tool - ttft_s)
+        # host UPPER bound when we only have the engine queue (no ttft):
+        host_ub = max(0.0, others - queue_s) if queue_s is not None else None
         rows.append({"gap": gap, "tool": tool, "others": others,
                      "client": client_s, "server": server_s,
-                     "queue": queue_s, "host_ub": host_ub})
+                     "queue": queue_s, "prefill": prefill_s,
+                     "gap_no_server": gap_no_server, "host_ub": host_ub})
     return rows
 
 
@@ -149,7 +186,7 @@ def tool_durations(profiles: Path, keep_ids: set[str]) -> dict[str, list[float]]
 
 def summarize(rows: list[dict]) -> dict:
     out = {}
-    for k in ("gap", "tool", "others", "client", "server", "queue", "host_ub"):
+    for k in ("gap", "tool", "others", "client", "server", "queue", "prefill", "gap_no_server", "host_ub"):
         vals = [r[k] for r in rows if r.get(k) is not None]
         out[k] = {"n": len(vals),
                   "p50": _pct(vals, 0.5),
@@ -241,6 +278,12 @@ def main(argv: list[str] | None = None) -> int:
                          "fallback for the client/server split when the "
                          "profile carries no nvext recv_ts); label must "
                          "match a --run label")
+    ap.add_argument("--frontend", action="append", nargs=2, metavar=("LABEL",
+                    "FRONTEND_LOG"), default=[],
+                    help="dynamo frontend.log for a run: supplies ttft_ms so "
+                         "the gap can also subtract PREFILL (prefill = ttft - "
+                         "queue). Adds `prefill` and `gap_no_server` columns; "
+                         "label must match a --run label")
     ap.add_argument("--out", type=Path, default=Path("mif_gap"))
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -249,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     e0 = _load("e0_turn_characterization", _E0_PATH)
 
     logs_by_label = {label: Path(p) for label, p in args.logs}
+    frontend_by_label = {label: Path(p) for label, p in args.frontend}
     runs: list[tuple[str, list[dict]]] = []
     runs_tools: list[tuple[str, dict[str, list[float]]]] = []
     for label, prof_s, trace_s in args.run:
@@ -259,7 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         if not trace.is_file():
             print(f"error: trace not found: {trace}", file=sys.stderr)
             return 2
-        rows = gap_rows(prof, trace, e0, ats, logs=logs_by_label.get(label))
+        rows = gap_rows(prof, trace, e0, ats, logs=logs_by_label.get(label),
+                        frontend=frontend_by_label.get(label))
         runs.append((label, rows))
         runs_tools.append((label,
                            tool_durations(prof, e0.trace_session_ids(trace))))
@@ -273,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         for label, rows in runs:
             s = summarize(rows)
             print(f"\n[{label}]  turns={len(rows)}")
-            for comp in ("gap", "tool", "others", "client", "server", "queue", "host_ub"):
+            for comp in ("gap", "tool", "others", "client", "server", "queue", "prefill", "gap_no_server", "host_ub"):
                 c = s[comp]
                 if c["n"] == 0:
                     if comp in ("client", "server"):
@@ -281,6 +326,9 @@ def main(argv: list[str] | None = None) -> int:
                     elif comp in ("queue", "host_ub"):
                         print(f"  {comp:7s} (no SCHED_DELAY match — pass "
                               "--logs and check request_id)")
+                    elif comp in ("prefill", "gap_no_server"):
+                        print(f"  {comp:12s} (needs --frontend ttft_ms "
+                              "+ --logs queue)")
                     continue
                 print(f"  {comp:7s} p50={c['p50']:.3f}  p90={c['p90']:.3f}  "
                       f"p99={c['p99']:.3f}  mean={c['mean']:.3f}  n={c['n']}")
@@ -295,7 +343,13 @@ def main(argv: list[str] | None = None) -> int:
               "host contention."
               "\nhost_ub (per turn = others - queue): UPPER bound on host-side "
               "time (still includes frontend queue + prefill). Small host_ub "
-              "== host contention negligible; the gap is LLM-side.")
+              "== host contention negligible; the gap is LLM-side."
+              "\nprefill (= ttft - queue, needs --frontend): the GPU prefill "
+              "compute that rides in the gap (on-GPU, not waiting)."
+              "\ngap_no_server (= gap - tool - ttft): gap with the ENTIRE "
+              "server chunk (queue + prefill) removed -> pure host-side "
+              "residual (scaffold + request build). This is the tightest "
+              "host-side estimate.")
 
     if not args.no_figures:
         try:
