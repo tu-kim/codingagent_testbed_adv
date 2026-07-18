@@ -409,6 +409,23 @@ def _percentile(xs: list[float], p: float) -> float | None:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
+def _draw_mean_p50(ax, vals: list[float], unit: str = "") -> None:
+    """Dashed red mean + dotted purple p50 horizontal lines on `ax`,
+    labeled with their values at the right edge (y-axis transform, so the
+    x-position is axis-relative). No-op on empty vals."""
+    if not vals:
+        return
+    mean = sum(vals) / len(vals)
+    p50 = _percentile(vals, 50)
+    tr = ax.get_yaxis_transform()
+    ax.axhline(mean, color="tab:red", lw=1.0, ls="--", zorder=3)
+    ax.text(0.995, mean, f" mean {mean:.2f}{unit}", color="tab:red",
+            fontsize=8, va="bottom", ha="right", transform=tr)
+    ax.axhline(p50, color="tab:purple", lw=1.0, ls=":", zorder=3)
+    ax.text(0.995, p50, f" p50 {p50:.2f}{unit}", color="tab:purple",
+            fontsize=8, va="top", ha="right", transform=tr)
+
+
 def fig_session_span(e0, spans: list[dict], path: Path) -> None:
     """Gantt of session wall time: one row per session (first-started at
     top), x = time from the earliest session start. Each row shows the full
@@ -512,11 +529,7 @@ def fig_turn_llm_time(e0, ordered: list, path: Path,
                    linewidth=0.7)
     if lpos:
         axes[0].set_ylim(min(lpos) * 0.8, max(lpos) * 1.2)
-        lmean = sum(lpos) / len(lpos)
-        axes[0].axhline(lmean, color="tab:red", lw=1.0, ls="--", zorder=3)
-        axes[0].text(0.995, lmean, f" mean {lmean:.2f}s", color="tab:red",
-                     fontsize=8, va="bottom", ha="right",
-                     transform=axes[0].get_yaxis_transform())
+        _draw_mean_p50(axes[0], lpos, "s")
     axes[0].set_ylabel("LLM time / turn (s)")
     axes[0].set_title("Per-turn LLM Time vs turn")
 
@@ -526,11 +539,7 @@ def fig_turn_llm_time(e0, ordered: list, path: Path,
                    linewidth=0.7)
     if tpos:
         axes[1].set_ylim(min(tpos) * 0.8, max(tpos) * 1.2)
-        tmean = sum(tpos) / len(tpos)
-        axes[1].axhline(tmean, color="tab:red", lw=1.0, ls="--", zorder=3)
-        axes[1].text(0.995, tmean, f" mean {tmean:.2f}s", color="tab:red",
-                     fontsize=8, va="bottom", ha="right",
-                     transform=axes[1].get_yaxis_transform())
+        _draw_mean_p50(axes[1], tpos, "s")
     axes[1].set_ylabel("tool exec time / turn (s)")
     axes[1].set_title("Per-turn Tool Execution Time vs turn "
                       "(orange = task sub-agent)")
@@ -544,6 +553,7 @@ def fig_turn_llm_time(e0, ordered: list, path: Path,
     if rpos:
         lim = max(abs(min(rpos)), abs(max(rpos))) * 1.1 or 1.0
         axes[2].set_ylim(-lim, lim)
+        _draw_mean_p50(axes[2], rpos)
     axes[2].set_ylabel("log2(LLM / tool)")
     axes[2].set_title("LLM Time / Tool Execution vs turn")
     axes[2].plot([], [], color="tab:blue", label="LLM-bound (>0)")
