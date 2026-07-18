@@ -99,6 +99,15 @@ def _sum_series(row: dict, name: str) -> float | None:
     return sum(vals) if vals else None
 
 
+def _counter_series(row: dict, base: str) -> float | None:
+    """Sum a Prometheus counter, tolerating the OpenMetrics `_total`
+    suffix: newer prometheus_client (what LMCache ships) exposes
+    `lmcache:num_hit_tokens_total`, older builds `lmcache:num_hit_tokens`.
+    Try the bare name first, then `_total`."""
+    v = _sum_series(row, base)
+    return v if v is not None else _sum_series(row, base + "_total")
+
+
 def lmcache_series(metrics_path: Path) -> dict[str, list[dict]]:
     """Per-worker LMCache series from any scrape row carrying lmcache:*
     metrics (LMCache rides the worker's own /metrics, so these appear on
@@ -144,36 +153,47 @@ def lmcache_series(metrics_path: Path) -> dict[str, list[dict]]:
                 # CPU-tier eviction counters (host tier full -> LRU drop):
                 # evict_keys = chunks evicted, evict_failed = allocate
                 # attempts that found NO evictable candidate (pure pressure).
-                "evict_keys": _sum_series(row, "lmcache:local_cpu_evict_keys_count"),
-                "evict_failed": _sum_series(row, "lmcache:local_cpu_evict_failed_count"),
+                # Counters -> OpenMetrics `_total` suffix (see _counter_series).
+                "evict_keys": _counter_series(row, "lmcache:local_cpu_evict_keys_count"),
+                "evict_failed": _counter_series(row, "lmcache:local_cpu_evict_failed_count"),
                 # transferred-token counters (pairs with the speed
                 # histograms to derive transfer TIME): hit = tokens
                 # retrieved host->device, stored = tokens offloaded
                 # device->host.
-                "hit_tokens": _sum_series(row, "lmcache:num_hit_tokens"),
-                "stored_tokens": _sum_series(row, "lmcache:num_stored_tokens"),
+                "hit_tokens": _counter_series(row, "lmcache:num_hit_tokens"),
+                "stored_tokens": _counter_series(row, "lmcache:num_stored_tokens"),
             })
     for recs in out.values():
         recs.sort(key=lambda r: r["ts"])
     return out
 
 
-# The exact lmcache:* names fig7/fig8 consume. Kept here (not buried in
+# The lmcache:* names fig7/fig8 consume. Kept here (not buried in
 # lmcache_series) so the diagnostic can report which ones the run is
 # actually missing -- LMCache metric names drift across versions, and a
-# renamed histogram/counter silently empties a panel.
+# renamed histogram/counter silently empties a panel. Counters carry an
+# OpenMetrics `_total` suffix on newer prometheus_client (a name is
+# considered present if EITHER the bare or the `_total` form appears; see
+# _counter_series / lmcache_missing_metrics).
 LMCACHE_EXPECTED_METRICS = (
-    "lmcache:local_cache_usage",
-    "lmcache:local_storage_usage",
-    "lmcache:retrieve_speed_sum",
+    "lmcache:local_cache_usage",         # gauge
+    "lmcache:local_storage_usage",       # gauge
+    "lmcache:retrieve_speed_sum",        # histogram
     "lmcache:retrieve_speed_count",
     "lmcache:store_speed_sum",
     "lmcache:store_speed_count",
-    "lmcache:local_cpu_evict_keys_count",
+    "lmcache:local_cpu_evict_keys_count",   # counter (+/- _total)
     "lmcache:local_cpu_evict_failed_count",
     "lmcache:num_hit_tokens",
     "lmcache:num_stored_tokens",
 )
+
+
+def lmcache_missing_metrics(seen: set[str]) -> list[str]:
+    """Expected names absent from `seen`, tolerating the counter `_total`
+    suffix (a bare expected name is satisfied by either form)."""
+    return [n for n in LMCACHE_EXPECTED_METRICS
+            if n not in seen and (n + "_total") not in seen]
 
 
 def lmcache_metric_names(metrics_path: Path) -> set[str]:
@@ -836,7 +856,7 @@ def main(argv: list[str] | None = None) -> int:
         # this tells you exactly which expected name is absent so it can be
         # reconciled against the installed lmcache.
         seen = lmcache_metric_names(args.metrics)
-        missing = [n for n in LMCACHE_EXPECTED_METRICS if n not in seen]
+        missing = lmcache_missing_metrics(seen)
         print(f"lmcache metrics: {len(seen)} names seen across "
               f"{len(lmc)} worker(s)", file=sys.stderr)
         if missing:

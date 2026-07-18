@@ -214,6 +214,38 @@ def test_transfer_batches_skips_missing_series_and_gap(mod):
     assert mod.transfer_batches(recs, "tok", "s", "c") == []
 
 
+def test_lmcache_series_tolerates_openmetrics_total_suffix(mod, tmp_path):
+    # the installed LMCache exposes counters with the OpenMetrics `_total`
+    # suffix (num_hit_tokens_total, local_cpu_evict_keys_count_total, ...);
+    # _counter_series must pick those up so fig8/eviction aren't empty.
+    def row(ts, hit, ev):
+        return {"ts": ts, "worker": "a0", "role": "agg", "ok": True,
+                "metrics": {
+                    "lmcache:num_hit_tokens_total": [{"labels": {}, "value": hit}],
+                    "lmcache:num_stored_tokens_total": [{"labels": {}, "value": 0}],
+                    "lmcache:local_cpu_evict_keys_count_total": [{"labels": {}, "value": ev}],
+                    "lmcache:local_cpu_evict_failed_count_total": [{"labels": {}, "value": 0}]}}
+    p = tmp_path / "m.ndjson"
+    p.write_text(json.dumps(row(10.0, 300, 10)) + "\n"
+                 + json.dumps(row(11.0, 500, 40)) + "\n")
+    lm = mod.lmcache_series(p)
+    assert [r["hit_tokens"] for r in lm["a0"]] == [300, 500]
+    assert [r["evict_keys"] for r in lm["a0"]] == [10, 40]
+    # and the diagnostic counts them as present despite the suffix
+    assert "lmcache:num_hit_tokens" not in mod.lmcache_missing_metrics(
+        mod.lmcache_metric_names(p))
+
+
+def test_lmcache_missing_metrics_flags_truly_absent(mod, tmp_path):
+    p = tmp_path / "m.ndjson"
+    # only a gauge present -> counters + histograms all reported missing
+    p.write_text(json.dumps({"ts": 1, "ok": True, "metrics": {
+        "lmcache:local_cache_usage": [{"labels": {}, "value": 1}]}}) + "\n")
+    missing = mod.lmcache_missing_metrics(mod.lmcache_metric_names(p))
+    assert "lmcache:num_hit_tokens" in missing
+    assert "lmcache:local_cache_usage" not in missing
+
+
 def test_lmcache_series_reads_eviction_counters(mod, tmp_path):
     p = tmp_path / "m.ndjson"
     p.write_text(
