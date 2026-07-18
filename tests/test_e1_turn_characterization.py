@@ -131,6 +131,32 @@ def test_window_avg_speed_skips_counter_reset(mod):
     assert mod.window_avg_speed(recs, "s", "c") == [(2, 50.0)]
 
 
+def test_prefix_hit_rate_series_windowed_ratio(mod, tmp_path):
+    # per tick sum hits/queries across workers, then delta(hits)/delta(queries)
+    def row(ts, worker, hits, queries):
+        return {"ts": ts, "worker": worker, "role": "agg", "ok": True,
+                "metrics": {
+                    "vllm:prefix_cache_hits_total": [{"labels": {}, "value": hits}],
+                    "vllm:prefix_cache_queries_total": [{"labels": {}, "value": queries}]}}
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        # tick 10: two workers -> hits 100, queries 200
+        json.dumps(row(10.0, "a0", 60, 120)) + "\n"
+        + json.dumps(row(10.0, "a1", 40, 80)) + "\n"
+        # tick 11: hits 100+80=180, queries 200+100=300 ->
+        #          delta hits 80 / delta queries 100 = 0.8
+        + json.dumps(row(11.0, "a0", 100, 160)) + "\n"
+        + json.dumps(row(11.0, "a1", 80, 140)) + "\n")
+    assert mod.prefix_hit_rate_series(p) == [(11.0, pytest.approx(0.8))]
+
+
+def test_prefix_hit_rate_series_empty_without_counters(mod, tmp_path):
+    p = tmp_path / "m.ndjson"
+    p.write_text(json.dumps({"ts": 1, "ok": True, "metrics": {
+        "vllm:kv_cache_usage_perc": [{"labels": {}, "value": 0.5}]}}) + "\n")
+    assert mod.prefix_hit_rate_series(p) == []
+
+
 def test_lmcache_metric_names_collects_lmcache_prefix_only(mod, tmp_path):
     p = tmp_path / "m.ndjson"
     p.write_text(
