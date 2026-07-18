@@ -512,6 +512,11 @@ def fig_turn_llm_time(e0, ordered: list, path: Path,
                    linewidth=0.7)
     if lpos:
         axes[0].set_ylim(min(lpos) * 0.8, max(lpos) * 1.2)
+        lmean = sum(lpos) / len(lpos)
+        axes[0].axhline(lmean, color="tab:red", lw=1.0, ls="--", zorder=3)
+        axes[0].text(0.995, lmean, f" mean {lmean:.2f}s", color="tab:red",
+                     fontsize=8, va="bottom", ha="right",
+                     transform=axes[0].get_yaxis_transform())
     axes[0].set_ylabel("LLM time / turn (s)")
     axes[0].set_title("Per-turn LLM Time vs turn")
 
@@ -521,6 +526,11 @@ def fig_turn_llm_time(e0, ordered: list, path: Path,
                    linewidth=0.7)
     if tpos:
         axes[1].set_ylim(min(tpos) * 0.8, max(tpos) * 1.2)
+        tmean = sum(tpos) / len(tpos)
+        axes[1].axhline(tmean, color="tab:red", lw=1.0, ls="--", zorder=3)
+        axes[1].text(0.995, tmean, f" mean {tmean:.2f}s", color="tab:red",
+                     fontsize=8, va="bottom", ha="right",
+                     transform=axes[1].get_yaxis_transform())
     axes[1].set_ylabel("tool exec time / turn (s)")
     axes[1].set_title("Per-turn Tool Execution Time vs turn "
                       "(orange = task sub-agent)")
