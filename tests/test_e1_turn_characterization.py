@@ -120,6 +120,25 @@ def test_session_spans_drops_only_the_none_turn_not_the_whole_session(mod):
     assert sp[0]["start"] == 0.0 and sp[0]["end"] == 1.0
 
 
+def test_session_utilizations_active_over_span(mod):
+    spans = [
+        {"session_id": "A", "start": 0.0, "end": 4.0,
+         "segments": [(0.0, 1.0), (3.0, 4.0)]},   # active 2 / span 4 = 0.5
+        {"session_id": "B", "start": 0.0, "end": 2.0,
+         "segments": [(0.0, 2.0)]},                # 1.0
+        {"session_id": "C", "start": 5.0, "end": 5.0,
+         "segments": [(5.0, 5.0)]},                # span 0 -> skipped
+    ]
+    assert mod.session_utilizations(spans) == [0.5, 1.0]
+
+
+def test_percentile_interpolates_and_handles_empty(mod):
+    assert mod._percentile([], 90) is None
+    assert mod._percentile([0.7], 50) == 0.7
+    assert mod._percentile([0.5, 1.0], 90) == pytest.approx(0.95)
+    assert mod._percentile([0.0, 0.5, 1.0], 50) == pytest.approx(0.5)
+
+
 def test_eviction_events_discriminates_eviction_vs_compaction(mod):
     # step1: prev_cached = 1000 + 100 = 1100
     # step2: prompt GREW (eff 1600 > 1000) but cache_read 200 -> eviction

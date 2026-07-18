@@ -381,6 +381,34 @@ def session_spans(turns: list) -> list[dict]:
     return out
 
 
+def session_utilizations(spans: list[dict]) -> list[float]:
+    """Per-session utilization = LLM-active time / total span, i.e. the
+    fraction of the session's wall time actually spent in the LLM (the
+    complement, 1 - util, is the turn-gap share). Sessions with a
+    non-positive span are skipped."""
+    out: list[float] = []
+    for sp in spans:
+        span = sp["end"] - sp["start"]
+        if span <= 0:
+            continue
+        active = sum(e - s for s, e in sp["segments"])
+        out.append(active / span)
+    return out
+
+
+def _percentile(xs: list[float], p: float) -> float | None:
+    """Linear-interpolated p-th percentile (0-100) of xs, or None if empty."""
+    if not xs:
+        return None
+    s = sorted(xs)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * p / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
 def fig_session_span(e0, spans: list[dict], path: Path) -> None:
     """Gantt of session wall time: one row per session (first-started at
     top), x = time from the earliest session start. Each row shows the full
@@ -413,11 +441,9 @@ def fig_session_span(e0, spans: list[dict], path: Path) -> None:
     ax.set_xlim(left=0)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("session (first-started at top)")
-    ax.set_title("Session span: first turn start -> last turn end "
-                 "(dark = LLM active, light = turn-gap delay)")
+    ax.set_title("Session span: session start -> end")
     ax.plot([], [], color="tab:blue", lw=6, alpha=0.9, label="LLM active")
-    ax.plot([], [], color="tab:blue", lw=6, alpha=0.2,
-            label="turn-gap delay (tool + scaffold + queue)")
+    ax.plot([], [], color="tab:blue", lw=6, alpha=0.2, label="turn-gap delay")
     ax.legend(fontsize=8, loc="lower right", framealpha=0.7)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -909,6 +935,15 @@ def main(argv: list[str] | None = None) -> int:
               f"turns; corr(shortfall, displaced) = "
               f"{r:.3f}" if r is not None else "n/a")
 
+    # session utilization = LLM-active / total span (1 - util = turn-gap share)
+    spans = session_spans(turns)
+    utils = session_utilizations(spans)
+    if utils:
+        mean = sum(utils) / len(utils)
+        print(f"session utilization (LLM-active / span): mean {mean:.3f}, "
+              f"p90 {_percentile(utils, 90):.3f}, "
+              f"p99 {_percentile(utils, 99):.3f} (n={len(utils)})")
+
     if not args.no_figures:
         try:
             fig_turn_llm_time(e0, ordered, out_dir / "fig1_turn_llm_time.pdf",
@@ -920,8 +955,7 @@ def main(argv: list[str] | None = None) -> int:
             e0.fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
             fig_eviction_vs_displacement(
                 events, out_dir / "fig6_eviction_vs_displacement.pdf", e0)
-            fig_session_span(e0, session_spans(turns),
-                             out_dir / "fig8_session_span.pdf")
+            fig_session_span(e0, spans, out_dir / "fig8_session_span.pdf")
             if lmc:
                 fig_lmcache(e0, lmc, kv, out_dir / "fig7_lmcache.pdf",
                             samples_abs, args.cpu_cache_gb, args.disk_cache_gb)
