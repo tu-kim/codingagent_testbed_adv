@@ -14,8 +14,9 @@ assumptions:
     each session's points across the interleave.
 
 Everything else (fig1 panels, fig2 CDF, fig4 reuse-vs-gap) reuses the E0
-implementations. fig3 bottom carries GPU KV-usage (left y) + the vLLM
-prefix-cache hit rate (right y), both from the scrape NDJSON.
+implementations. fig3 top = cached-vs-reused per turn (cached tokens vs
+hit tokens, eviction gap in red); fig3 bottom = GPU KV-usage (left y) +
+the vLLM prefix-cache hit rate (right y), both from the scrape NDJSON.
 
 Usage:
   scripts/arm/e1_turn_characterization.py \\
@@ -357,55 +358,6 @@ def eviction_events(turns: list, compaction_drop_ratio: float = 0.6,
     return out
 
 
-def fig_reuse_shortfall(events: list[dict], turns: list, path: Path,
-                        e0) -> None:
-    """Per session block (sessions in start order): prev_cached (what was
-    cached) vs cache_read (what was reused). The gap between them = KV the
-    session failed to reuse; eviction turns (prompt did not shrink) are
-    marked red, compaction turns (prompt shrank) grey. Shows the reuse
-    collapse happens WHILE the cached total keeps growing = eviction, not
-    compaction."""
-    plt = e0._mpl()
-    fig, ax = plt.subplots(figsize=(18, 6))
-    # session start order
-    starts: dict[str, float] = {}
-    for t in turns:
-        st = t.llm_start_ts if t.llm_start_ts is not None else t.llm_end_ts
-        if st is not None and t.session_id not in starts:
-            starts[t.session_id] = st
-    ev_by_sess: dict[str, list[dict]] = {}
-    for e in events:
-        ev_by_sess.setdefault(e["session_id"], []).append(e)
-    offset = 0
-    first = True
-    for sid in sorted(ev_by_sess, key=lambda s: starts.get(s, 0.0)):
-        evs = sorted(ev_by_sess[sid], key=lambda e: e["step"])
-        xs = [offset + j for j in range(len(evs))]
-        ax.axvline(offset, color="crimson", linewidth=0.4, alpha=0.5, zorder=1)
-        ax.plot(xs, [e["prev_cached"] for e in evs], color="tab:orange",
-                lw=0.8, marker=".", ms=2, zorder=2,
-                label="cached tokens" if first else None)
-        ax.plot(xs, [e["cache_read"] for e in evs], color="tab:blue",
-                lw=0.8, marker=".", ms=2, zorder=2,
-                label="hit tokens (reused)" if first else None)
-        # mark reuse collapses (eviction only; compaction is excluded)
-        for x, e in zip(xs, evs):
-            if e["label"] == "eviction":
-                ax.plot([x, x], [e["cache_read"], e["prev_cached"]],
-                        color="tab:green", lw=0.8, alpha=0.7, zorder=3)
-        first = False
-        offset += len(evs)
-    ax.plot([], [], color="tab:green", lw=1.0, label="miss due to eviction")
-    ax.set_xlim(0, max(offset - 1, 1))
-    ax.set_ylim(bottom=0)
-    ax.set_xlabel("turn")
-    ax.set_ylabel("tokens")
-    ax.set_title("Cached-vs-reused per turn")
-    ax.legend(fontsize=8, loc="upper right", framealpha=0.7)
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
 def fig_eviction_vs_displacement(events: list[dict], path: Path, e0) -> None:
     """Scatter: eviction shortfall (tokens the session had to re-prefill,
     NON-compaction turns only) vs away_displaced_tokens (KV other sessions
@@ -547,39 +499,54 @@ def prefix_hit_rate_series(metrics_path: Path) -> list[tuple[float, float]]:
 def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
                   sample_ordinals: list[int],
                   sample_times: list[float],
-                  prefix_hit: list[tuple[float, float]] | None = None) -> None:
-    """E0's two stacked fig3 panels for a CONCURRENT run. Top panel:
-    sessions are laid out as CONSECUTIVE x-axis blocks, ordered by session
-    start time — each block holds exactly ONE session's turns (in its own
-    chronological order), so lines never overlap or zigzag across each
-    other. Red lines mark the block boundaries. Bottom panel: GPU KV-cache
-    usage (left y) + the vLLM prefix-cache hit rate (right y, `prefix_hit`)
-    on the same scrape time axis."""
+                  prefix_hit: list[tuple[float, float]] | None = None,
+                  events: list[dict] | None = None,
+                  turns: list | None = None) -> None:
+    """Two stacked fig3 panels for a CONCURRENT run. Top panel (cached-vs-
+    reused per turn, sessions in start order as consecutive blocks): the
+    KV each turn HAD cached (cached tokens) vs what it reused (hit tokens),
+    with the gap on eviction turns marked red = tokens missed due to
+    eviction. Bottom panel: GPU KV-cache usage (left y) + the vLLM
+    prefix-cache hit rate (right y, `prefix_hit`) on the same scrape time
+    axis."""
     plt = e0._mpl()
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(18, 10))
 
-    by_sess: dict[str, list[tuple[float, float]]] = {}
-    for t in ordered:
-        h = e0._hit_tokens(t)
+    # top panel: cached-vs-reused per turn (formerly fig5)
+    starts: dict[str, float] = {}
+    for t in (turns or []):
         st = t.llm_start_ts if t.llm_start_ts is not None else t.llm_end_ts
-        if h is not None and st is not None:
-            by_sess.setdefault(t.session_id, []).append((st, h))
-    # blocks in session start order
-    order = sorted(by_sess, key=lambda sid: min(ts for ts, _ in by_sess[sid]))
+        if st is not None and t.session_id not in starts:
+            starts[t.session_id] = st
+    ev_by_sess: dict[str, list[dict]] = {}
+    for e in (events or []):
+        ev_by_sess.setdefault(e["session_id"], []).append(e)
     offset = 0
-    for sid in order:
-        pts = sorted(by_sess[sid])      # session-local chronological order
-        xs = [offset + j for j in range(len(pts))]
-        ax_top.axvline(offset, color="crimson", linewidth=0.5, alpha=0.7,
+    first = True
+    for sid in sorted(ev_by_sess, key=lambda s: starts.get(s, 0.0)):
+        evs = sorted(ev_by_sess[sid], key=lambda e: e["step"])
+        xs = [offset + j for j in range(len(evs))]
+        ax_top.axvline(offset, color="crimson", linewidth=0.4, alpha=0.5,
                        zorder=1)
-        ax_top.plot(xs, [h for _, h in pts],
-                    color="tab:blue", marker=".", ms=3, lw=0.8, zorder=2)
-        offset += len(pts)
+        ax_top.plot(xs, [e["prev_cached"] for e in evs], color="tab:orange",
+                    lw=0.8, marker=".", ms=2, zorder=2,
+                    label="cached tokens" if first else None)
+        ax_top.plot(xs, [e["cache_read"] for e in evs], color="tab:blue",
+                    lw=0.8, marker=".", ms=2, zorder=2,
+                    label="hit tokens (reused)" if first else None)
+        for x, e in zip(xs, evs):
+            if e["label"] == "eviction":
+                ax_top.plot([x, x], [e["cache_read"], e["prev_cached"]],
+                            color="tab:red", lw=0.8, alpha=0.7, zorder=3)
+        first = False
+        offset += len(evs)
+    ax_top.plot([], [], color="tab:red", lw=1.0, label="miss due to eviction")
     ax_top.set_xlim(0, max(offset - 1, 1))
     ax_top.set_ylim(bottom=0)
-    ax_top.set_xlabel("turn (sessions in start order, one block each)")
-    ax_top.set_ylabel("prefix-cache hit tokens / turn")
-    ax_top.set_title("Prefix-cache Hit Tokens vs turn")
+    ax_top.set_xlabel("turn")
+    ax_top.set_ylabel("tokens")
+    ax_top.set_title("Cached-vs-reused per turn")
+    ax_top.legend(fontsize=8, loc="upper right", framealpha=0.7)
 
     ts_all = [t.llm_end_ts for t in ordered if t.llm_end_ts is not None] + \
              [t.llm_start_ts for t in ordered if t.llm_start_ts is not None]
@@ -883,10 +850,9 @@ def main(argv: list[str] | None = None) -> int:
                               sample_ords)
             e0.fig_llm_time_cdf(turns, out_dir / "fig2_llm_time_cdf.pdf")
             fig_hit_vs_kv(e0, ordered, kv, out_dir / "fig3_hit_vs_kv.pdf",
-                          sample_ords, samples_abs, prefix_hit=prefix_hit)
+                          sample_ords, samples_abs, prefix_hit=prefix_hit,
+                          events=events, turns=turns)
             e0.fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
-            fig_reuse_shortfall(events, turns,
-                                out_dir / "fig5_reuse_shortfall.pdf", e0)
             fig_eviction_vs_displacement(
                 events, out_dir / "fig6_eviction_vs_displacement.pdf", e0)
             if lmc:
