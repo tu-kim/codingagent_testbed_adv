@@ -468,10 +468,15 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
     plt = e0._mpl()
     fig, (ax_use, ax_spd) = plt.subplots(2, 1, figsize=(18, 10), sharex=True)
 
-    # shared t0 with the GPU KV curve so both panels align to it
-    all_ts = [r["ts"] for recs in lmcache.values() for r in recs]
-    all_ts += [t for t, _ in gpu_kv]
-    t0 = min(all_ts) if all_ts else 0.0
+    # Anchor t0 to the FIRST lmcache data point, not the earliest scrape
+    # tick: vLLM (vllm:*) metrics appear from worker startup, but lmcache:*
+    # metrics only register once LMCache does its first transfer, so a
+    # min-over-both t0 would leave the whole occupancy curve floating in a
+    # blank left margin. Trim the GPU KV curve to the lmcache window so the
+    # panels start at x=0 where the data actually begins.
+    lm_ts = [r["ts"] for recs in lmcache.values() for r in recs]
+    t0 = min(lm_ts) if lm_ts else (min((t for t, _ in gpu_kv), default=0.0))
+    gpu_kv = [(t, v) for t, v in gpu_kv if t >= t0]
     GB = float(1 << 30)
     x_right = 0.0
 
