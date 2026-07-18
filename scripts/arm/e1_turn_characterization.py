@@ -17,6 +17,8 @@ Everything else (fig1 panels, fig2 CDF, fig4 reuse-vs-gap) reuses the E0
 implementations. fig3 top = cached-vs-reused per turn (cached tokens vs
 hit tokens, eviction gap in red); fig3 bottom = GPU KV-usage (left y) +
 the vLLM prefix-cache hit rate (right y), both from the scrape NDJSON.
+fig8 is a per-session Gantt (first turn start -> last turn end) showing how
+much of each session's wall time is turn-gap delay vs LLM-active.
 
 Usage:
   scripts/arm/e1_turn_characterization.py \\
@@ -356,6 +358,69 @@ def eviction_events(turns: list, compaction_drop_ratio: float = 0.6,
             "displaced": t.away_displaced_tokens,
         })
     return out
+
+
+def session_spans(turns: list) -> list[dict]:
+    """Per session: {session_id, start, end, segments} ordered by start.
+    start = first turn's llm_start, end = latest turn's llm_end, segments =
+    each turn's (start, end) LLM-active interval. The (end - start) span is
+    the session's total wall time; the light area between segments is the
+    turn-gap delay (tool + scaffold + queue) we want to visualize."""
+    by: dict[str, list[tuple[float, float]]] = {}
+    for t in turns:
+        s, e = t.llm_start_ts, t.llm_end_ts
+        if s is None or e is None:
+            continue
+        by.setdefault(t.session_id, []).append((s, e))
+    out: list[dict] = []
+    for sid, segs in by.items():
+        segs = sorted(segs)
+        out.append({"session_id": sid, "start": segs[0][0],
+                    "end": max(e for _, e in segs), "segments": segs})
+    out.sort(key=lambda d: d["start"])
+    return out
+
+
+def fig_session_span(e0, spans: list[dict], path: Path) -> None:
+    """Gantt of session wall time: one row per session (first-started at
+    top), x = time from the earliest session start. Each row shows the full
+    span (first turn start -> last turn end) as a light bar and the
+    LLM-active turns as dark segments on top; the light gaps between dark
+    segments are the turn-gap delays (tool + scaffold + queue wait) that
+    stretch the session's end-to-end time."""
+    plt = e0._mpl()
+    n = len(spans)
+    fig, ax = plt.subplots(figsize=(18, max(4.0, 0.32 * n)))
+    if not spans:
+        ax.text(0.5, 0.5, "no sessions", transform=ax.transAxes,
+                ha="center", va="center", color="grey")
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return
+    t0 = spans[0]["start"]
+    for i, sp in enumerate(spans):
+        y = n - 1 - i                      # first-started session at the top
+        ax.broken_barh([(sp["start"] - t0, max(sp["end"] - sp["start"], 1e-9))],
+                       (y - 0.4, 0.8), facecolors="tab:blue", alpha=0.2,
+                       zorder=1)
+        segs = [(s - t0, max(e - s, 1e-3)) for s, e in sp["segments"]]
+        ax.broken_barh(segs, (y - 0.4, 0.8), facecolors="tab:blue",
+                       alpha=0.9, zorder=2)
+    ax.set_ylim(-1, n)
+    ax.set_yticks([n - 1 - i for i in range(n)])
+    ax.set_yticklabels([sp["session_id"][-8:] for sp in spans],
+                       fontsize=max(4, min(8, int(400 / max(n, 1)))))
+    ax.set_xlim(left=0)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("session (first-started at top)")
+    ax.set_title("Session span: first turn start -> last turn end "
+                 "(dark = LLM active, light = turn-gap delay)")
+    ax.plot([], [], color="tab:blue", lw=6, alpha=0.9, label="LLM active")
+    ax.plot([], [], color="tab:blue", lw=6, alpha=0.2,
+            label="turn-gap delay (tool + scaffold + queue)")
+    ax.legend(fontsize=8, loc="lower right", framealpha=0.7)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def fig_eviction_vs_displacement(events: list[dict], path: Path, e0) -> None:
@@ -855,6 +920,8 @@ def main(argv: list[str] | None = None) -> int:
             e0.fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
             fig_eviction_vs_displacement(
                 events, out_dir / "fig6_eviction_vs_displacement.pdf", e0)
+            fig_session_span(e0, session_spans(turns),
+                             out_dir / "fig8_session_span.pdf")
             if lmc:
                 fig_lmcache(e0, lmc, kv, out_dir / "fig7_lmcache.pdf",
                             samples_abs, args.cpu_cache_gb, args.disk_cache_gb)

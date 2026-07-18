@@ -90,6 +90,25 @@ class _TE:
         return None if self.input_tokens is None else self.input_tokens + self.cache_read
 
 
+def test_session_spans_first_start_to_last_end_ordered(mod):
+    turns = [_T("A", 1, 0.0, 1.0), _T("A", 2, 3.0, 4.0),
+             _T("B", 1, 0.5, 1.5),
+             _T("X", 1, None, None)]     # missing timing -> dropped
+    sp = mod.session_spans(turns)
+    assert [d["session_id"] for d in sp] == ["A", "B"]   # by start time
+    assert sp[0]["start"] == 0.0 and sp[0]["end"] == 4.0
+    assert sp[0]["segments"] == [(0.0, 1.0), (3.0, 4.0)]
+    assert sp[1]["start"] == 0.5 and sp[1]["end"] == 1.5
+
+
+def test_session_spans_end_is_max_not_last_segment(mod):
+    # out-of-order / overlapping turns: end must be the MAX end, not the
+    # last-by-start segment's end
+    turns = [_T("A", 1, 0.0, 5.0), _T("A", 2, 1.0, 2.0)]
+    sp = mod.session_spans(turns)
+    assert sp[0]["start"] == 0.0 and sp[0]["end"] == 5.0
+
+
 def test_eviction_events_discriminates_eviction_vs_compaction(mod):
     # step1: prev_cached = 1000 + 100 = 1100
     # step2: prompt GREW (eff 1600 > 1000) but cache_read 200 -> eviction
