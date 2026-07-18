@@ -24,11 +24,15 @@ Usage:
       [--cpu-cache-gb N] [--disk-cache-gb N] \\
       [--worker-log logs/vllm-a0.log] [--out <dir>] [--no-figures]
 
-When the scrape NDJSON carries lmcache:* metrics (an LMCache offload run),
-fig7_lmcache is emitted: CPU/disk tier occupancy (lmcache:local_cache_usage
-/ local_storage_usage bytes; % of --cpu-cache-gb/--disk-cache-gb when given)
-on the GPU-KV-usage time axis, plus host<->device transfer speed (retrieve =
-onboard, store = offload; window-avg tokens/sec from the speed histograms).
+When the scrape NDJSON carries lmcache:* metrics (an LMCache offload run):
+  fig7_lmcache — CPU/disk tier occupancy (lmcache:local_cache_usage /
+    local_storage_usage bytes; % of --cpu-cache-gb/--disk-cache-gb when
+    given) on the GPU-KV-usage time axis + CPU-tier eviction rate, plus a
+    host<->device transfer-speed panel (retrieve = onboard, store =
+    offload; window-avg tokens/sec from the speed histograms).
+  fig8_lmcache_transfer_time — tokens transferred per window (num_hit_tokens
+    / num_stored_tokens) and the seconds it took to move them (tokens /
+    speed): a time spike without a matching token spike = slow transfer.
 """
 
 from __future__ import annotations
@@ -137,9 +141,66 @@ def lmcache_series(metrics_path: Path) -> dict[str, list[dict]]:
                 "retrieve_count": _sum_series(row, "lmcache:retrieve_speed_count"),
                 "store_sum": _sum_series(row, "lmcache:store_speed_sum"),
                 "store_count": _sum_series(row, "lmcache:store_speed_count"),
+                # CPU-tier eviction counters (host tier full -> LRU drop):
+                # evict_keys = chunks evicted, evict_failed = allocate
+                # attempts that found NO evictable candidate (pure pressure).
+                "evict_keys": _sum_series(row, "lmcache:local_cpu_evict_keys_count"),
+                "evict_failed": _sum_series(row, "lmcache:local_cpu_evict_failed_count"),
+                # transferred-token counters (pairs with the speed
+                # histograms to derive transfer TIME): hit = tokens
+                # retrieved host->device, stored = tokens offloaded
+                # device->host.
+                "hit_tokens": _sum_series(row, "lmcache:num_hit_tokens"),
+                "stored_tokens": _sum_series(row, "lmcache:num_stored_tokens"),
             })
     for recs in out.values():
         recs.sort(key=lambda r: r["ts"])
+    return out
+
+
+def counter_rate(recs: list[dict], key: str) -> list[tuple[float, float]]:
+    """Per-window rate (units/sec) of a cumulative counter:
+    delta(value)/delta(ts), stamped at the later tick. Skips negative
+    deltas (counter reset), non-positive dt, and breaks the chain on a
+    None gap. Used for LMCache eviction counters (chunks evicted/sec)."""
+    out: list[tuple[float, float]] = []
+    prev = None
+    for r in recs:
+        v = r.get(key)
+        if v is None:
+            prev = None
+            continue
+        if prev is not None:
+            dv, dt = v - prev[1], r["ts"] - prev[0]
+            if dt > 0 and dv >= 0:
+                out.append((r["ts"], dv / dt))
+        prev = (r["ts"], v)
+    return out
+
+
+def transfer_batches(recs: list[dict], tok_key: str, sum_key: str,
+                     count_key: str) -> list[tuple[float, float, float]]:
+    """Per window: (ts, tokens_transferred, seconds_to_transfer).
+
+    tokens = delta(tok_key) actually moved in the window; the window's
+    mean speed = delta(_sum)/delta(_count) tokens/sec from the paired
+    speed histogram; seconds = tokens / speed = how long it took to
+    transfer THOSE tokens. Skips windows with no completed ops
+    (delta_count <= 0) or non-positive speed, and breaks the chain on a
+    None gap (any of the three series missing)."""
+    out: list[tuple[float, float, float]] = []
+    prev = None
+    for r in recs:
+        tok, s, c = r.get(tok_key), r.get(sum_key), r.get(count_key)
+        if tok is None or s is None or c is None:
+            prev = None
+            continue
+        if prev is not None:
+            dtok, ds, dc = tok - prev[1], s - prev[2], c - prev[3]
+            if dc > 0 and ds > 0 and dtok >= 0:
+                speed = ds / dc
+                out.append((r["ts"], dtok, dtok / speed))
+        prev = (r["ts"], tok, s, c)
     return out
 
 
@@ -461,22 +522,27 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
     Panel 1: CPU tier usage (lmcache:local_cache_usage bytes; as % of
         --cpu-cache-gb when given, else GB) + disk tier usage, on the SAME
         time axis as the GPU KV-cache usage curve (twin %-axis) so the
-        host tier filling as the GPU stays pinned is directly visible.
+        host tier filling as the GPU stays pinned is directly visible;
+        plus CPU-tier eviction rate (lmcache:local_cpu_evict_keys_count
+        delta, chunks/sec, third axis) so the host-tier-full -> LRU-drop
+        onset lines up with the occupancy curve hitting capacity.
     Panel 2: transfer speed (tokens/sec, window-avg from the speed
         histograms): retrieve = host->device onboard, store = device->host
         offload. Same time axis."""
     plt = e0._mpl()
     fig, (ax_use, ax_spd) = plt.subplots(2, 1, figsize=(18, 10), sharex=True)
 
-    # Anchor t0 to the FIRST lmcache data point, not the earliest scrape
-    # tick: vLLM (vllm:*) metrics appear from worker startup, but lmcache:*
-    # metrics only register once LMCache does its first transfer, so a
-    # min-over-both t0 would leave the whole occupancy curve floating in a
-    # blank left margin. Trim the GPU KV curve to the lmcache window so the
-    # panels start at x=0 where the data actually begins.
-    lm_ts = [r["ts"] for recs in lmcache.values() for r in recs]
-    t0 = min(lm_ts) if lm_ts else (min((t for t, _ in gpu_kv), default=0.0))
-    gpu_kv = [(t, v) for t, v in gpu_kv if t >= t0]
+    # Anchor t0 to the EARLIEST scrape tick overall (GPU KV appears from
+    # worker startup) so the GPU KV-usage curve shows its full 0->full
+    # warmup ramp from x=0. The lmcache:* metrics only register after
+    # LMCache's first transfer, so the tier-occupancy + speed curves
+    # legitimately start LATER (at the real host-tier onset) — that lag is
+    # the signal: the host tier engages once the GPU is under pressure.
+    # (Both curves cannot start at x=0 on a shared real-time axis without
+    # hiding the GPU ramp, so we keep true-zero and let occupancy lag.)
+    all_ts = [r["ts"] for recs in lmcache.values() for r in recs]
+    all_ts += [t for t, _ in gpu_kv]
+    t0 = min(all_ts) if all_ts else 0.0
     GB = float(1 << 30)
     x_right = 0.0
 
@@ -486,6 +552,10 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
 
     # --- panel 1: tier occupancy (+ GPU KV usage on twin axis) ---
     ax_gpu = ax_use.twinx()
+    # third axis: CPU-tier eviction rate (chunks/sec), the "host tier full,
+    # LRU dropping" signal — offset spine so it doesn't overlap ax_gpu.
+    ax_ev = ax_use.twinx()
+    ax_ev.spines["right"].set_position(("axes", 1.06))
     if gpu_kv:
         gx = [t - t0 for t, _ in gpu_kv]
         ax_gpu.plot(gx, [v * 100.0 for _, v in gpu_kv], color="tab:green",
@@ -524,18 +594,37 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
                                  for b in disk],
                             color="tab:blue", lw=0.9, ls="--", zorder=2,
                             label="disk tier usage (GB)" if first else None)
+        # CPU-tier eviction rate (chunks/sec): fires once the host tier
+        # fills and LRU starts dropping chunks. evict_failed = no evictable
+        # candidate found (pure pressure, chunks pinned in-flight).
+        ev = counter_rate(recs, "evict_keys")
+        evf = counter_rate(recs, "evict_failed")
+        if ev:
+            ex = [t - t0 for t, _ in ev]
+            ax_ev.plot(ex, [v for _, v in ev], color="tab:red", lw=0.9,
+                       zorder=3,
+                       label="CPU evict rate (chunks/s)" if first else None)
+            x_right = max(x_right, ex[-1])
+        if any(v > 0 for _, v in evf):
+            efx = [t - t0 for t, _ in evf]
+            ax_ev.plot(efx, [v for _, v in evf], color="tab:red", lw=0.7,
+                       ls=":", alpha=0.8, zorder=3,
+                       label="CPU evict-FAILED rate (1/s)" if first else None)
         if ux:
             x_right = max(x_right, ux[-1])
         first = False
 
     ax_use.set_ylim(bottom=0)
+    ax_ev.set_ylim(bottom=0)
     ax_use.set_ylabel("LMCache tier usage "
                       + ("(% of capacity)" if as_pct else "(GB)"))
-    ax_use.set_title("LMCache Tier Occupancy vs time "
-                     "(host tier filling while GPU KV stays pinned)")
+    ax_ev.set_ylabel("CPU-tier eviction rate (chunks/s)", color="tab:red")
+    ax_use.set_title("LMCache Tier Occupancy + Eviction vs time "
+                     "(host tier fills -> LRU eviction kicks in)")
     h1, l1 = ax_use.get_legend_handles_labels()
     h2, l2 = ax_gpu.get_legend_handles_labels()
-    ax_use.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left",
+    h3, l3 = ax_ev.get_legend_handles_labels()
+    ax_use.legend(h1 + h2 + h3, l1 + l2 + l3, fontsize=8, loc="upper left",
                   framealpha=0.7)
 
     # --- panel 2: transfer speed (tokens/sec, window-avg) ---
@@ -566,6 +655,67 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
     ax_spd.set_title("LMCache Transfer Speed vs time "
                      "(window-avg from speed histograms)")
     ax_spd.legend(fontsize=8, loc="upper right", framealpha=0.7)
+
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_lmcache_transfer_time(e0, lmcache: dict[str, list[dict]],
+                              path: Path, sample_times: list[float]) -> None:
+    """How long the transferred tokens took to move, per window.
+
+    Pairs the transferred-token counters (lmcache:num_hit_tokens for
+    retrieve = host->device, num_stored_tokens for store = device->host)
+    with the matching speed histogram: seconds = tokens / (delta(_sum)/
+    delta(_count)). Two stacked panels on a shared time axis:
+      top    — tokens transferred per window (the actual token volume)
+      bottom — seconds it took to transfer THOSE tokens (tokens / speed)
+    so a spike in bottom-panel time that is NOT explained by a top-panel
+    token spike is a slow-transfer (contention) window."""
+    plt = e0._mpl()
+    fig, (ax_tok, ax_t) = plt.subplots(2, 1, figsize=(18, 10), sharex=True)
+
+    all_ts = [r["ts"] for recs in lmcache.values() for r in recs]
+    t0 = min(all_ts) if all_ts else 0.0
+    x_right = 0.0
+
+    for b in sample_times:
+        ax_tok.axvline(b - t0, color="crimson", lw=0.5, alpha=0.7, zorder=1)
+        ax_t.axvline(b - t0, color="crimson", lw=0.5, alpha=0.7, zorder=1)
+
+    specs = [("hit_tokens", "retrieve_sum", "retrieve_count", "tab:blue",
+              "retrieve  host->device"),
+             ("stored_tokens", "store_sum", "store_count", "tab:red",
+              "store  device->host")]
+    first = True
+    for worker in sorted(lmcache):
+        recs = lmcache[worker]
+        for tok_key, sk, ck, color, label in specs:
+            batches = transfer_batches(recs, tok_key, sk, ck)
+            if not batches:
+                continue
+            bx = [t - t0 for t, _, _ in batches]
+            ax_tok.plot(bx, [tok for _, tok, _ in batches], color=color,
+                        lw=0.9, marker=".", ms=3, zorder=2,
+                        label=label if first else None)
+            ax_t.plot(bx, [sec for _, _, sec in batches], color=color,
+                      lw=0.9, marker=".", ms=3, zorder=2,
+                      label=label if first else None)
+            x_right = max(x_right, bx[-1])
+        first = False
+
+    ax_tok.set_ylim(bottom=0)
+    ax_tok.set_ylabel("tokens transferred / window")
+    ax_tok.set_title("LMCache Tokens Transferred per window")
+    ax_tok.legend(fontsize=8, loc="upper right", framealpha=0.7)
+
+    ax_t.set_ylim(bottom=0)
+    ax_t.set_xlim(0, x_right if x_right > 0 else 1)
+    ax_t.set_xlabel("time (s)")
+    ax_t.set_ylabel("seconds to transfer those tokens")
+    ax_t.set_title("LMCache Transfer Time per window "
+                   "(tokens / speed; spike w/o token spike = slow transfer)")
+    ax_t.legend(fontsize=8, loc="upper right", framealpha=0.7)
 
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -670,6 +820,9 @@ def main(argv: list[str] | None = None) -> int:
             if lmc:
                 fig_lmcache(e0, lmc, kv, out_dir / "fig7_lmcache.pdf",
                             samples_abs, args.cpu_cache_gb, args.disk_cache_gb)
+                fig_lmcache_transfer_time(
+                    e0, lmc, out_dir / "fig8_lmcache_transfer_time.pdf",
+                    samples_abs)
         except ImportError:
             print("matplotlib not available (no figures written)",
                   file=sys.stderr)

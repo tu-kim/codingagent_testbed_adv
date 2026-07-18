@@ -131,8 +131,19 @@ def test_window_avg_speed_skips_counter_reset(mod):
     assert mod.window_avg_speed(recs, "s", "c") == [(2, 50.0)]
 
 
+def test_counter_rate_delta_over_dt_skips_reset_and_gap(mod):
+    # rate = delta(value)/delta(ts); zero-delta -> 0, reset (dv<0) skipped,
+    # None breaks the chain (no cross-gap rate).
+    recs = [{"ts": 0, "k": 10.0}, {"ts": 2, "k": 30.0},   # 20/2 = 10
+            {"ts": 4, "k": 30.0},                          # flat -> 0.0
+            {"ts": 6, "k": 5.0},                           # reset -> skip
+            {"ts": 7, "k": None},                          # gap -> break
+            {"ts": 8, "k": 100.0}]                         # prev reset -> none
+    assert mod.counter_rate(recs, "k") == [(2, 10.0), (4, 0.0)]
+
+
 def _lmc_row(ts, worker, cpu_b, disk_b, r_sum, r_cnt, s_sum, s_cnt,
-             ok=True, role="agg"):
+             evict_keys=0, evict_failed=0, ok=True, role="agg"):
     return {"ts": ts, "worker": worker, "role": role, "ok": ok, "metrics": {
         "vllm:kv_cache_usage_perc": [{"labels": {}, "value": 0.5}],
         "lmcache:local_cache_usage": [{"labels": {}, "value": cpu_b}],
@@ -140,7 +151,43 @@ def _lmc_row(ts, worker, cpu_b, disk_b, r_sum, r_cnt, s_sum, s_cnt,
         "lmcache:retrieve_speed_sum": [{"labels": {}, "value": r_sum}],
         "lmcache:retrieve_speed_count": [{"labels": {}, "value": r_cnt}],
         "lmcache:store_speed_sum": [{"labels": {}, "value": s_sum}],
-        "lmcache:store_speed_count": [{"labels": {}, "value": s_cnt}]}}
+        "lmcache:store_speed_count": [{"labels": {}, "value": s_cnt}],
+        "lmcache:local_cpu_evict_keys_count": [{"labels": {}, "value": evict_keys}],
+        "lmcache:local_cpu_evict_failed_count": [{"labels": {}, "value": evict_failed}]}}
+
+
+def test_transfer_batches_seconds_from_tokens_over_speed(mod):
+    # window t=1: tokens moved = 1200-1000 = 200; window mean speed =
+    # (3200-1000)/(20-10) = 220 tok/s; seconds = 200/220. dc=0 window skip.
+    recs = [{"ts": 0, "tok": 1000, "s": 1000.0, "c": 10},
+            {"ts": 1, "tok": 1200, "s": 3200.0, "c": 20},
+            {"ts": 2, "tok": 1200, "s": 3200.0, "c": 20}]  # dc 0 -> skip
+    tb = mod.transfer_batches(recs, "tok", "s", "c")
+    assert len(tb) == 1
+    ts, tokens, secs = tb[0]
+    assert ts == 1 and tokens == 200
+    assert secs == pytest.approx(200 / 220.0)
+
+
+def test_transfer_batches_skips_missing_series_and_gap(mod):
+    # a None in any of the three series breaks the delta chain
+    recs = [{"ts": 0, "tok": 100, "s": 10.0, "c": 1},
+            {"ts": 1, "tok": None, "s": 20.0, "c": 2},   # gap
+            {"ts": 2, "tok": 300, "s": 30.0, "c": 3}]     # prev reset -> none
+    assert mod.transfer_batches(recs, "tok", "s", "c") == []
+
+
+def test_lmcache_series_reads_eviction_counters(mod, tmp_path):
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        json.dumps(_lmc_row(10.0, "a0", 1 << 30, 0, 0.0, 0, 0.0, 0,
+                            evict_keys=0)) + "\n"
+        + json.dumps(_lmc_row(11.0, "a0", 2 << 30, 0, 0.0, 0, 0.0, 0,
+                              evict_keys=30, evict_failed=2)) + "\n")
+    lm = mod.lmcache_series(p)
+    assert [r["evict_keys"] for r in lm["a0"]] == [0, 30]
+    # chunks/sec across the 1s window
+    assert mod.counter_rate(lm["a0"], "evict_keys") == [(11.0, 30.0)]
 
 
 def test_lmcache_series_reads_lmcache_rows_only(mod, tmp_path):
