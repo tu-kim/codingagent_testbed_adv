@@ -120,6 +120,17 @@ def test_session_spans_drops_only_the_none_turn_not_the_whole_session(mod):
     assert sp[0]["start"] == 0.0 and sp[0]["end"] == 1.0
 
 
+def test_eviction_loss_pct(mod):
+    # missed = eviction-turn shortfall only; total = prev_cached over ALL
+    ev = [{"prev_cached": 1000, "shortfall": 300, "label": "eviction"},
+          {"prev_cached": 500, "shortfall": 100, "label": "compaction"},
+          {"prev_cached": 800, "shortfall": 0, "label": "ok"}]
+    missed, total, pct = mod.eviction_loss_pct(ev)
+    assert missed == 300 and total == 2300
+    assert pct == pytest.approx(300 / 2300 * 100)
+    assert mod.eviction_loss_pct([]) == (0, 0, None)
+
+
 def test_session_utilizations_active_over_span(mod):
     spans = [
         {"session_id": "A", "start": 0.0, "end": 4.0,

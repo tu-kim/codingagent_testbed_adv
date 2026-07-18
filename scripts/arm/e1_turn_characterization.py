@@ -360,6 +360,19 @@ def eviction_events(turns: list, compaction_drop_ratio: float = 0.6,
     return out
 
 
+def eviction_loss_pct(events: list[dict]) -> tuple[float, float, float | None]:
+    """(missed, total_cached, pct): missed = tokens that had been cached
+    but were re-prefilled because of EVICTION (sum of eviction-turn
+    shortfall, the red gap in fig3's top panel); total_cached = all KV
+    that WAS cached and available for reuse across turns (sum of
+    prev_cached over every resolved turn). pct = 100*missed/total_cached
+    = share of reusable KV lost to eviction (None if nothing cached)."""
+    total_cached = sum(e["prev_cached"] for e in events)
+    missed = sum(e["shortfall"] for e in events if e["label"] == "eviction")
+    pct = (100.0 * missed / total_cached) if total_cached > 0 else None
+    return missed, total_cached, pct
+
+
 def session_spans(turns: list) -> list[dict]:
     """Per session: {session_id, start, end, segments} ordered by start.
     start = first turn's llm_start, end = latest turn's llm_end, segments =
@@ -950,6 +963,10 @@ def main(argv: list[str] | None = None) -> int:
                and isinstance(e["displaced"], (int, float))]
     print(f"reuse-shortfall turns: eviction {n_ev}, compaction {n_cp}, "
           f"ok {len(events) - n_ev - n_cp} (of {len(events)})")
+    missed, total_cached, loss_pct = eviction_loss_pct(events)
+    if loss_pct is not None:
+        print(f"missed tokens due to eviction: {int(missed)} / "
+              f"{int(total_cached)} cached ({loss_pct:.2f}%)")
     if ev_disp:
         r = _pearson([p[0] for p in ev_disp], [p[1] for p in ev_disp])
         tot = sum(p[1] for p in ev_disp)
