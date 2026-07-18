@@ -492,3 +492,74 @@ def test_kvbm_env_override(tmp_path: Path):
     cfg = cfg_mod.load(_write(tmp_path, _AGG_YAML), environ=env)
     assert cfg.vllm.kvbm.enabled is True
     assert cfg.vllm.kvbm.cpu_cache_gb == 32
+
+
+# ---------- vllm.lmcache (CPU/disk KV offloading; agg-only) ----------
+
+
+def _agg_with_lmcache(lmcache: dict, kvbm: dict | None = None) -> str:
+    d = yaml.safe_load(_AGG_YAML)
+    d["vllm"]["lmcache"] = lmcache
+    if kvbm is not None:
+        d["vllm"]["kvbm"] = kvbm
+    return yaml.dump(d)
+
+
+def test_lmcache_defaults_off(tmp_path: Path):
+    cfg = cfg_mod.load(_write(tmp_path, _AGG_YAML))
+    assert cfg.vllm.lmcache.enabled is False
+    assert cfg.vllm.lmcache.chunk_size == 256
+    assert cfg.vllm.lmcache.cpu_cache_gb == 0.0
+    assert cfg.vllm.lmcache.disk_path == "/tmp/lmcache"
+
+
+def test_lmcache_enabled_on_agg_accepted(tmp_path: Path):
+    cfg = cfg_mod.load(_write(tmp_path, _agg_with_lmcache(
+        {"enabled": True, "cpu_cache_gb": 20, "disk_cache_gb": 40,
+         "disk_path": "/data/lmc"})))
+    assert cfg.vllm.lmcache.enabled is True
+    assert cfg.vllm.lmcache.cpu_cache_gb == 20
+    assert cfg.vllm.lmcache.disk_cache_gb == 40
+    assert cfg.vllm.lmcache.disk_path == "/data/lmc"
+
+
+def test_lmcache_enabled_requires_cpu_cache(tmp_path: Path):
+    with pytest.raises(ValidationError, match="cpu_cache_gb > 0"):
+        cfg_mod.load(_write(tmp_path, _agg_with_lmcache({"enabled": True})))
+
+
+def test_lmcache_zero_chunk_rejected(tmp_path: Path):
+    with pytest.raises(ValidationError, match="chunk_size"):
+        cfg_mod.load(_write(tmp_path, _agg_with_lmcache(
+            {"enabled": True, "cpu_cache_gb": 20, "chunk_size": 0})))
+
+
+def test_lmcache_disk_without_path_rejected(tmp_path: Path):
+    with pytest.raises(ValidationError, match="disk_path"):
+        cfg_mod.load(_write(tmp_path, _agg_with_lmcache(
+            {"enabled": True, "cpu_cache_gb": 20, "disk_cache_gb": 10,
+             "disk_path": ""})))
+
+
+def test_lmcache_rejected_on_disagg_topology(tmp_path: Path):
+    d = yaml.safe_load(_BASE_YAML)
+    d["vllm"]["lmcache"] = {"enabled": True, "cpu_cache_gb": 20}
+    with pytest.raises(ValidationError, match="agg \\(colocation\\) workers only"):
+        cfg_mod.load(_write(tmp_path, yaml.dump(d)))
+
+
+def test_lmcache_and_kvbm_mutually_exclusive(tmp_path: Path):
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        cfg_mod.load(_write(tmp_path, _agg_with_lmcache(
+            {"enabled": True, "cpu_cache_gb": 20},
+            kvbm={"enabled": True, "cpu_cache_gb": 20})))
+
+
+def test_lmcache_env_override(tmp_path: Path):
+    env = {"TESTBED__VLLM__LMCACHE__ENABLED": "true",
+           "TESTBED__VLLM__LMCACHE__CPU_CACHE_GB": "32",
+           "TESTBED__VLLM__LMCACHE__DISK_CACHE_GB": "100"}
+    cfg = cfg_mod.load(_write(tmp_path, _AGG_YAML), environ=env)
+    assert cfg.vllm.lmcache.enabled is True
+    assert cfg.vllm.lmcache.cpu_cache_gb == 32
+    assert cfg.vllm.lmcache.disk_cache_gb == 100

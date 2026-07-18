@@ -350,6 +350,42 @@ def test_run_scraper_writes_one_row_per_worker_per_tick(mod, tmp_path):
         assert row["role"] in ("prefill", "decode")
 
 
+def test_run_scraper_routes_kvbm_role_through_own_allowlist(mod, tmp_path):
+    """role=='kvbm' targets must scrape with KVBM_METRIC_NAMES (no
+    lmcache prefix, vllm: names dropped); other roles keep the passed
+    allowlist plus the lmcache: prefix. Exercises the branch in
+    run_scraper, not just parse_prometheus directly."""
+    out_path = tmp_path / "metrics.ndjson"
+    workers = [
+        {"worker": "a0", "role": "agg", "host": "127.0.0.1", "port": 21000},
+        {"worker": "a0", "role": "kvbm", "host": "127.0.0.1", "port": 6880},
+    ]
+    text = (
+        "vllm:num_requests_running 3\n"
+        "lmcache:local_cache_hit_rate 0.7\n"
+        "kvbm_host_cache_hit_rate 0.9\n"
+    )
+    state = {"count": 0}
+    def stop():
+        state["count"] += 1
+        return state["count"] > 1
+    with patch.object(mod.urllib.request, "urlopen",
+                       side_effect=lambda *a, **kw: _mk_response(text)):
+        n = mod.run_scraper(workers, 0.0, out_path,
+                             mod.DEFAULT_METRIC_NAMES, 2.0, stop)
+    assert n == 2
+    rows = {json.loads(l)["role"]: json.loads(l)
+            for l in out_path.read_text().splitlines() if l}
+    agg_metrics = rows["agg"]["metrics"]
+    assert "vllm:num_requests_running" in agg_metrics
+    assert "lmcache:local_cache_hit_rate" in agg_metrics
+    assert "kvbm_host_cache_hit_rate" not in agg_metrics
+    kvbm_metrics = rows["kvbm"]["metrics"]
+    assert "kvbm_host_cache_hit_rate" in kvbm_metrics
+    assert "vllm:num_requests_running" not in kvbm_metrics
+    assert "lmcache:local_cache_hit_rate" not in kvbm_metrics
+
+
 def test_run_scraper_records_error_when_worker_unreachable(mod, tmp_path):
     """One dead worker must not kill the loop; record `ok:false` +
     error string and continue."""
@@ -430,3 +466,28 @@ def test_kvbm_names_parse_through_own_allowlist(mod):
     parsed = mod.parse_prometheus(text, mod.KVBM_METRIC_NAMES)
     assert "kvbm_host_cache_hit_rate" in parsed
     assert "vllm:kv_cache_usage_perc" not in parsed
+
+
+def test_parse_keep_prefixes_keeps_lmcache_alongside_allowlist(mod):
+    """vLLM targets keep lmcache:-prefixed names BY PREFIX (exact names
+    live in the external lmcache pip package) in addition to the exact
+    allowlist; unrelated names still drop."""
+    text = (
+        'vllm:kv_cache_usage_perc{engine="0"} 0.5\n'
+        'lmcache:local_cache_hit_rate 0.7\n'
+        'lmcache:num_retrieved_tokens 1234\n'
+        'python_gc_collections_total 9\n'
+    )
+    out = mod.parse_prometheus(
+        text, frozenset({"vllm:kv_cache_usage_perc"}),
+        (mod.LMCACHE_METRIC_PREFIX,))
+    assert set(out) == {"vllm:kv_cache_usage_perc",
+                        "lmcache:local_cache_hit_rate",
+                        "lmcache:num_retrieved_tokens"}
+
+
+def test_parse_no_prefixes_drops_lmcache(mod):
+    """KVBM targets (and any caller passing no prefixes) must NOT pick up
+    lmcache: names through the prefix path."""
+    text = 'lmcache:local_cache_hit_rate 0.7\n'
+    assert mod.parse_prometheus(text, mod.KVBM_METRIC_NAMES) == {}

@@ -166,6 +166,21 @@ vllm:
     leader_zmq_pub_port_base: 56001   # KVBM leader coordination; unique per co-located worker (base+rank)
     leader_zmq_ack_port_base: 56101
 
+  # LMCache: CPU/disk KV offloading via vLLM's native LMCacheConnectorV1 —
+  # the KVBM alternative (avoids the KVBM stale-slot preemption crash; see
+  # CLAUDE.md). AGG workers ONLY; mutually exclusive with kvbm. Wire-in:
+  # --kv-transfer-config {"kv_connector":"LMCacheConnectorV1","kv_role":
+  # "kv_both"}; tiers ride LMCACHE_* env. No separate metrics port —
+  # "lmcache:"-prefixed metrics ride the worker's own system_port_base
+  # /metrics endpoint (scrape_vllm_metrics.py keeps them by prefix).
+  # PREREQ: `pip install lmcache` importable on the worker host.
+  lmcache:
+    enabled: false
+    chunk_size: 256              # LMCACHE_CHUNK_SIZE (token chunk granularity)
+    cpu_cache_gb: 0              # LMCACHE_MAX_LOCAL_CPU_SIZE GB; REQUIRED > 0 when enabled
+    disk_cache_gb: 0             # LMCACHE_MAX_LOCAL_DISK_SIZE GB; 0 = no disk tier
+    disk_path: /tmp/lmcache      # LMCACHE_LOCAL_DISK=file://<path>/; used when disk_cache_gb > 0
+
   extra_args: "--trust-remote-code --moe-backend triton"   # appended to every vLLM serve invocation (MiniMax M2 is a custom-code sparse-MoE; text-only, no --enable-multimodal)
 
 dynamo:

@@ -244,6 +244,65 @@ class KvbmCfg(_Strict):
         return self
 
 
+class LmcacheCfg(_Strict):
+    """LMCache CPU/disk KV offloading — the KVBM alternative.
+
+    Enabled by selecting vLLM's native connector "LMCacheConnectorV1" via
+    --kv-transfer-config (kv_role kv_both; exact shape from
+    dynamo/tests/lmcache/deploy-lmcache_enabled-dynamo.sh:31). Tier config
+    rides LMCACHE_* env vars (chunk size + CPU tier names from
+    dynamo/tests/lmcache/deploy-lmcache_enabled-dynamo-disag.sh:37-39;
+    disk tier names LMCACHE_LOCAL_DISK / LMCACHE_MAX_LOCAL_DISK_SIZE are
+    LMCache-documented, not vendored — verify on the GPU host with the
+    installed lmcache version).
+
+    vs KVBM: no kvbm wheel / consolidator / leader-ZMQ ports, and NO
+    separate metrics endpoint — LMCache registers "lmcache:"-prefixed
+    Prometheus metrics on the worker's own registry, i.e. the existing
+    DYN_SYSTEM_PORT /metrics that scrape_vllm_metrics.py already polls
+    (dynamo main.py:213-308 filters ["vllm:","lmcache:"] the same way).
+
+    Testbed scope: AGG (colocation) workers only, mirroring KvbmCfg — the
+    disagg shape puts LMCache on the prefill worker with kv_role=kv_both,
+    conflicting with our kv_producer/kv_consumer wiring. Mutually
+    exclusive with vllm.kvbm (one offload connector per worker).
+
+    Prereq: `pip install lmcache` importable on the worker host (vLLM's
+    factory resolves the connector module lazily at engine init).
+    """
+
+    enabled: bool = False
+    # LMCache token-chunk granularity (LMCACHE_CHUNK_SIZE). 256 is the
+    # value used across the vendored dynamo lmcache tests.
+    chunk_size: int = 256
+    # CPU tier size in GB (LMCACHE_LOCAL_CPU=True +
+    # LMCACHE_MAX_LOCAL_CPU_SIZE). REQUIRED > 0 when enabled.
+    cpu_cache_gb: float = 0.0
+    # Disk tier size in GB (LMCACHE_MAX_LOCAL_DISK_SIZE). 0 = no disk tier.
+    disk_cache_gb: float = 0.0
+    # Disk tier backing dir (LMCACHE_LOCAL_DISK=file://<path>/). Used only
+    # when disk_cache_gb > 0; testbed.sh mkdir -p's it at spawn.
+    disk_path: str = "/tmp/lmcache"
+
+    @model_validator(mode="after")
+    def _validate_lmcache(self) -> "LmcacheCfg":
+        if self.enabled:
+            if self.cpu_cache_gb <= 0:
+                raise ValueError(
+                    "lmcache.enabled requires cpu_cache_gb > 0 (disk-only "
+                    "tiering is unsupported here, matching kvbm)"
+                )
+            if self.disk_cache_gb < 0:
+                raise ValueError("lmcache.disk_cache_gb must be >= 0")
+            if self.chunk_size <= 0:
+                raise ValueError("lmcache.chunk_size must be > 0")
+            if self.disk_cache_gb > 0 and not self.disk_path:
+                raise ValueError(
+                    "lmcache.disk_cache_gb > 0 requires disk_path"
+                )
+        return self
+
+
 class VLLMCfg(_Strict):
     kv_connector: str = "NixlConnector"
     nixl_port_base: int = 6000
@@ -321,6 +380,9 @@ class VLLMCfg(_Strict):
     agg: VLLMRoleCfg | None = None
     # KVBM host/disk KV tiering — agg-only (see KvbmCfg docstring).
     kvbm: KvbmCfg = Field(default_factory=KvbmCfg)
+    # LMCache CPU/disk KV offloading — agg-only, mutually exclusive with
+    # kvbm (see LmcacheCfg docstring).
+    lmcache: LmcacheCfg = Field(default_factory=LmcacheCfg)
     extra_args: str = ""
 
     @field_validator("prefill_workers", "decode_workers", "agg_workers")
@@ -372,6 +434,20 @@ class VLLMCfg(_Strict):
                 "prefill worker (dynamo disagg_kvbm.sh), which conflicts "
                 "with our kv_producer/kv_consumer wiring and is not "
                 "validated on this tag. Use agg_workers or disable kvbm."
+            )
+        if self.lmcache.enabled and disagg:
+            raise ValueError(
+                "vllm.lmcache is currently supported for agg (colocation) "
+                "workers only: the disagg shape runs LMCache on the prefill "
+                "worker with kv_role=kv_both, which conflicts with our "
+                "kv_producer/kv_consumer wiring. Use agg_workers or "
+                "disable lmcache."
+            )
+        if self.lmcache.enabled and self.kvbm.enabled:
+            raise ValueError(
+                "vllm.lmcache and vllm.kvbm are mutually exclusive: both "
+                "claim the worker's --kv-transfer-config offload-connector "
+                "slot. Enable at most one."
             )
         return self
 

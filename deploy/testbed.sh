@@ -225,7 +225,7 @@ spawn_worker() {
   #     config.py rejects kvbm.enabled on disagg topologies.
   local disagg_mode kv_role=""
   local -a kv_args=()
-  local -a kvbm_env=()
+  local -a offload_env=()
   if [[ "$role" == "prefill" ]]; then
     disagg_mode=prefill; kv_role=kv_producer
   elif [[ "$role" == "decode" ]]; then
@@ -270,7 +270,7 @@ spawn_worker() {
       return 2
     fi
     kv_args=(--kv-transfer-config '{"kv_connector":"DynamoConnector","kv_connector_module_path":"kvbm.vllm_integration.connector","kv_role":"kv_both"}')
-    kvbm_env=(
+    offload_env=(
       "DYN_KVBM_CPU_CACHE_GB=$kvbm_cpu_gb"
       # Unique per co-located KVBM worker (rank offset) -- same collision
       # class as NIXL side-channel ports.
@@ -279,16 +279,67 @@ spawn_worker() {
     )
     # Disk tier only when sized > 0 (disk-only is rejected above via cpu>0).
     if awk -v x="$kvbm_disk_gb" 'BEGIN { exit !(x > 0) }'; then
-      kvbm_env+=("DYN_KVBM_DISK_CACHE_GB=$kvbm_disk_gb")
+      offload_env+=("DYN_KVBM_DISK_CACHE_GB=$kvbm_disk_gb")
     fi
     if [[ "$kvbm_metrics_base" -gt 0 ]]; then
-      kvbm_env+=(
+      offload_env+=(
         "DYN_KVBM_METRICS=true"
         "DYN_KVBM_METRICS_PORT=$((kvbm_metrics_base + rank))"
       )
     fi
     echo "vllm-${name}: KVBM enabled cpu=${kvbm_cpu_gb}GB disk=${kvbm_disk_gb}GB" \
          "metrics_port=$((kvbm_metrics_base + rank))"
+  elif [[ "$(cfg_bool VLLM__LMCACHE__ENABLED '.vllm.lmcache.enabled // ""')" == "true" ]]; then
+    # agg + vllm.lmcache.enabled: the OTHER offload-connector exception --
+    # LMCache CPU/disk KV offloading via vLLM's native LMCacheConnectorV1
+    # (kv_role=kv_both; exact shape from
+    # dynamo/tests/lmcache/deploy-lmcache_enabled-dynamo.sh:31). Tier
+    # sizes ride LMCACHE_* env (chunk/CPU names from the vendored disag
+    # script :37-39; disk names are LMCache-documented). Unlike KVBM there
+    # is NO separate metrics port: lmcache: metrics ride the worker's own
+    # DYN_SYSTEM_PORT /metrics registry. config.py rejects lmcache on
+    # disagg and lmcache+kvbm together; this elif chain mirrors the latter.
+    local lmc_chunk lmc_cpu_gb lmc_disk_gb lmc_disk_path
+    lmc_chunk=$(cfg_get_env VLLM__LMCACHE__CHUNK_SIZE '.vllm.lmcache.chunk_size // 256')
+    lmc_cpu_gb=$(cfg_get_env VLLM__LMCACHE__CPU_CACHE_GB '.vllm.lmcache.cpu_cache_gb // 0')
+    lmc_disk_gb=$(cfg_get_env VLLM__LMCACHE__DISK_CACHE_GB '.vllm.lmcache.disk_cache_gb // 0')
+    lmc_disk_path=$(cfg_get_env VLLM__LMCACHE__DISK_PATH '.vllm.lmcache.disk_path // "/tmp/lmcache"')
+    local v
+    for v in "cpu_cache_gb=$lmc_cpu_gb" "disk_cache_gb=$lmc_disk_gb"; do
+      if [[ ! "${v#*=}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "worker $name: vllm.lmcache.${v%%=*}=${v#*=} is not a number" >&2
+        return 2
+      fi
+    done
+    if [[ ! "$lmc_chunk" =~ ^[0-9]+$ ]] || [[ "$lmc_chunk" -le 0 ]]; then
+      echo "worker $name: vllm.lmcache.chunk_size=$lmc_chunk is not a positive integer" >&2
+      return 2
+    fi
+    # config.py enforces cpu_cache_gb > 0; mirror it shell-side.
+    if ! awk -v x="$lmc_cpu_gb" 'BEGIN { exit !(x > 0) }'; then
+      echo "worker $name: vllm.lmcache.enabled requires cpu_cache_gb > 0" >&2
+      return 2
+    fi
+    kv_args=(--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}')
+    offload_env=(
+      "LMCACHE_CHUNK_SIZE=$lmc_chunk"
+      "LMCACHE_LOCAL_CPU=True"
+      "LMCACHE_MAX_LOCAL_CPU_SIZE=$lmc_cpu_gb"
+    )
+    # Disk tier only when sized > 0.
+    if awk -v x="$lmc_disk_gb" 'BEGIN { exit !(x > 0) }'; then
+      if [[ -z "$lmc_disk_path" ]]; then
+        echo "worker $name: vllm.lmcache.disk_cache_gb > 0 requires disk_path" >&2
+        return 2
+      fi
+      mkdir -p "$lmc_disk_path"
+      offload_env+=(
+        "LMCACHE_LOCAL_DISK=file://${lmc_disk_path%/}/"
+        "LMCACHE_MAX_LOCAL_DISK_SIZE=$lmc_disk_gb"
+      )
+    fi
+    echo "vllm-${name}: LMCache enabled chunk=${lmc_chunk} cpu=${lmc_cpu_gb}GB" \
+         "disk=${lmc_disk_gb}GB (lmcache: metrics on system port)"
   fi
 
   # --dyn-tool-call-parser applies to every NON-PREFILL worker: the branch in
@@ -467,7 +518,7 @@ spawn_worker() {
     "NATS_SERVER=$nats_url" \
     "ETCD_ENDPOINTS=$etcd_endpoints" \
     ${sys_env[@]+"${sys_env[@]}"} \
-    ${kvbm_env[@]+"${kvbm_env[@]}"} \
+    ${offload_env[@]+"${offload_env[@]}"} \
     ${prompt_dump_envs[@]+"${prompt_dump_envs[@]}"} \
     -- \
     python -m dynamo.vllm \

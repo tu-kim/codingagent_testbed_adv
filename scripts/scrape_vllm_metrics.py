@@ -126,6 +126,16 @@ KVBM_METRIC_NAMES = frozenset({
     "kvbm_disk_cache_hit_rate",    # 0.0-1.0
 })
 
+# LMCache (vllm.lmcache.enabled): LMCacheConnectorV1 registers its metrics
+# on the WORKER'S OWN Prometheus registry (no separate endpoint, unlike
+# KVBM) with a "lmcache:" name prefix — dynamo's own scraper filters by the
+# same prefix pair ["vllm:", "lmcache:"] (dynamo main.py:213-308). The
+# exact metric names live in the external lmcache pip package (not
+# vendored), so we keep BY PREFIX rather than exact-name allowlist. Applied
+# to every vLLM target unconditionally: zero cost when LMCache is off (no
+# lmcache: lines exist), complete capture when on.
+LMCACHE_METRIC_PREFIX = "lmcache:"
+
 # Prometheus text-format line (no labels): metric value [ts]
 # With labels:                              metric{labels} value [ts]
 _METRIC_LINE = re.compile(
@@ -140,13 +150,16 @@ _LABEL_PAIR = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 
 def parse_prometheus(text: str,
                      keep_names: frozenset[str] | set[str] | None = None,
+                     keep_prefixes: tuple[str, ...] = (),
                     ) -> dict[str, list[dict]]:
     """Parse Prometheus exposition-format text into
     {metric_name: [{labels: {...}, value: float}, ...]}.
 
     `keep_names` is an exact-match allowlist applied at parse time
     (only matching names enter the output). Pass None to keep
-    everything (--keep-all)."""
+    everything (--keep-all). `keep_prefixes` additionally keeps any
+    name starting with one of the prefixes (used for lmcache: metrics,
+    whose exact names are not vendored)."""
     out: dict[str, list[dict]] = {}
     for line in text.splitlines():
         line = line.strip()
@@ -156,7 +169,8 @@ def parse_prometheus(text: str,
         if not m:
             continue
         name = m.group("name")
-        if keep_names is not None and name not in keep_names:
+        if (keep_names is not None and name not in keep_names
+                and not name.startswith(keep_prefixes)):
             continue
         labels: dict[str, str] = {}
         if m.group("labels"):
@@ -227,6 +241,7 @@ def load_workers(testbed_yaml: Path) -> list[dict]:
 
 def scrape_one(host: str, port: int, timeout_s: float,
                keep_names: frozenset[str] | set[str] | None,
+               keep_prefixes: tuple[str, ...] = (),
               ) -> tuple[bool, dict | str]:
     """GET http://<host>:<port>/metrics, parse, return (ok, payload).
     payload is the parsed metrics dict on success, an error string on
@@ -238,7 +253,7 @@ def scrape_one(host: str, port: int, timeout_s: float,
             text = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
         return False, f"{type(e).__name__}: {e}"
-    return True, parse_prometheus(text, keep_names)
+    return True, parse_prometheus(text, keep_names, keep_prefixes)
 
 
 def run_scraper(workers: list[dict], interval_s: float, output: Path,
@@ -251,9 +266,16 @@ def run_scraper(workers: list[dict], interval_s: float, output: Path,
             tick_ts = time.time()
             for w in workers:
                 # KVBM targets have their own allowlist (kvbm_* names);
-                # the vLLM allowlist would drop every KVBM metric.
-                target_keep = KVBM_METRIC_NAMES if w["role"] == "kvbm" else keep_names
-                ok, payload = scrape_one(w["host"], w["port"], timeout_s, target_keep)
+                # the vLLM allowlist would drop every KVBM metric. vLLM
+                # targets additionally keep lmcache:-prefixed names (the
+                # LMCache connector registers on the worker's own registry).
+                if w["role"] == "kvbm":
+                    target_keep, target_prefixes = KVBM_METRIC_NAMES, ()
+                else:
+                    target_keep = keep_names
+                    target_prefixes = (LMCACHE_METRIC_PREFIX,)
+                ok, payload = scrape_one(w["host"], w["port"], timeout_s,
+                                         target_keep, target_prefixes)
                 row = {
                     "ts": tick_ts,
                     "interval_s": interval_s,
