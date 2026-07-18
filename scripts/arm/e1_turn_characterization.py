@@ -682,7 +682,8 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
     ax_bot.set_ylim(bottom=0)
     ax_bot.set_xlabel("time (s)")
     ax_bot.set_ylabel("GPU KV-cache usage (%)")
-    ax_bot.set_title("GPU KV-cache Usage vs time")
+    # title lifted above the legend (legend sits just above the axes below)
+    ax_bot.set_title("GPU KV-cache Usage vs time", y=1.14)
 
     # prefix-cache hit rate on the right y-axis (same scrape clock) —
     # the former fig3-1 curve, folded into fig3.
@@ -697,7 +698,9 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
         ax_ph.set_ylabel("prefix-cache hit rate (%)", color="tab:orange")
         h1, l1 = ax_bot.get_legend_handles_labels()
         h2, l2 = ax_ph.get_legend_handles_labels()
-        ax_bot.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper right",
+        # legend above the plot area (horizontal), not overlapping the data
+        ax_bot.legend(h1 + h2, l1 + l2, fontsize=8, ncol=2,
+                      loc="lower center", bbox_to_anchor=(0.5, 1.0),
                       framealpha=0.7)
 
     fig.savefig(path, dpi=200, bbox_inches="tight")
