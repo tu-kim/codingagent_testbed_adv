@@ -162,6 +162,12 @@ def lmcache_series(metrics_path: Path) -> dict[str, list[dict]]:
                 # device->host.
                 "hit_tokens": _counter_series(row, "lmcache:num_hit_tokens"),
                 "stored_tokens": _counter_series(row, "lmcache:num_stored_tokens"),
+                # LMCache hit-rate gauges (0-1, sliding window): retrieve =
+                # fraction of retrieve requests served from the tier, lookup
+                # = fraction of lookups that found a match. The tier-side
+                # analogue of fig3-1's GPU prefix-cache hit rate.
+                "retrieve_hit_rate": _sum_series(row, "lmcache:retrieve_hit_rate"),
+                "lookup_hit_rate": _sum_series(row, "lmcache:lookup_hit_rate"),
             })
     for recs in out.values():
         recs.sort(key=lambda r: r["ts"])
@@ -186,6 +192,8 @@ LMCACHE_EXPECTED_METRICS = (
     "lmcache:local_cpu_evict_failed_count",
     "lmcache:num_hit_tokens",
     "lmcache:num_stored_tokens",
+    "lmcache:retrieve_hit_rate",          # gauge
+    "lmcache:lookup_hit_rate",            # gauge
 )
 
 
@@ -584,7 +592,10 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
         host tier filling as the GPU stays pinned is directly visible;
         plus CPU-tier eviction rate (lmcache:local_cpu_evict_keys_count
         delta, chunks/sec, third axis) so the host-tier-full -> LRU-drop
-        onset lines up with the occupancy curve hitting capacity.
+        onset lines up with the occupancy curve hitting capacity, and the
+        LMCache tier hit rate (retrieve/lookup, on the %-axis) — the
+        tier-side analogue of fig3-1's GPU prefix-cache hit rate, on the
+        scrape clock.
     Panel 2: transfer speed (tokens/sec, window-avg from the speed
         histograms): retrieve = host->device onboard, store = device->host
         offload. Same time axis."""
@@ -620,8 +631,25 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
         ax_gpu.plot(gx, [v * 100.0 for _, v in gpu_kv], color="tab:green",
                     lw=0.1, zorder=1, label="GPU KV usage %")
         x_right = max(x_right, gx[-1])
+    # LMCache tier hit rate on the same %-axis (the tier-side analogue of
+    # fig3-1's GPU prefix-cache hit rate; from the scrape gauges so it
+    # shares fig7's clock, unlike the worker-log-based fig3-1).
+    hr_labeled: set[str] = set()
+    for worker in sorted(lmcache):
+        recs = lmcache[worker]
+        for key, color, lab in (
+                ("retrieve_hit_rate", "tab:cyan", "LMCache retrieve hit %"),
+                ("lookup_hit_rate", "tab:olive", "LMCache lookup hit %")):
+            pts = [(r["ts"] - t0, r[key] * 100.0) for r in recs
+                   if r.get(key) is not None]
+            if not pts:
+                continue
+            ax_gpu.plot([x for x, _ in pts], [y for _, y in pts], color=color,
+                        lw=0.9, alpha=0.85, zorder=2,
+                        label=None if lab in hr_labeled else lab)
+            hr_labeled.add(lab)
     ax_gpu.set_ylim(0, 105)
-    ax_gpu.set_ylabel("GPU KV-cache usage (%)")
+    ax_gpu.set_ylabel("GPU KV usage / LMCache hit rate (%)")
 
     as_pct = cpu_cache_gb and cpu_cache_gb > 0
     first = True

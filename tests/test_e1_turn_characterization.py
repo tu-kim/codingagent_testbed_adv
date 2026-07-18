@@ -236,6 +236,21 @@ def test_lmcache_series_tolerates_openmetrics_total_suffix(mod, tmp_path):
         mod.lmcache_metric_names(p))
 
 
+def test_lmcache_series_reads_hit_rate_gauges(mod, tmp_path):
+    # LMCache tier hit-rate gauges (retrieve/lookup, 0-1) surface on fig7
+    def row(ts, rhr, lhr):
+        return {"ts": ts, "worker": "a0", "role": "agg", "ok": True,
+                "metrics": {
+                    "lmcache:retrieve_hit_rate": [{"labels": {}, "value": rhr}],
+                    "lmcache:lookup_hit_rate": [{"labels": {}, "value": lhr}]}}
+    p = tmp_path / "m.ndjson"
+    p.write_text(json.dumps(row(10.0, 0.2, 0.3)) + "\n"
+                 + json.dumps(row(11.0, 0.5, 0.4)) + "\n")
+    lm = mod.lmcache_series(p)
+    assert [r["retrieve_hit_rate"] for r in lm["a0"]] == [0.2, 0.5]
+    assert [r["lookup_hit_rate"] for r in lm["a0"]] == [0.3, 0.4]
+
+
 def test_lmcache_missing_metrics_flags_truly_absent(mod, tmp_path):
     p = tmp_path / "m.ndjson"
     # only a gauge present -> counters + histograms all reported missing
