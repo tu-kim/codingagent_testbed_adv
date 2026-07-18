@@ -158,6 +158,45 @@ def lmcache_series(metrics_path: Path) -> dict[str, list[dict]]:
     return out
 
 
+# The exact lmcache:* names fig7/fig8 consume. Kept here (not buried in
+# lmcache_series) so the diagnostic can report which ones the run is
+# actually missing -- LMCache metric names drift across versions, and a
+# renamed histogram/counter silently empties a panel.
+LMCACHE_EXPECTED_METRICS = (
+    "lmcache:local_cache_usage",
+    "lmcache:local_storage_usage",
+    "lmcache:retrieve_speed_sum",
+    "lmcache:retrieve_speed_count",
+    "lmcache:store_speed_sum",
+    "lmcache:store_speed_count",
+    "lmcache:local_cpu_evict_keys_count",
+    "lmcache:local_cpu_evict_failed_count",
+    "lmcache:num_hit_tokens",
+    "lmcache:num_stored_tokens",
+)
+
+
+def lmcache_metric_names(metrics_path: Path) -> set[str]:
+    """Every distinct lmcache:* metric name present in the scrape NDJSON —
+    the ground truth for reconciling LMCACHE_EXPECTED_METRICS against the
+    installed LMCache version when a panel comes up empty."""
+    names: set[str] = set()
+    with metrics_path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not row.get("ok"):
+                continue
+            names.update(k for k in (row.get("metrics") or {})
+                         if k.startswith("lmcache:"))
+    return names
+
+
 def counter_rate(recs: list[dict], key: str) -> list[tuple[float, float]]:
     """Per-window rate (units/sec) of a cumulative counter:
     delta(value)/delta(ts), stamped at the later tick. Skips negative
@@ -624,37 +663,40 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
     h1, l1 = ax_use.get_legend_handles_labels()
     h2, l2 = ax_gpu.get_legend_handles_labels()
     h3, l3 = ax_ev.get_legend_handles_labels()
-    ax_use.legend(h1 + h2 + h3, l1 + l2 + l3, fontsize=8, loc="upper left",
-                  framealpha=0.7)
+    if l1 + l2 + l3:
+        ax_use.legend(h1 + h2 + h3, l1 + l2 + l3, fontsize=8,
+                      loc="upper left", framealpha=0.7)
 
     # --- panel 2: transfer speed (tokens/sec, window-avg) ---
-    first = True
+    spd_labeled: set[str] = set()
     for worker in sorted(lmcache):
         recs = lmcache[worker]
         ret = window_avg_speed(recs, "retrieve_sum", "retrieve_count")
         sto = window_avg_speed(recs, "store_sum", "store_count")
         if ret:
             rx = [t - t0 for t, _ in ret]
+            lab = "retrieve  host->device (onboard)"
             ax_spd.plot(rx, [v for _, v in ret], color="tab:blue", lw=0.9,
                         marker=".", ms=3, zorder=2,
-                        label="retrieve  host->device (onboard)"
-                        if first else None)
+                        label=None if lab in spd_labeled else lab)
+            spd_labeled.add(lab)
             x_right = max(x_right, rx[-1])
         if sto:
             sx = [t - t0 for t, _ in sto]
+            lab = "store  device->host (offload)"
             ax_spd.plot(sx, [v for _, v in sto], color="tab:red", lw=0.9,
                         marker=".", ms=3, zorder=2,
-                        label="store  device->host (offload)"
-                        if first else None)
+                        label=None if lab in spd_labeled else lab)
+            spd_labeled.add(lab)
             x_right = max(x_right, sx[-1])
-        first = False
     ax_spd.set_ylim(bottom=0)
     ax_spd.set_xlim(0, x_right if x_right > 0 else 1)
     ax_spd.set_xlabel("time (s)")
     ax_spd.set_ylabel("transfer speed (tokens/sec)")
     ax_spd.set_title("LMCache Transfer Speed vs time "
                      "(window-avg from speed histograms)")
-    ax_spd.legend(fontsize=8, loc="upper right", framealpha=0.7)
+    if spd_labeled:
+        ax_spd.legend(fontsize=8, loc="upper right", framealpha=0.7)
 
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -687,27 +729,25 @@ def fig_lmcache_transfer_time(e0, lmcache: dict[str, list[dict]],
               "retrieve  host->device"),
              ("stored_tokens", "store_sum", "store_count", "tab:red",
               "store  device->host")]
-    first = True
+    labeled: set[str] = set()      # legend entry once per spec across workers
     for worker in sorted(lmcache):
         recs = lmcache[worker]
         for tok_key, sk, ck, color, label in specs:
             batches = transfer_batches(recs, tok_key, sk, ck)
             if not batches:
                 continue
+            lab = None if label in labeled else label
+            labeled.add(label)
             bx = [t - t0 for t, _, _ in batches]
             ax_tok.plot(bx, [tok for _, tok, _ in batches], color=color,
-                        lw=0.9, marker=".", ms=3, zorder=2,
-                        label=label if first else None)
+                        lw=0.9, marker=".", ms=3, zorder=2, label=lab)
             ax_t.plot(bx, [sec for _, _, sec in batches], color=color,
-                      lw=0.9, marker=".", ms=3, zorder=2,
-                      label=label if first else None)
+                      lw=0.9, marker=".", ms=3, zorder=2, label=lab)
             x_right = max(x_right, bx[-1])
-        first = False
 
     ax_tok.set_ylim(bottom=0)
     ax_tok.set_ylabel("tokens transferred / window")
     ax_tok.set_title("LMCache Tokens Transferred per window")
-    ax_tok.legend(fontsize=8, loc="upper right", framealpha=0.7)
 
     ax_t.set_ylim(bottom=0)
     ax_t.set_xlim(0, x_right if x_right > 0 else 1)
@@ -715,7 +755,17 @@ def fig_lmcache_transfer_time(e0, lmcache: dict[str, list[dict]],
     ax_t.set_ylabel("seconds to transfer those tokens")
     ax_t.set_title("LMCache Transfer Time per window "
                    "(tokens / speed; spike w/o token spike = slow transfer)")
-    ax_t.legend(fontsize=8, loc="upper right", framealpha=0.7)
+    if labeled:
+        ax_tok.legend(fontsize=8, loc="upper right", framealpha=0.7)
+        ax_t.legend(fontsize=8, loc="upper right", framealpha=0.7)
+    else:
+        # nothing plotted (no worker produced a batch) -> annotate why
+        # instead of a bare empty frame + legend warning.
+        msg = ("no transfer batches: lmcache num_hit/stored_tokens or "
+               "retrieve/store_speed histograms absent or renamed "
+               "(see the lmcache metric-name diagnostic on stderr)")
+        ax_tok.text(0.5, 0.5, msg, transform=ax_tok.transAxes, ha="center",
+                    va="center", fontsize=11, color="grey", wrap=True)
 
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -781,6 +831,22 @@ def main(argv: list[str] | None = None) -> int:
     have_metrics = args.metrics is not None and args.metrics.exists()
     kv = e0.kv_usage_series(args.metrics) if have_metrics else []
     lmc = lmcache_series(args.metrics) if have_metrics else {}
+    if lmc:
+        # LMCache metric names drift across versions; when a panel is empty
+        # this tells you exactly which expected name is absent so it can be
+        # reconciled against the installed lmcache.
+        seen = lmcache_metric_names(args.metrics)
+        missing = [n for n in LMCACHE_EXPECTED_METRICS if n not in seen]
+        print(f"lmcache metrics: {len(seen)} names seen across "
+              f"{len(lmc)} worker(s)", file=sys.stderr)
+        if missing:
+            print("  MISSING expected names (fig7/fig8 panels using them "
+                  "will be empty): " + ", ".join(missing), file=sys.stderr)
+            extra = sorted(n for n in seen
+                           if n not in LMCACHE_EXPECTED_METRICS)
+            if extra:
+                print("  other lmcache: names present (candidate renames): "
+                      + ", ".join(extra), file=sys.stderr)
 
     out_dir = args.out or (args.profiles / "e1")
     out_dir.mkdir(parents=True, exist_ok=True)

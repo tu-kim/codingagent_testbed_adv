@@ -131,6 +131,20 @@ def test_window_avg_speed_skips_counter_reset(mod):
     assert mod.window_avg_speed(recs, "s", "c") == [(2, 50.0)]
 
 
+def test_lmcache_metric_names_collects_lmcache_prefix_only(mod, tmp_path):
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        json.dumps({"ts": 1, "ok": True, "metrics": {
+            "vllm:x": [{"labels": {}, "value": 1}],
+            "lmcache:a": [{"labels": {}, "value": 1}]}}) + "\n"
+        + json.dumps({"ts": 2, "ok": True, "metrics": {
+            "lmcache:b": [{"labels": {}, "value": 1}]}}) + "\n"
+        # not-ok rows are ignored
+        + json.dumps({"ts": 3, "ok": False, "metrics": {
+            "lmcache:c": [{"labels": {}, "value": 1}]}}) + "\n")
+    assert mod.lmcache_metric_names(p) == {"lmcache:a", "lmcache:b"}
+
+
 def test_counter_rate_delta_over_dt_skips_reset_and_gap(mod):
     # rate = delta(value)/delta(ts); zero-delta -> 0, reset (dv<0) skipped,
     # None breaks the chain (no cross-gap rate).
