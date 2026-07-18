@@ -651,7 +651,7 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
                             color="tab:red", lw=0.8, alpha=0.7, zorder=3)
         first = False
         offset += len(evs)
-    ax_top.plot([], [], color="tab:red", lw=1.0, label="miss due to eviction")
+    ax_top.plot([], [], color="tab:red", lw=1.0, label="missed token")
     ax_top.set_xlim(0, max(offset - 1, 1))
     ax_top.set_ylim(bottom=0)
     ax_top.set_xlabel("turn")
