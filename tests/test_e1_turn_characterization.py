@@ -109,6 +109,17 @@ def test_session_spans_end_is_max_not_last_segment(mod):
     assert sp[0]["start"] == 0.0 and sp[0]["end"] == 5.0
 
 
+def test_session_spans_drops_only_the_none_turn_not_the_whole_session(mod):
+    # A has one valid turn and one turn with missing timing; the session
+    # must still appear, built from just the valid turn (per-turn skip,
+    # not a session-level drop).
+    turns = [_T("A", 1, 0.0, 1.0), _T("A", 2, None, None)]
+    sp = mod.session_spans(turns)
+    assert [d["session_id"] for d in sp] == ["A"]
+    assert sp[0]["segments"] == [(0.0, 1.0)]
+    assert sp[0]["start"] == 0.0 and sp[0]["end"] == 1.0
+
+
 def test_eviction_events_discriminates_eviction_vs_compaction(mod):
     # step1: prev_cached = 1000 + 100 = 1100
     # step2: prompt GREW (eff 1600 > 1000) but cache_read 200 -> eviction
