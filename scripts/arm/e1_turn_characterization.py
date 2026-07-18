@@ -534,7 +534,7 @@ def fig_turn_llm_time(e0, ordered: list, path: Path,
     if rpos:
         lim = max(abs(min(rpos)), abs(max(rpos))) * 1.1 or 1.0
         axes[2].set_ylim(-lim, lim)
-    axes[2].set_ylabel("log2(LLM / tool)  +up LLM-bound / -down tool-bound")
+    axes[2].set_ylabel("log2(LLM / tool)")
     axes[2].set_title("LLM Time / Tool Execution vs turn")
     axes[2].plot([], [], color="tab:blue", label="LLM-bound (>0)")
     axes[2].plot([], [], color="tab:orange", label="tool-bound (<0)")
