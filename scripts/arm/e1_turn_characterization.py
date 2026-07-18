@@ -747,7 +747,8 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
 def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
                 path: Path, sample_times: list[float],
                 cpu_cache_gb: float | None = None,
-                disk_cache_gb: float | None = None) -> None:
+                disk_cache_gb: float | None = None,
+                profile_end: float | None = None) -> None:
     """LMCache CPU/disk tier occupancy + transfer speed + transfer time
     vs time — the fig3 analogue for a KVBM-alternative run (LMCache
     exposes a REAL occupancy gauge, unlike KVBM). Three stacked panels on
@@ -773,6 +774,14 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
     plt = e0._mpl()
     fig, (ax_use, ax_spd, ax_tt) = plt.subplots(3, 1, figsize=(18, 15),
                                                 sharex=True)
+
+    # Trim scrape series to the profile end: the scrape keeps running after
+    # the last turn, so without this the panels show a long residual tail.
+    if profile_end is not None:
+        gpu_kv = [(t, v) for t, v in gpu_kv if t <= profile_end]
+        lmcache = {w: [r for r in recs if r["ts"] <= profile_end]
+                   for w, recs in lmcache.items()}
+        lmcache = {w: recs for w, recs in lmcache.items() if recs}
 
     # Anchor t0 to the EARLIEST scrape tick overall (GPU KV appears from
     # worker startup); the lmcache:* metrics only register after LMCache's
@@ -883,6 +892,10 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
                        lw=0.9, marker=".", ms=3, zorder=2, label=lab)
             x_right = max(x_right, bx[-1])
     ax_tt.set_ylim(bottom=0)
+    # end the x-axis at the profile end (not the last scrape point), so the
+    # panels close exactly where the run ends — matches fig3.
+    if profile_end is not None:
+        x_right = profile_end - t0
     ax_tt.set_xlim(0, x_right if x_right > 0 else 1)
     ax_tt.set_xlabel("time (s)")
     ax_tt.set_ylabel("seconds to transfer those tokens")
@@ -1026,8 +1039,11 @@ def main(argv: list[str] | None = None) -> int:
                 events, out_dir / "fig6_eviction_vs_displacement.pdf", e0)
             fig_session_span(e0, spans, out_dir / "fig8_session_span.pdf")
             if lmc:
+                prof_end = max((t.llm_end_ts for t in turns
+                                if t.llm_end_ts is not None), default=None)
                 fig_lmcache(e0, lmc, kv, out_dir / "fig7_lmcache.pdf",
-                            samples_abs, args.cpu_cache_gb, args.disk_cache_gb)
+                            samples_abs, args.cpu_cache_gb, args.disk_cache_gb,
+                            profile_end=prof_end)
         except ImportError:
             print("matplotlib not available (no figures written)",
                   file=sys.stderr)
