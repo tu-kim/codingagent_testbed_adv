@@ -82,6 +82,10 @@ class TurnRec:
     elapsed_s: float | None = None     # dynamo.total_time_ms/1000
     output_tokens: int | None = None
     input_tokens: int | None = None
+    reasoning_tokens: int = 0          # llm.end tokens.reasoning (part of
+                                       # output; opencode drops PRIOR-turn
+                                       # reasoning from the next prompt, so it
+                                       # is not reusable KV downstream)
     cache_read: int = 0
     llm_wall_s: float | None = None    # llm.end duration_s (stream wall)
     # turn.end llm_wall_true_s: wall-clock-anchored LLM wall
@@ -200,6 +204,7 @@ def load_turns(profiles_dir: Path) -> list[TurnRec]:
                 cache = tokens.get("cache") or {}
                 t.input_tokens = inp
                 t.output_tokens = out
+                t.reasoning_tokens = (tokens.get("reasoning") or 0)
                 t.cache_read = (cache.get("read") if isinstance(cache, dict) else 0) or 0
             elif ev_type == "turn.end":
                 t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))

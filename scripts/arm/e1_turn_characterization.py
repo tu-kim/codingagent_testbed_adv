@@ -335,7 +335,14 @@ def eviction_events(turns: list, compaction_drop_ratio: float = 0.6,
         pe = prev.effective_input
         if pe is None:
             continue
-        prev_cached = pe + (prev.output_tokens or 0)
+        # prev_cached = KV from turn N-1 that STAYS reusable in turn N's
+        # prompt = effective_input(N-1) + non-reasoning output(N-1).
+        # opencode drops prior-turn reasoning from the next prompt, so
+        # reasoning tokens are never re-fed and must not count as
+        # "cached but not reused" (else every turn shows a phantom miss,
+        # even at mif=1 where no real eviction can happen).
+        prev_out = (prev.output_tokens or 0) - getattr(prev, "reasoning_tokens", 0)
+        prev_cached = pe + max(0, prev_out)
         if prev_cached <= 0:
             continue
         cr = t.cache_read or 0
@@ -371,6 +378,21 @@ def eviction_loss_pct(events: list[dict]) -> tuple[float, float, float | None]:
     missed = sum(e["shortfall"] for e in events if e["label"] == "eviction")
     pct = (100.0 * missed / total_cached) if total_cached > 0 else None
     return missed, total_cached, pct
+
+
+def prefix_mismatch_pct(events: list[dict]) -> tuple[float, float, float | None]:
+    """(missed, reusable, pct): prefix-mismatch rate — of the reusable KV
+    across NON-compaction turns (compaction is a legitimate prompt shrink,
+    not a mismatch), what fraction failed to be prefix-matched and had to
+    be re-prefilled. missed = sum of positive shortfall, reusable = sum of
+    prev_cached, over label != 'compaction'. With prior-turn reasoning
+    already excluded from prev_cached, this is the true prefix-match miss
+    rate (reasoning drop no longer inflates it)."""
+    rel = [e for e in events if e["label"] != "compaction"]
+    reusable = sum(e["prev_cached"] for e in rel)
+    missed = sum(max(0, e["shortfall"]) for e in rel)
+    pct = (100.0 * missed / reusable) if reusable > 0 else None
+    return missed, reusable, pct
 
 
 def session_spans(turns: list) -> list[dict]:
@@ -967,6 +989,11 @@ def main(argv: list[str] | None = None) -> int:
     if loss_pct is not None:
         print(f"missed tokens due to eviction: {int(missed)} / "
               f"{int(total_cached)} cached ({loss_pct:.2f}%)")
+    mm, reusable, mm_pct = prefix_mismatch_pct(events)
+    if mm_pct is not None:
+        print(f"prefix mismatch rate: {mm_pct:.2f}%  "
+              f"(missed {int(mm)} / reusable {int(reusable)} tokens, "
+              f"reasoning excluded)")
     if ev_disp:
         r = _pearson([p[0] for p in ev_disp], [p[1] for p in ev_disp])
         tot = sum(p[1] for p in ev_disp)

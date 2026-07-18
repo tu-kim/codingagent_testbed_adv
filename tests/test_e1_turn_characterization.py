@@ -74,12 +74,14 @@ def test_main_interleaved_sessions_no_figures(mod, tmp_path):
 
 
 class _TE:
-    def __init__(self, sid, step, inp, cache, out, away=None, disp=None):
+    def __init__(self, sid, step, inp, cache, out, away=None, disp=None,
+                 reasoning=0):
         self.session_id = sid
         self.step = step
         self.input_tokens = inp
         self.cache_read = cache
         self.output_tokens = out
+        self.reasoning_tokens = reasoning
         self.away_s = away
         self.away_displaced_tokens = disp
         self.llm_start_ts = float(step)
@@ -118,6 +120,28 @@ def test_session_spans_drops_only_the_none_turn_not_the_whole_session(mod):
     assert [d["session_id"] for d in sp] == ["A"]
     assert sp[0]["segments"] == [(0.0, 1.0)]
     assert sp[0]["start"] == 0.0 and sp[0]["end"] == 1.0
+
+
+def test_eviction_events_excludes_prior_turn_reasoning(mod):
+    # prev_cached must exclude prior-turn reasoning (dropped from the next
+    # prompt): eff(N-1)=1000, out=200, reasoning=150 -> prev_cached =
+    # 1000 + (200-150) = 1050 (not 1200). cache_read 1000 -> shortfall 50.
+    turns = [_TE("A", 1, 1000, 0, 200, reasoning=150),
+             _TE("A", 2, 1400, 1000, 80)]
+    ev = {e["step"]: e for e in mod.eviction_events(turns)}
+    assert ev[2]["prev_cached"] == 1050
+    assert ev[2]["shortfall"] == 50
+    assert ev[2]["label"] == "ok"       # below the 128 min-shortfall
+
+
+def test_prefix_mismatch_pct_excludes_compaction(mod):
+    ev = [{"prev_cached": 900, "shortfall": 100, "label": "eviction"},
+          {"prev_cached": 500, "shortfall": 400, "label": "compaction"},  # out
+          {"prev_cached": 600, "shortfall": 50, "label": "ok"}]
+    missed, reusable, pct = mod.prefix_mismatch_pct(ev)
+    assert missed == 150 and reusable == 1500
+    assert pct == pytest.approx(10.0)
+    assert mod.prefix_mismatch_pct([]) == (0, 0, None)
 
 
 def test_eviction_loss_pct(mod):
