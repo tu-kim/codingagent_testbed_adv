@@ -143,7 +143,8 @@ def test_counter_rate_delta_over_dt_skips_reset_and_gap(mod):
 
 
 def _lmc_row(ts, worker, cpu_b, disk_b, r_sum, r_cnt, s_sum, s_cnt,
-             evict_keys=0, evict_failed=0, ok=True, role="agg"):
+             evict_keys=0, evict_failed=0, hit_tokens=0, stored_tokens=0,
+             ok=True, role="agg"):
     return {"ts": ts, "worker": worker, "role": role, "ok": ok, "metrics": {
         "vllm:kv_cache_usage_perc": [{"labels": {}, "value": 0.5}],
         "lmcache:local_cache_usage": [{"labels": {}, "value": cpu_b}],
@@ -153,7 +154,29 @@ def _lmc_row(ts, worker, cpu_b, disk_b, r_sum, r_cnt, s_sum, s_cnt,
         "lmcache:store_speed_sum": [{"labels": {}, "value": s_sum}],
         "lmcache:store_speed_count": [{"labels": {}, "value": s_cnt}],
         "lmcache:local_cpu_evict_keys_count": [{"labels": {}, "value": evict_keys}],
-        "lmcache:local_cpu_evict_failed_count": [{"labels": {}, "value": evict_failed}]}}
+        "lmcache:local_cpu_evict_failed_count": [{"labels": {}, "value": evict_failed}],
+        "lmcache:num_hit_tokens": [{"labels": {}, "value": hit_tokens}],
+        "lmcache:num_stored_tokens": [{"labels": {}, "value": stored_tokens}]}}
+
+
+def test_lmcache_series_maps_transferred_token_counters(mod, tmp_path):
+    # locks the field-name mapping: lmcache:num_hit_tokens -> hit_tokens,
+    # lmcache:num_stored_tokens -> stored_tokens (an upstream rename must
+    # fail here, not silently zero out fig8).
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        json.dumps(_lmc_row(10.0, "a0", 1 << 30, 0, 1000.0, 10, 500.0, 5,
+                            hit_tokens=300, stored_tokens=400)) + "\n"
+        + json.dumps(_lmc_row(11.0, "a0", 2 << 30, 0, 3200.0, 20, 900.0, 9,
+                              hit_tokens=500, stored_tokens=800)) + "\n")
+    lm = mod.lmcache_series(p)
+    assert [r["hit_tokens"] for r in lm["a0"]] == [300, 500]
+    assert [r["stored_tokens"] for r in lm["a0"]] == [400, 800]
+    # end-to-end through transfer_batches with the real field names:
+    # window tokens = 500-300 = 200, speed = (3200-1000)/(20-10) = 220
+    tb = mod.transfer_batches(lm["a0"], "hit_tokens",
+                              "retrieve_sum", "retrieve_count")
+    assert tb == [(11.0, 200, pytest.approx(200 / 220.0))]
 
 
 def test_transfer_batches_seconds_from_tokens_over_speed(mod):
