@@ -21,13 +21,22 @@ Usage:
       --profiles <workspace_root>/profiles \\
       --trace results/<run>/trace.jsonl \\
       [--metrics logs/vllm_metrics.ndjson] \\
+      [--cpu-cache-gb N] [--disk-cache-gb N] \\
       [--worker-log logs/vllm-a0.log] [--out <dir>] [--no-figures]
+
+When the scrape NDJSON carries lmcache:* metrics (an LMCache offload run),
+fig7_lmcache is emitted: CPU/disk tier occupancy (lmcache:local_cache_usage
+/ local_storage_usage bytes; % of --cpu-cache-gb/--disk-cache-gb when given)
+on the GPU-KV-usage time axis, plus host<->device transfer speed (retrieve =
+onboard, store = offload; window-avg tokens/sec from the speed histograms).
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -71,6 +80,89 @@ def session_first_times_abs(ordered: list) -> list[float]:
         if st is not None and t.session_id not in first:
             first[t.session_id] = st
     return sorted(first.values())
+
+
+# ---------- LMCache tier occupancy + transfer speed (scrape NDJSON) ----------
+
+
+def _sum_series(row: dict, name: str) -> float | None:
+    series = (row.get("metrics") or {}).get(name)
+    if not series:
+        return None
+    vals = [e.get("value") for e in series
+            if isinstance(e.get("value"), (int, float))
+            and math.isfinite(e["value"])]
+    return sum(vals) if vals else None
+
+
+def lmcache_series(metrics_path: Path) -> dict[str, list[dict]]:
+    """Per-worker LMCache series from any scrape row carrying lmcache:*
+    metrics (LMCache rides the worker's own /metrics, so these appear on
+    the normal vLLM target rows, NOT a separate role like KVBM).
+
+    Returns {worker: [rec, ...]} sorted by ts, each rec:
+      ts, local_usage_bytes  (lmcache:local_cache_usage  = CPU tier occupancy)
+          storage_usage_bytes(lmcache:local_storage_usage = disk tier occupancy)
+          retrieve_sum/retrieve_count (lmcache:retrieve_speed histogram
+              _sum/_count; retrieve = host->device onboard, tokens/sec)
+          store_sum/store_count       (lmcache:store_speed histogram
+              _sum/_count; store = device->host offload, tokens/sec)
+    Window-average speed is derived downstream as delta(_sum)/delta(_count)
+    between successive scrape ticks. Metric names are LMCache's (verified
+    against a local LMCache checkout; re-confirm against the installed
+    version via the first run's vllm_metrics.ndjson)."""
+    out: dict[str, list[dict]] = {}
+    with metrics_path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not row.get("ok"):
+                continue
+            metrics = row.get("metrics") or {}
+            if not any(k.startswith("lmcache:") for k in metrics):
+                continue
+            ts = row.get("ts")
+            if ts is None:
+                continue
+            out.setdefault(str(row.get("worker", "?")), []).append({
+                "ts": float(ts),
+                "local_usage_bytes": _sum_series(row, "lmcache:local_cache_usage"),
+                "storage_usage_bytes": _sum_series(row, "lmcache:local_storage_usage"),
+                "retrieve_sum": _sum_series(row, "lmcache:retrieve_speed_sum"),
+                "retrieve_count": _sum_series(row, "lmcache:retrieve_speed_count"),
+                "store_sum": _sum_series(row, "lmcache:store_speed_sum"),
+                "store_count": _sum_series(row, "lmcache:store_speed_count"),
+            })
+    for recs in out.values():
+        recs.sort(key=lambda r: r["ts"])
+    return out
+
+
+def window_avg_speed(recs: list[dict], sum_key: str,
+                     count_key: str) -> list[tuple[float, float]]:
+    """Per-window mean transfer speed (tokens/sec) from a Prometheus
+    histogram's _sum/_count: between two ticks, delta(_sum)/delta(_count)
+    is the mean of the operations that completed in that window. Points
+    are stamped at the LATER tick. Skips windows with no new operations
+    (delta_count <= 0) and any tick missing the series."""
+    out: list[tuple[float, float]] = []
+    prev = None
+    for r in recs:
+        s, c = r.get(sum_key), r.get(count_key)
+        if s is None or c is None:
+            prev = None      # break the delta chain across a gap
+            continue
+        if prev is not None:
+            ds, dc = s - prev[1], c - prev[2]
+            if dc > 0 and ds >= 0:
+                out.append((r["ts"], ds / dc))
+        prev = (r["ts"], s, c)
+    return out
 
 
 # ---------- eviction evidence ----------
@@ -358,6 +450,122 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
     plt.close(fig)
 
 
+def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
+                path: Path, sample_times: list[float],
+                cpu_cache_gb: float | None = None,
+                disk_cache_gb: float | None = None) -> None:
+    """LMCache CPU/disk tier occupancy + transfer speed vs time — the
+    fig3 analogue for a KVBM-alternative run (LMCache exposes a REAL
+    occupancy gauge, unlike KVBM).
+
+    Panel 1: CPU tier usage (lmcache:local_cache_usage bytes; as % of
+        --cpu-cache-gb when given, else GB) + disk tier usage, on the SAME
+        time axis as the GPU KV-cache usage curve (twin %-axis) so the
+        host tier filling as the GPU stays pinned is directly visible.
+    Panel 2: transfer speed (tokens/sec, window-avg from the speed
+        histograms): retrieve = host->device onboard, store = device->host
+        offload. Same time axis."""
+    plt = e0._mpl()
+    fig, (ax_use, ax_spd) = plt.subplots(2, 1, figsize=(18, 10), sharex=True)
+
+    # shared t0 with the GPU KV curve so both panels align to it
+    all_ts = [r["ts"] for recs in lmcache.values() for r in recs]
+    all_ts += [t for t, _ in gpu_kv]
+    t0 = min(all_ts) if all_ts else 0.0
+    GB = float(1 << 30)
+    x_right = 0.0
+
+    for b in sample_times:
+        ax_use.axvline(b - t0, color="crimson", lw=0.5, alpha=0.7, zorder=1)
+        ax_spd.axvline(b - t0, color="crimson", lw=0.5, alpha=0.7, zorder=1)
+
+    # --- panel 1: tier occupancy (+ GPU KV usage on twin axis) ---
+    ax_gpu = ax_use.twinx()
+    if gpu_kv:
+        gx = [t - t0 for t, _ in gpu_kv]
+        ax_gpu.plot(gx, [v * 100.0 for _, v in gpu_kv], color="tab:green",
+                    lw=0.1, zorder=1, label="GPU KV usage %")
+        x_right = max(x_right, gx[-1])
+    ax_gpu.set_ylim(0, 105)
+    ax_gpu.set_ylabel("GPU KV-cache usage (%)")
+
+    as_pct = cpu_cache_gb and cpu_cache_gb > 0
+    first = True
+    for worker in sorted(lmcache):
+        recs = lmcache[worker]
+        ux = [r["ts"] - t0 for r in recs]
+        cpu = [r["local_usage_bytes"] for r in recs]
+        disk = [r["storage_usage_bytes"] for r in recs]
+        if as_pct:
+            cap = cpu_cache_gb * GB
+            ax_use.plot(ux, [b / cap * 100.0 if b is not None else float("nan")
+                             for b in cpu],
+                        color="tab:purple", lw=0.9, zorder=2,
+                        label="CPU tier usage %" if first else None)
+        else:
+            ax_use.plot(ux, [b / GB if b is not None else float("nan")
+                             for b in cpu],
+                        color="tab:purple", lw=0.9, zorder=2,
+                        label="CPU tier usage (GB)" if first else None)
+        if any(d is not None for d in disk):
+            if disk_cache_gb and disk_cache_gb > 0 and as_pct:
+                dcap = disk_cache_gb * GB
+                ax_use.plot(ux, [b / dcap * 100.0 if b is not None
+                                 else float("nan") for b in disk],
+                            color="tab:blue", lw=0.9, ls="--", zorder=2,
+                            label="disk tier usage %" if first else None)
+            else:
+                ax_use.plot(ux, [b / GB if b is not None else float("nan")
+                                 for b in disk],
+                            color="tab:blue", lw=0.9, ls="--", zorder=2,
+                            label="disk tier usage (GB)" if first else None)
+        if ux:
+            x_right = max(x_right, ux[-1])
+        first = False
+
+    ax_use.set_ylim(bottom=0)
+    ax_use.set_ylabel("LMCache tier usage "
+                      + ("(% of capacity)" if as_pct else "(GB)"))
+    ax_use.set_title("LMCache Tier Occupancy vs time "
+                     "(host tier filling while GPU KV stays pinned)")
+    h1, l1 = ax_use.get_legend_handles_labels()
+    h2, l2 = ax_gpu.get_legend_handles_labels()
+    ax_use.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left",
+                  framealpha=0.7)
+
+    # --- panel 2: transfer speed (tokens/sec, window-avg) ---
+    first = True
+    for worker in sorted(lmcache):
+        recs = lmcache[worker]
+        ret = window_avg_speed(recs, "retrieve_sum", "retrieve_count")
+        sto = window_avg_speed(recs, "store_sum", "store_count")
+        if ret:
+            rx = [t - t0 for t, _ in ret]
+            ax_spd.plot(rx, [v for _, v in ret], color="tab:blue", lw=0.9,
+                        marker=".", ms=3, zorder=2,
+                        label="retrieve  host->device (onboard)"
+                        if first else None)
+            x_right = max(x_right, rx[-1])
+        if sto:
+            sx = [t - t0 for t, _ in sto]
+            ax_spd.plot(sx, [v for _, v in sto], color="tab:red", lw=0.9,
+                        marker=".", ms=3, zorder=2,
+                        label="store  device->host (offload)"
+                        if first else None)
+            x_right = max(x_right, sx[-1])
+        first = False
+    ax_spd.set_ylim(bottom=0)
+    ax_spd.set_xlim(0, x_right if x_right > 0 else 1)
+    ax_spd.set_xlabel("time (s)")
+    ax_spd.set_ylabel("transfer speed (tokens/sec)")
+    ax_spd.set_title("LMCache Transfer Speed vs time "
+                     "(window-avg from speed histograms)")
+    ax_spd.legend(fontsize=8, loc="upper right", framealpha=0.7)
+
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ---------- main ----------
 
 
@@ -376,6 +584,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-shortfall", type=int, default=128,
                     help="fig5/6: ignore reuse shortfalls <= this many "
                          "tokens (block-granularity noise). Default 128")
+    ap.add_argument("--cpu-cache-gb", type=float, default=None,
+                    help="LMCache CPU tier capacity GB (vllm.lmcache."
+                         "cpu_cache_gb) -> fig_lmcache usage panel in %% "
+                         "of capacity instead of raw GB")
+    ap.add_argument("--disk-cache-gb", type=float, default=None,
+                    help="LMCache disk tier capacity GB "
+                         "(vllm.lmcache.disk_cache_gb)")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -410,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
                              args.min_shortfall)
     have_metrics = args.metrics is not None and args.metrics.exists()
     kv = e0.kv_usage_series(args.metrics) if have_metrics else []
+    lmc = lmcache_series(args.metrics) if have_metrics else {}
 
     out_dir = args.out or (args.profiles / "e1")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -446,6 +662,9 @@ def main(argv: list[str] | None = None) -> int:
                 if wl_hits or wl_kv:
                     e0.fig_worker_hit_kv(wl_hits, wl_kv,
                                          out_dir / "fig3-1_worker_hit_kv.pdf")
+            if lmc:
+                fig_lmcache(e0, lmc, kv, out_dir / "fig7_lmcache.pdf",
+                            samples_abs, args.cpu_cache_gb, args.disk_cache_gb)
         except ImportError:
             print("matplotlib not available (no figures written)",
                   file=sys.stderr)

@@ -111,6 +111,75 @@ def test_eviction_events_min_shortfall_noise_is_ok(mod):
     assert ev[0]["label"] == "ok"
 
 
+def test_window_avg_speed_delta_sum_over_delta_count(mod):
+    # window mean = delta(_sum)/delta(_count); zero-delta and gap skipped
+    recs = [{"ts": 0, "s": 100.0, "c": 2},
+            {"ts": 1, "s": 400.0, "c": 4},     # (400-100)/(4-2) = 150
+            {"ts": 2, "s": 400.0, "c": 4},     # dcount 0 -> skip
+            {"ts": 3, "s": None, "c": None},   # gap -> break the chain
+            {"ts": 4, "s": 500.0, "c": 5}]     # prev reset -> no point
+    assert mod.window_avg_speed(recs, "s", "c") == [(1, 150.0)]
+
+
+def test_window_avg_speed_skips_counter_reset(mod):
+    # a Prometheus counter reset (e.g. worker restart) makes _sum go DOWN;
+    # that window must be dropped (ds < 0), not reported as negative speed,
+    # but the reset value still seeds the next window's baseline.
+    recs = [{"ts": 0, "s": 1000.0, "c": 10},
+            {"ts": 1, "s": 50.0, "c": 1},      # reset: ds=-950 -> skip
+            {"ts": 2, "s": 150.0, "c": 3}]     # (150-50)/(3-1) = 50, post-reset
+    assert mod.window_avg_speed(recs, "s", "c") == [(2, 50.0)]
+
+
+def _lmc_row(ts, worker, cpu_b, disk_b, r_sum, r_cnt, s_sum, s_cnt,
+             ok=True, role="agg"):
+    return {"ts": ts, "worker": worker, "role": role, "ok": ok, "metrics": {
+        "vllm:kv_cache_usage_perc": [{"labels": {}, "value": 0.5}],
+        "lmcache:local_cache_usage": [{"labels": {}, "value": cpu_b}],
+        "lmcache:local_storage_usage": [{"labels": {}, "value": disk_b}],
+        "lmcache:retrieve_speed_sum": [{"labels": {}, "value": r_sum}],
+        "lmcache:retrieve_speed_count": [{"labels": {}, "value": r_cnt}],
+        "lmcache:store_speed_sum": [{"labels": {}, "value": s_sum}],
+        "lmcache:store_speed_count": [{"labels": {}, "value": s_cnt}]}}
+
+
+def test_lmcache_series_reads_lmcache_rows_only(mod, tmp_path):
+    p = tmp_path / "m.ndjson"
+    rows = [
+        _lmc_row(10.0, "a0", 2 << 30, 1 << 30, 1000.0, 10, 500.0, 5),
+        _lmc_row(11.0, "a0", 3 << 30, 1 << 30, 3200.0, 20, 900.0, 9),
+        # a plain vLLM row (no lmcache: metric) must be skipped
+        {"ts": 10.5, "worker": "a0", "role": "agg", "ok": True,
+         "metrics": {"vllm:kv_cache_usage_perc": [{"labels": {}, "value": 0.9}]}},
+        # not-ok row dropped
+        _lmc_row(12.0, "a0", 9 << 30, 0, 0.0, 0, 0.0, 0, ok=False),
+        "not json",
+    ]
+    p.write_text("".join(
+        (r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows))
+    lm = mod.lmcache_series(p)
+    assert list(lm) == ["a0"] and len(lm["a0"]) == 2
+    assert lm["a0"][0]["local_usage_bytes"] == 2 << 30
+    # retrieve = host->device onboard speed, window-avg tokens/sec
+    assert mod.window_avg_speed(lm["a0"], "retrieve_sum", "retrieve_count") \
+        == [(11.0, (3200.0 - 1000.0) / (20 - 10))]
+
+
+def test_main_with_lmcache_metrics_no_figures(mod, tmp_path):
+    prof = tmp_path / "profiles"; prof.mkdir()
+    (prof / "A.jsonl").write_text("".join(
+        json.dumps(e) + "\n" for e in
+        _turn(1, 0, 1, 500, 50, 0, "read") + _turn(2, 3, 4, 600, 60, 500, None)))
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(json.dumps({"session_id": "A"}) + "\n")
+    met = tmp_path / "m.ndjson"
+    met.write_text(json.dumps(_lmc_row(0.5, "a0", 1 << 30, 0, 10.0, 1, 5.0, 1)) + "\n")
+    rc = mod.main(["--profiles", str(prof), "--trace", str(trace),
+                   "--metrics", str(met), "--cpu-cache-gb", "8",
+                   "--out", str(tmp_path / "o"), "--no-figures"])
+    assert rc == 0
+
+
 def test_main_missing_trace_returns_2(mod, tmp_path):
     prof = tmp_path / "profiles"; prof.mkdir()
     rc = mod.main(["--profiles", str(prof), "--trace", str(tmp_path / "no")])
