@@ -698,11 +698,15 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
              [t.llm_start_ts for t in ordered if t.llm_start_ts is not None]
     if ts_all:
         lo, hi = min(ts_all), max(ts_all)
-        kv = e0.trim_to_window(kv, lo, hi)
+        # Trim both scrape series to the profile window [lo, hi]: the scrape
+        # (kv + prefix_hit) often keeps running after the last turn ends, so
+        # without this the panel shows a long residual tail past the run.
+        kv = [(t, v) for t, v in kv if lo <= t <= hi]
         t0 = min([lo] + [p[0] for p in kv])
+        hi_x = hi - t0
     else:
         t0 = min((p[0] for p in kv), default=0.0)
-    x_right = 0.0
+        hi_x = max((t - t0 for t, _ in kv), default=1.0)
     for b in sample_times:
         ax_bot.axvline(b - t0, color="crimson", linewidth=0.5, alpha=0.7,
                        zorder=1)
@@ -710,19 +714,18 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
         kx = [t - t0 for t, _ in kv]
         ax_bot.plot(kx, [v * 100.0 for _, v in kv], color="tab:green",
                     lw=0.1, zorder=2, label="GPU KV usage %")
-        x_right = kx[-1]
-    if ts_all:
-        x_right = max(x_right, hi - t0)
-    ax_bot.set_xlim(0, x_right if x_right > 0 else 1)
+    # x-axis ends at the profile's last turn (hi), NOT the scrape end.
+    ax_bot.set_xlim(0, hi_x if hi_x > 0 else 1)
     ax_bot.set_ylim(bottom=0)
     ax_bot.set_xlabel("time (s)")
     ax_bot.set_ylabel("GPU KV-cache usage (%)")
     ax_bot.set_title("GPU KV-cache Usage vs time")
 
     # prefix-cache hit rate on the right y-axis (same scrape clock) —
-    # the former fig3-1 curve, folded into fig3.
+    # the former fig3-1 curve, folded into fig3. Trimmed to [t0, hi] too.
     ph = prefix_hit or []
-    ph = [(t, r) for t, r in ph if t >= t0]
+    hi_ts = t0 + hi_x
+    ph = [(t, r) for t, r in ph if t0 <= t <= hi_ts]
     if ph:
         ax_ph = ax_bot.twinx()
         px = [t - t0 for t, _ in ph]
