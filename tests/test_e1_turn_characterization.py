@@ -150,6 +150,22 @@ def test_prefix_hit_rate_series_windowed_ratio(mod, tmp_path):
     assert mod.prefix_hit_rate_series(p) == [(11.0, pytest.approx(0.8))]
 
 
+def test_prefix_hit_rate_series_skips_counter_reset(mod, tmp_path):
+    def row(ts, hits, queries):
+        return {"ts": ts, "ok": True, "metrics": {
+            "vllm:prefix_cache_hits_total": [{"labels": {}, "value": hits}],
+            "vllm:prefix_cache_queries_total": [{"labels": {}, "value": queries}]}}
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        json.dumps(row(10.0, 100, 200)) + "\n"
+        # worker restarted: counters reset lower -> tick 11 must be skipped
+        # (dh < 0), not produce a negative/garbage ratio
+        + json.dumps(row(11.0, 5, 10)) + "\n"
+        + json.dumps(row(12.0, 25, 40)) + "\n")
+    # tick 12 measured against tick 11's raw values: dh=20, dq=30
+    assert mod.prefix_hit_rate_series(p) == [(12.0, pytest.approx(20 / 30))]
+
+
 def test_prefix_hit_rate_series_empty_without_counters(mod, tmp_path):
     p = tmp_path / "m.ndjson"
     p.write_text(json.dumps({"ts": 1, "ok": True, "metrics": {
