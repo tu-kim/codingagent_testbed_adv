@@ -221,6 +221,28 @@ def get_workload(name: str) -> Workload:
     return WORKLOADS[name]
 
 
+async def _try_abort(client: OpenCodeClient, session_id: str,
+                     abs_dir: str, *, timeout_s: float = 30.0) -> bool:
+    """Best-effort POST /session/:id/abort after a task timeout.
+
+    Cancelling the POST /message call only drops the HTTP request; the
+    opencode server keeps running the agent loop to completion (a ZOMBIE),
+    which keeps firing LLM turns — pinning GPU KV blocks (ref_cnt > 0)
+    under later sessions and growing a residual-usage floor in their
+    KV-usage curves. Explicitly aborting kills the loop and releases the
+    KV. Bounded by its own timeout and swallowing errors so it never
+    re-hangs the task or masks the original timeout. Returns True if the
+    abort call succeeded."""
+    try:
+        await asyncio.wait_for(
+            client.abort_session(session_id, directory=abs_dir),
+            timeout=timeout_s,
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def _try_list_partial(client: OpenCodeClient, session_id: str,
                             abs_dir: str, *, timeout_s: float = 30.0) -> list[Any]:
     """Best-effort fetch of the turns completed BEFORE a timeout abort.
@@ -454,6 +476,10 @@ async def _run_one(
                 await send_coro
         except asyncio.TimeoutError:
             rtt_timeout = time.monotonic() - t0
+            # Kill the server-side agent loop FIRST: cancelling the POST
+            # only drops the HTTP request, opencode keeps looping (zombie)
+            # and its turns pin GPU KV under later sessions. See _try_abort.
+            aborted = await _try_abort(client, session_id, abs_dir)
             # Best-effort: pull the turns opencode persisted before the
             # abort so the trace shows how far the agent got (where it
             # stalled), instead of an empty messages list.
@@ -469,6 +495,7 @@ async def _run_one(
                     "stage": "timeout",
                     "type": "TimeoutError",
                     "msg": f"send_message exceeded task_timeout_s={task_timeout_s}",
+                    "aborted": aborted,
                     "partial_messages": len(partial),
                 },
                 messages=partial,

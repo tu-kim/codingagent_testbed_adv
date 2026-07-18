@@ -69,6 +69,24 @@ class OpenCodeClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def abort_session(self, session_id: str, directory: str) -> bool:
+        """POST /session/:id/abort — stop the session's ongoing agent loop.
+
+        The server runs the agent loop independently of the HTTP request
+        lifetime (session.ts routes svc.prompt through runRequest and only
+        writes the response AFTER the loop completes), so cancelling the
+        POST /message call — what the runner's task timeout does — leaves a
+        ZOMBIE loop still issuing LLM turns and pinning GPU KV. This is the
+        explicit kill switch (route: session.ts "/:sessionID/abort" ->
+        SessionPrompt.Service.cancel). Returns the server's boolean.
+        """
+        resp = await self._client.post(
+            f"/session/{session_id}/abort",
+            params={"directory": directory},
+        )
+        resp.raise_for_status()
+        return bool(resp.json())
+
     async def list_messages(self, session_id: str, directory: str) -> list[dict[str, Any]]:
         """GET /session/:id/message — the canonical source of intermediate tool-loop steps."""
         resp = await self._client.get(

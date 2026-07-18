@@ -40,6 +40,7 @@ class _FakeClient:
         self.create_calls: list[str] = []
         self.send_calls: list[tuple[str, str, str]] = []
         self.list_calls: list[tuple[str, str]] = []
+        self.abort_calls: list[tuple[str, str]] = []
 
     async def create_session(self, directory: str) -> str:
         self.create_calls.append(directory)
@@ -58,6 +59,10 @@ class _FakeClient:
         if self.list_raises is not None:
             raise self.list_raises
         return self.list_payload
+
+    async def abort_session(self, session_id: str, directory: str) -> bool:
+        self.abort_calls.append((session_id, directory))
+        return True
 
 
 _SAMPLE = {
@@ -225,6 +230,10 @@ async def test_message_timeout_marks_timeout_stage(tmp_path: Path):
     assert rec.rtt_s is not None and rec.rtt_s >= 0.05
     # session_id was acquired before the hang, so it's recoverable for diagnosis.
     assert rec.session_id == "ses_test"
+    # The server-side agent loop is explicitly aborted (cancelling the
+    # POST alone leaves a zombie loop pinning GPU KV under later sessions).
+    assert client.abort_calls == [("ses_test", str(tmp_path / rec.directory))]
+    assert rec.error["aborted"] is True
     # Partial turns ARE fetched after the abort (so the trace shows
     # how far the agent got), and the count is recorded on the error.
     assert client.list_calls == [("ses_test", str(tmp_path / rec.directory))]
@@ -248,6 +257,24 @@ async def test_timeout_partial_list_failure_falls_back_to_empty(tmp_path: Path):
     assert rec.error and rec.error["stage"] == "timeout"
     assert rec.messages == []
     assert rec.error["partial_messages"] == 0
+
+
+class _HangingAbortFailsClient(_HangingClient):
+    """Hangs on send AND fails the post-timeout abort (e.g. server busy)."""
+    async def abort_session(self, session_id: str, directory: str) -> bool:
+        raise RuntimeError("abort endpoint unavailable")
+
+
+async def test_timeout_abort_failure_does_not_mask_timeout(tmp_path: Path):
+    """A failing abort call must not mask the timeout record: the record
+    still lands with stage='timeout', aborted=False, and the partial list
+    is still attempted."""
+    client = _HangingAbortFailsClient()
+    sem = asyncio.Semaphore(1)
+    rec = await _run_one(client, _SAMPLE, 0.0, tmp_path, sem, task_timeout_s=0.05)
+    assert rec.error and rec.error["stage"] == "timeout"
+    assert rec.error["aborted"] is False
+    assert rec.error["partial_messages"] == 1
 
 
 async def test_no_timeout_when_task_timeout_s_is_none(tmp_path: Path):

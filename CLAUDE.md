@@ -80,6 +80,12 @@ async def send_message(session_id: str, prompt: str, directory: str) -> dict
     # Blocks until agent loop completes; returns the raw JSON envelope
     # ({info, parts}) — only the FINAL assistant message — see per-task flow.
 
+async def abort_session(session_id: str, directory: str) -> bool
+    # POST /session/:id/abort?directory=<abs_dir> with NO body.
+    # Cancels the server-side agent loop (route handler runs svc.cancel and
+    # returns a bare boolean). Returns that boolean. Used by the runner's
+    # timeout path to kill the zombie loop — see "Concurrency, errors, cleanup".
+
 async def list_messages(session_id: str, directory: str) -> list[dict]
     # GET /session/:id/message?directory=<abs_dir>; returns the full message
     # list as-is. This is the canonical source of intermediate tool-loop steps.
@@ -367,7 +373,7 @@ OpenCode accepts a `?directory=` that points to an already-existing pre-cloned d
 | `POST /session/:id/message` exceeded `--task-timeout-s`    | yes                 | false     | wall to abort (≈timeout) | `timeout`  |
 | `GET /session/:id/message` (after good POST)               | yes                 | true      | from the POST         | `list`        |
 
-`error.stage = "list"` means RTT is valid but `messages` may be empty/partial. `error.stage = "timeout"` means the agent loop was wall-clock-aborted at `task_timeout_s`. On timeout the runner does a **best-effort `GET /session/:id/message`** (bounded by its own 30 s cap) to capture the turns opencode persisted before the abort, so `messages` holds the partial trajectory (not `[]`) and `error.partial_messages` records how many were recovered (0 if that list call also failed). The OpenCode session/workspace may hold further state on disk at `<workspace_root>/<directory>`.
+`error.stage = "list"` means RTT is valid but `messages` may be empty/partial. `error.stage = "timeout"` means the agent loop was wall-clock-aborted at `task_timeout_s`. On timeout the runner **first POSTs `/session/:id/abort`** (best-effort, own 30 s cap; recorded as `error.aborted`) — cancelling the message POST alone only drops the HTTP request while opencode keeps running the agent loop server-side (route handlers run `svc.prompt` to completion regardless of client disconnect), and that ZOMBIE loop keeps firing LLM turns that pin GPU KV blocks under later sessions (observed as a growing residual KV-usage floor after a timeout). It then does a **best-effort `GET /session/:id/message`** (bounded by its own 30 s cap) to capture the turns opencode persisted before the abort, so `messages` holds the partial trajectory (not `[]`) and `error.partial_messages` records how many were recovered (0 if that list call also failed). The OpenCode session/workspace may hold further state on disk at `<workspace_root>/<directory>`.
 
 **Cleanup**: none by default. `<workspace_root>/session-<instance_id>-<uuid>/` directories accumulate across runs; prune manually (`rm -rf /tmp/testbed-workspaces/session-*`) between large runs. Per-task cleanup is intentionally avoided so failing runs can be inspected. **With `--reset-workspace`**, the runner instead reuses `<workspace_root>/session-<instance_id>/` and wipes it back to `base_commit` (git reset --hard + git clean -fdx) before each task — same final state as a fresh clone, no network round-trip. Broken checkouts (interrupted prior clone) are detected with `git rev-parse --git-dir` — NOT a bare `.git` presence check, since a half-written `.git` directory passes that but every git command then dies with "fatal: not a git repository" — and are nuked + re-cloned in both modes; a valid-looking repo whose `reset --hard` still fails (missing objects) likewise falls through to a full re-clone. Non-existent dirs get the normal full clone path. `workspace_root` is normalized with `expanduser().resolve()` at every entry point (`run`, `pre_clone_run`, `smoke`) — a relative value in `testbed.yaml` would otherwise anchor `git -C` and the OpenCode `?directory=` on the process CWD.
 
