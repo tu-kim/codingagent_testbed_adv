@@ -178,19 +178,19 @@ def lmcache_series(metrics_path: Path) -> dict[str, list[dict]]:
 # OpenMetrics `_total` suffix on newer prometheus_client (a name is
 # considered present if EITHER the bare or the `_total` form appears; see
 # _counter_series / lmcache_missing_metrics).
+# Only the names fig7's CURRENT panels consume (host usage + hit rate +
+# transfer speed/time). Disk usage, eviction counters, and retrieve_hit_rate
+# are still parsed by lmcache_series (available if re-enabled) but not
+# required, so they are omitted here to keep the diagnostic quiet.
 LMCACHE_EXPECTED_METRICS = (
-    "lmcache:local_cache_usage",         # gauge
-    "lmcache:local_storage_usage",       # gauge
-    "lmcache:retrieve_speed_sum",        # histogram
+    "lmcache:local_cache_usage",         # gauge (host tier usage)
+    "lmcache:retrieve_speed_sum",        # histogram (transfer speed)
     "lmcache:retrieve_speed_count",
     "lmcache:store_speed_sum",
     "lmcache:store_speed_count",
-    "lmcache:local_cpu_evict_keys_count",   # counter (+/- _total)
-    "lmcache:local_cpu_evict_failed_count",
-    "lmcache:num_hit_tokens",
+    "lmcache:num_hit_tokens",            # counter (+/- _total; transfer time)
     "lmcache:num_stored_tokens",
-    "lmcache:retrieve_hit_rate",          # gauge
-    "lmcache:lookup_hit_rate",            # gauge
+    "lmcache:lookup_hit_rate",           # gauge (LMCache hit %)
 )
 
 
@@ -637,10 +637,11 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
 
     Panel 1 (KV Cache Tier Occupancy): host CPU tier usage
         (lmcache:local_cache_usage; % of --cpu-cache-gb when given, else
-        GB) + disk tier usage (left y) + CPU-tier eviction rate
-        (lmcache:local_cpu_evict_keys_count delta, chunks/sec, offset
-        axis) + LMCache tier hit rate (retrieve/lookup, right y). GPU KV
-        usage is intentionally NOT drawn here — it lives in fig3.
+        GB) on the left y, and the LMCache hit rate
+        (lmcache:lookup_hit_rate = fraction of the prompt the tier covers)
+        on the right y. GPU KV usage is intentionally NOT drawn here — it
+        lives in fig3. (Disk tier + eviction-rate overlays were removed;
+        the counters are still parsed and available in lmcache_series.)
     Panel 2 (LMCache Transfer Speed): tokens/sec window-avg from the speed
         histograms; retrieve = host->device onboard, store = device->host
         offload.
@@ -670,24 +671,19 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
             ax.axvline(b - t0, color="crimson", lw=0.5, alpha=0.7, zorder=1)
 
     # --- panel 1: KV Cache Tier Occupancy ---
-    # right y = LMCache tier hit rate; offset right = eviction rate.
+    # left y = host tier usage; right y = LMCache hit rate (lookup).
     ax_hr = ax_use.twinx()
-    ax_ev = ax_use.twinx()
-    ax_ev.spines["right"].set_position(("axes", 1.06))
-    hr_labeled: set[str] = set()
+    hr_labeled = False
     for worker in sorted(lmcache):
         recs = lmcache[worker]
-        for key, color, lab in (
-                ("retrieve_hit_rate", "tab:cyan", "LMCache retrieve hit %"),
-                ("lookup_hit_rate", "tab:olive", "LMCache lookup hit %")):
-            pts = [(r["ts"] - t0, r[key] * 100.0) for r in recs
-                   if r.get(key) is not None]
-            if not pts:
-                continue
-            ax_hr.plot([x for x, _ in pts], [y for _, y in pts], color=color,
-                       lw=0.9, alpha=0.85, zorder=2,
-                       label=None if lab in hr_labeled else lab)
-            hr_labeled.add(lab)
+        pts = [(r["ts"] - t0, r["lookup_hit_rate"] * 100.0) for r in recs
+               if r.get("lookup_hit_rate") is not None]
+        if not pts:
+            continue
+        ax_hr.plot([x for x, _ in pts], [y for _, y in pts], color="tab:olive",
+                   lw=0.9, alpha=0.85, zorder=2,
+                   label=None if hr_labeled else "LMCache hit %")
+        hr_labeled = True
     ax_hr.set_ylim(0, 105)
     ax_hr.set_ylabel("LMCache hit rate (%)")
 
@@ -697,7 +693,6 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
         recs = lmcache[worker]
         ux = [r["ts"] - t0 for r in recs]
         cpu = [r["local_usage_bytes"] for r in recs]
-        disk = [r["storage_usage_bytes"] for r in recs]
         if as_pct:
             cap = cpu_cache_gb * GB
             ax_use.plot(ux, [b / cap * 100.0 if b is not None else float("nan")
@@ -709,49 +704,18 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
                              for b in cpu],
                         color="tab:purple", lw=0.9, zorder=2,
                         label="host tier usage (GB)" if first else None)
-        if any(d is not None for d in disk):
-            if disk_cache_gb and disk_cache_gb > 0 and as_pct:
-                dcap = disk_cache_gb * GB
-                ax_use.plot(ux, [b / dcap * 100.0 if b is not None
-                                 else float("nan") for b in disk],
-                            color="tab:blue", lw=0.9, ls="--", zorder=2,
-                            label="disk tier usage %" if first else None)
-            else:
-                ax_use.plot(ux, [b / GB if b is not None else float("nan")
-                                 for b in disk],
-                            color="tab:blue", lw=0.9, ls="--", zorder=2,
-                            label="disk tier usage (GB)" if first else None)
-        # CPU-tier eviction rate (chunks/sec): fires once the host tier
-        # fills and LRU starts dropping chunks. evict_failed = no evictable
-        # candidate found (pure pressure, chunks pinned in-flight).
-        ev = counter_rate(recs, "evict_keys")
-        evf = counter_rate(recs, "evict_failed")
-        if ev:
-            ex = [t - t0 for t, _ in ev]
-            ax_ev.plot(ex, [v for _, v in ev], color="tab:red", lw=0.9,
-                       zorder=3,
-                       label="CPU evict rate (chunks/s)" if first else None)
-            x_right = max(x_right, ex[-1])
-        if any(v > 0 for _, v in evf):
-            efx = [t - t0 for t, _ in evf]
-            ax_ev.plot(efx, [v for _, v in evf], color="tab:red", lw=0.7,
-                       ls=":", alpha=0.8, zorder=3,
-                       label="CPU evict-FAILED rate (1/s)" if first else None)
         if ux:
             x_right = max(x_right, ux[-1])
         first = False
 
     ax_use.set_ylim(bottom=0)
-    ax_ev.set_ylim(bottom=0)
     ax_use.set_ylabel("Host KV usage "
                       + ("(%)" if as_pct else "(GB)"))
-    ax_ev.set_ylabel("CPU-tier eviction rate (chunks/s)", color="tab:red")
     ax_use.set_title("KV Cache Tier Occupancy")
     h1, l1 = ax_use.get_legend_handles_labels()
     h2, l2 = ax_hr.get_legend_handles_labels()
-    h3, l3 = ax_ev.get_legend_handles_labels()
-    if l1 + l2 + l3:
-        ax_use.legend(h1 + h2 + h3, l1 + l2 + l3, fontsize=8,
+    if l1 + l2:
+        ax_use.legend(h1 + h2, l1 + l2, fontsize=8,
                       loc="upper left", framealpha=0.7)
 
     # --- panel 2: transfer speed (tokens/sec, window-avg) ---
