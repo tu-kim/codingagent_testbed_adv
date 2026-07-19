@@ -1169,6 +1169,39 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         print(f"{name:<18} {s['mean']:>9.1%} {s['median']:>9.1%} "
               f"{s['p90']:>9.1%} {s['p99']:>9.1%}")
 
+    # ----- TIME-WEIGHTED pooled share + session-wall coverage -----
+    # The table above weights every turn equally (mean of per-turn ratios),
+    # which under-represents the few turns with huge walls. The pooled row
+    # is Sum(component)/Sum(wall) — the time-weighted share comparable to
+    # e1's span-based session breakdown (note e1's "others" = tool +
+    # scaffold there). Coverage: task-tool turns are EXCLUDED from rows,
+    # so a low coverage means much of the sessions' wall (typically the
+    # task turns' nested-agent time) is missing from these shares — that
+    # missing wall shows up in e1's span but not here.
+    grand_wall = float(dur.sum())
+    if grand_wall > 0:
+        print()
+        print("Pooled time-weighted share (Sum comp / Sum wall, "
+              "included turns only):")
+        for name, vals in (("llm_wall_s", llm), ("tool_wall_s", tool),
+                           ("scaffold", post), ("tool+scaffold", tool + post)):
+            print(f"  {name:<16} {float(vals.sum()) / grand_wall:>7.1%}")
+    span_total = 0.0
+    for _sid, s in sorted(sessions.items()):
+        starts = [t.turn_start_ts for t in s.turns.values()
+                  if t.turn_start_ts is not None]
+        ends = [t.turn_end_ts for t in s.turns.values()
+                if t.turn_end_ts is not None]
+        if starts and ends and max(ends) > min(starts):
+            span_total += max(ends) - min(starts)
+    if span_total > 0:
+        n_all = sum(len(s.turns) for s in sessions.values())
+        print(f"session-wall coverage: included turns cover "
+              f"{grand_wall:.0f}s of {span_total:.0f}s total session span "
+              f"({grand_wall / span_total:.1%}; {len(rows)}/{n_all} turns "
+              f"— the rest is mostly task-tool turns, which e1's span-based "
+              f"breakdown DOES include)")
+
     # ----- legacy stream-event split (start-step anchor), for reference -----
     # The primary tables above are the canonical decomposition; show the old
     # stream-based llm/others alongside so the redefinition's effect is visible.
