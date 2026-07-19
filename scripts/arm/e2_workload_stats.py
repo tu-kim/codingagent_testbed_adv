@@ -7,20 +7,17 @@ Answers "what does the agent workflow look like to the serving stack":
                           the engine-side prompt length) and OSL (output
                           tokens) histograms side by side, with mean / p50
                           / p90 vertical lines.
-  fig2_tool_counts.pdf    Tool invocation counts across all turns (a turn
-                          can fire several tools; each invocation counts).
-  fig3_tool_tokens.pdf    Per tool: the CURRENT turn's output tokens vs
-                          the tokens ADDED to the NEXT turn's prompt
-                          (mean +- std bars). added(N) = eff(N+1) - eff(N)
-                          - kept_output(N), where kept_output = output -
-                          reasoning (opencode drops prior-turn reasoning
-                          from the next prompt) -- i.e. the tool
-                          responses + scaffold framing the tool injected.
+  tool_stats.csv          Per tool: invocation count, mean/std of the
+                          CURRENT turn's output tokens, mean/std of the
+                          tokens ADDED to the NEXT turn's prompt.
+                          added(N) = eff(N+1) - eff(N) - kept_output(N),
+                          kept_output = output - reasoning (opencode
+                          drops prior-turn reasoning from the next
+                          prompt) -- i.e. the tool responses + scaffold
+                          framing the tool injected.
   fig4_tool_transition.pdf Heat map of tool(N) -> tool(N+1) transitions
-                          within a session (first tool of each turn;
-                          turns with no tool are the "(none)" row/col --
-                          "(none)" as the NEXT state means the session's
-                          final text-only turn).
+                          within a session (first tool of each turn),
+                          row-normalized %, toolless turns excluded.
 
 Usage:
   scripts/arm/e2_workload_stats.py \
@@ -173,66 +170,34 @@ def fig_isl_osl(e0, isl: list[float], osl: list[float], path: Path) -> None:
     plt.close(fig)
 
 
-def fig_tool_counts(e0, counts: Counter, path: Path) -> None:
-    plt = e0._mpl()
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    if counts:
-        items = counts.most_common()
-        names = [k for k, _ in items]
-        vals = [v for _, v in items]
-        ax.bar(names, vals, color="tab:blue", alpha=0.85)
-        for i, v in enumerate(vals):
-            ax.text(i, v, f" {v}", ha="center", va="bottom", fontsize=8)
-        ax.set_ylabel("invocations")
-        ax.tick_params(axis="x", rotation=30)
-    else:
-        ax.text(0.5, 0.5, "no tool calls", transform=ax.transAxes,
-                ha="center", va="center", color="grey")
-    ax.set_title("Tool invocation counts")
-    fig.tight_layout()
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def fig_tool_tokens(e0, effects: dict, path: Path) -> None:
-    """Grouped mean+-std bars per tool: current-turn output tokens vs
-    tokens added to the next prompt."""
-    plt = e0._mpl()
-    tools = sorted(effects, key=lambda k: -len(effects[k]["out"]))
-    fig, ax = plt.subplots(figsize=(max(9, 1.2 * len(tools)), 5))
-    if tools:
-        xs = list(range(len(tools)))
-        w = 0.38
-        for off, key, label, color in (
-                (-w / 2, "out", "output tokens (turn N)", "tab:green"),
-                (w / 2, "added", "added to next prompt", "tab:orange")):
-            means, stds = [], []
-            for k in tools:
-                vals = effects[k][key]
-                if vals:
-                    m, s = _mean_std(vals)
-                else:
-                    m, s = 0.0, 0.0
-                means.append(m)
-                stds.append(s)
-            ax.bar([x + off for x in xs], means, width=w, yerr=stds,
-                   capsize=3, color=color, alpha=0.85, label=label)
-        ax.set_xticks(xs)
-        ax.set_xticklabels(tools, rotation=30, ha="right")
-        ax.set_ylabel("tokens (mean +- std)")
-        ax.legend(fontsize=8, framealpha=0.7)
-    else:
-        ax.text(0.5, 0.5, "no turns", transform=ax.transAxes,
-                ha="center", va="center", color="grey")
-    ax.set_title("Per-tool token effect: turn output vs next-prompt growth")
-    fig.tight_layout()
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+def write_tool_stats_csv(counts: Counter, effects: dict, path: Path) -> None:
+    """tool_stats.csv: tool, invocations, output_mean/std (turn N),
+    added_mean/std (tokens added to turn N+1's prompt), sample sizes."""
+    import csv
+    tools = sorted(set(counts) | set(effects),
+                   key=lambda k: -counts.get(k, 0))
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["tool", "invocations",
+                    "output_tokens_mean", "output_tokens_std", "n_out",
+                    "added_next_prompt_mean", "added_next_prompt_std",
+                    "n_added"])
+        for tool in tools:
+            o = effects.get(tool, {}).get("out", [])
+            a = effects.get(tool, {}).get("added", [])
+            om, os_ = _mean_std(o) if o else (0.0, 0.0)
+            am, as_ = _mean_std(a) if a else (0.0, 0.0)
+            w.writerow([tool, counts.get(tool, 0),
+                        f"{om:.1f}", f"{os_:.1f}", len(o),
+                        f"{am:.1f}", f"{as_:.1f}", len(a)])
 
 
 def fig_tool_transition(e0, trans: dict, path: Path) -> None:
-    """Row-normalized heat map of tool(N) -> tool(N+1)."""
+    """Row-normalized heat map of tool(N) -> tool(N+1), % only.
+    Toolless "(none)" turns are excluded entirely."""
     plt = e0._mpl()
+    trans = {k: v for k, v in trans.items()
+             if k[0] != "(none)" and k[1] != "(none)"}
     tools = sorted({k[0] for k in trans} | {k[1] for k in trans})
     fig, ax = plt.subplots(figsize=(max(6, 0.8 * len(tools) + 2),
                                     max(5, 0.8 * len(tools) + 1)))
@@ -248,8 +213,8 @@ def fig_tool_transition(e0, trans: dict, path: Path) -> None:
         for i in range(n):
             for j in range(n):
                 if mat[i][j]:
-                    ax.text(j, i, f"{int(mat[i][j])}\n{norm[i][j]:.0%}",
-                            ha="center", va="center", fontsize=7,
+                    ax.text(j, i, f"{norm[i][j]:.0%}",
+                            ha="center", va="center", fontsize=8,
                             color="black" if norm[i][j] < 0.6 else "white")
         ax.set_xticks(range(n), tools, rotation=30, ha="right")
         ax.set_yticks(range(n), tools)
@@ -259,7 +224,7 @@ def fig_tool_transition(e0, trans: dict, path: Path) -> None:
     else:
         ax.text(0.5, 0.5, "no transitions", transform=ax.transAxes,
                 ha="center", va="center", color="grey")
-    ax.set_title("Tool transition heat map (count / row share)")
+    ax.set_title("Tool transition heat map (row %)")
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -323,12 +288,11 @@ def main(argv: list[str] | None = None) -> int:
               f"{am:>9,.0f} +-{as_:>6,.0f}  (n={len(o)}/{len(a)})")
 
     trans = tool_transitions(turns)
+    write_tool_stats_csv(counts, effects, out_dir / "tool_stats.csv")
 
     if not args.no_figures:
         try:
             fig_isl_osl(e0, isl, osl, out_dir / "fig1_isl_osl.pdf")
-            fig_tool_counts(e0, counts, out_dir / "fig2_tool_counts.pdf")
-            fig_tool_tokens(e0, effects, out_dir / "fig3_tool_tokens.pdf")
             fig_tool_transition(e0, trans,
                                 out_dir / "fig4_tool_transition.pdf")
         except ImportError:
