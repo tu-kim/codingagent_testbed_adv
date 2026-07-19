@@ -164,6 +164,10 @@ class Turn:
     llm_step_duration_s: float | None = None
     llm_stream_end_s: float | None = None
     llm_end_ts: float | None = None            # wall-clock ts of the llm.end event
+    # dynamo in-band server wall (llm.end.dynamo.elapsed_s): HTTP receipt ->
+    # last chunk = engine queue wait + prefill + decode. The canonical
+    # "LLM_wall" for the turn decomposition; None on non-dynamo providers.
+    dynamo_elapsed_s: float | None = None
     # from llm.end.post_stream_overhead_s = max(0, finish-step - streamFinish):
     # the per-step framework finalization slice (snapshot.track + snapshot.patch
     # + session.updateMessage DB write + EventV2 dual-write; processor.ts:453-497).
@@ -276,6 +280,9 @@ def load_sessions(path: Path,
                     t.llm_end_ts = ts
                     t.llm_step_duration_s = ev.get("step_duration_s")
                     t.llm_stream_end_s = ev.get("stream_end_s") or ev.get("duration_s")
+                    dyn = ev.get("dynamo") or {}
+                    if isinstance(dyn, dict) and dyn.get("elapsed_s") is not None:
+                        t.dynamo_elapsed_s = float(dyn["elapsed_s"])
                     # post_stream_overhead_s is emitted (possibly null) by the
                     # current profile patch. Key-absent => older patch, no data;
                     # key-present-but-null => streamFinish didn't fire this step.
@@ -907,8 +914,8 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path,
 
 
 def _collect_turn_decomposition(sessions: dict[str, Session]):
-    """Per-turn (session_id, step, duration_s, llm_wall_s, tool_wall_s,
-    post_overhead_s, llm_wall_true_s, others_true_s).
+    """Per-turn (session_id, step, wall_s, llm_wall_s_stream, tool_wall_s,
+    others_s_stream, llm_canon_s, others_canon_s).
 
     Turns that fired the `task` tool are EXCLUDED wholesale: `task` spawns
     a nested agent session (its own LLM loop + tools) whose wall time lands
@@ -916,25 +923,33 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
     work, not the ordinary "one LLM step + local tools" shape this
     decomposition characterizes. Task turns are analyzed separately.
 
-    The last two fields are the WALL-CLOCK-ANCHORED correction to the
-    stream-event llm_wall_s. The profiler's llm_wall_s = start-step -> first
-    tool/last text, but `start-step` fires only when opencode begins
-    CONSUMING the response, which for a large buffered tool-call arrives at
-    the END of generation -- so the real LLM time lands in the
-    turn.start -> llm.start gap and gets misattributed to post_overhead
-    ("others"). llm_wall_true_s = (llm.end.ts - turn.start.ts) - tool_wall
-    recovers the true client-observed LLM wall (request send -> response
-    fully received, incl. any server queue/prefill), and others_true_s =
-    duration - llm_true - tool_wall is then just the finish-step ->
-    turn.end framework tail. Both are None when turn.start/llm.end
-    timestamps are missing (fall back to the stream-based split).
+    CANONICAL decomposition (positions 2, 6, 7 — what the figures/stats
+    use):
+      wall_s      = turn.start(N) -> turn.start(N+1) (last turn:
+                    turn.end ts, falling back to turn.start + duration).
+                    This is the TRUE wall bracket the turn occupies, so
+                    inter-turn scaffold/queue/prefill time is captured
+                    instead of silently dropped (the old duration_s was
+                    defined as llm+tool+post, which excluded them).
+      llm_canon   = dynamo elapsed_s (server HTTP receipt -> last chunk =
+                    engine QUEUE WAIT + PREFILL + DECODE). Fallback when
+                    the turn has no in-band dynamo timing: the wall-clock-
+                    anchored llm.end - turn.start - tool (over-counts
+                    client scaffold), then the stream llm_wall_s.
+      others_canon= wall - llm_canon - tool (clamped >= 0) = request build
+                    (scaffold) + post-stream framework tail + client/server
+                    transport deltas — everything that is neither the
+                    server LLM time nor tool execution.
+    Positions 3/5 keep the legacy stream-based llm_wall_s /
+    post_overhead_s for the CSV/reference tables.
 
     Skips turns where the three turn.end component fields aren't all
     present (post_overhead_s is reconstructed from the others when only
     it is missing -- older patches didn't emit it on turn.end)."""
     rows = []
     for sid, s in sorted(sessions.items()):
-        for step, t in sorted(s.turns.items()):
+        ordered = sorted(s.turns.items())
+        for idx, (step, t) in enumerate(ordered):
             if any(tc.name == TASK_TOOL_NAME for tc in t.tools) \
                     or _turn_has_excluded_call(t):
                 continue
@@ -944,11 +959,27 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
             po = t.post_overhead_s
             if po is None:
                 po = max(0.0, d - lw - tw)
-            llm_true = others_true = None
-            if t.turn_start_ts is not None and t.llm_end_ts is not None:
-                llm_true = max(0.0, t.llm_end_ts - t.turn_start_ts - tw)
-                others_true = max(0.0, d - llm_true - tw)
-            rows.append((sid, step, d, lw, tw, po, llm_true, others_true))
+            # --- canonical wall bracket ---
+            wall = None
+            if t.turn_start_ts is not None:
+                nxt = ordered[idx + 1][1] if idx + 1 < len(ordered) else None
+                if nxt is not None and nxt.turn_start_ts is not None:
+                    wall = nxt.turn_start_ts - t.turn_start_ts
+                elif t.turn_end_ts is not None:
+                    wall = t.turn_end_ts - t.turn_start_ts
+                else:
+                    wall = d
+            if wall is None or wall <= 0:
+                wall = d
+            # --- canonical LLM: server queue + prefill + decode ---
+            llm_canon = t.dynamo_elapsed_s
+            if llm_canon is None and t.turn_start_ts is not None \
+                    and t.llm_end_ts is not None:
+                llm_canon = max(0.0, t.llm_end_ts - t.turn_start_ts - tw)
+            if llm_canon is None:
+                llm_canon = lw
+            others_canon = max(0.0, wall - llm_canon - tw)
+            rows.append((sid, step, wall, lw, tw, po, llm_canon, others_canon))
     return rows
 
 
@@ -1055,14 +1086,18 @@ def _fig_turn_share_dist(share_arrays: dict, share_components, path: Path) -> Pa
 
 
 def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | None:
-    """Mean/median/p90/p99 stats for per-turn duration / llm_wall /
-    tool_wall / others, plus the per-turn share distribution. The LLM
-    component is WALL-CLOCK-ANCHORED (llm.end - turn.start - tool_wall),
-    which recovers the real LLM time the stream-event llm_wall_s misses on
-    buffered large tool-call turns; turns lacking timestamps fall back to
-    the stream-based split. The legacy stream-based numbers are printed
-    below for reference, and the per-turn CSV carries both
-    (llm_wall_s/others_s = stream, llm_wall_true_s/others_true_s = anchored).
+    """Mean/median/p90/p99 stats for the CANONICAL per-turn decomposition:
+      wall      = turn.start(N) -> turn.start(N+1) (true wall bracket,
+                  inter-turn time included)
+      llm_wall  = dynamo elapsed_s = engine QUEUE WAIT + PREFILL + DECODE
+                  (fallback: wall-anchored llm.end - turn.start - tool,
+                  then stream llm_wall_s)
+      tool_wall = tool execution
+      others    = wall - llm - tool = scaffold (request build) + post-
+                  stream framework tail + transport deltas
+    plus the per-turn share distribution. The legacy stream-based numbers
+    are printed below for reference, and the per-turn CSV carries both
+    (llm_wall_s/others_s = stream, llm_canon_s/others_canon_s = canonical).
     Emits a horizontal stacked bar figure + companion CSVs + stdout tables."""
     rows = _collect_turn_decomposition(sessions)
     if not rows:
@@ -1072,10 +1107,9 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     arr = np.array([(r[2], r[3], r[4], r[5]) for r in rows], dtype=float)
     dur, llm, tool, post = arr.T
 
-    # Wall-clock-anchored correction (turn.start -> llm.end). Present only on
-    # turns that carry both timestamps; NaN elsewhere. See
-    # _collect_turn_decomposition for why the stream-based llm_wall_s
-    # under-measures buffered large tool-call turns.
+    # Canonical values from _collect_turn_decomposition: llm = dynamo
+    # elapsed_s (queue+prefill+decode; anchored/stream fallback), others =
+    # wall - llm - tool. Always populated (total fallback chain).
     corr = np.array(
         [(r[6] if r[6] is not None else np.nan,
           r[7] if r[7] is not None else np.nan) for r in rows],
@@ -1084,22 +1118,15 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     llm_true, others_true = corr.T
     n_corr = int(np.count_nonzero(~np.isnan(llm_true)))
 
-    # Promote the wall-clock-anchored values (llm.end - turn.start - tool) to
-    # PRIMARY: the stream-event llm_wall_s under-measures buffered large
-    # tool-call turns (start-step fires only when opencode starts consuming the
-    # response). Fall back to the stream-based split only where turn.start /
-    # llm.end timestamps are missing. Both variants satisfy
-    # llm + tool + others == duration, so the fallback is seamless and the
-    # tool_wall_s / duration_s columns are untouched.
     llm_stream, post_stream = llm.copy(), post.copy()
     llm = np.where(np.isnan(llm_true), llm_stream, llm_true)
     post = np.where(np.isnan(others_true), post_stream, others_true)
 
     components = [
-        ("duration_s", dur),
-        ("llm_wall_s", llm),      # wall-clock-anchored (llm.end - turn.start - tool)
+        ("duration_s", dur),      # wall bracket: turn.start(N) -> turn.start(N+1)
+        ("llm_wall_s", llm),      # dynamo elapsed = queue + prefill + decode
         ("tool_wall_s", tool),
-        ("others", post),         # residual = finish-step -> turn.end framework tail
+        ("others", post),         # wall - llm - tool = scaffold + post + transport
     ]
     stats = {name: _summary_stats(vals) for name, vals in components}
     share_components = ("llm_wall_s", "tool_wall_s", "others")
@@ -1122,7 +1149,8 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     # ----- stdout pretty table -----
     print()
     print(f"Per-turn duration decomposition (n={len(rows)} turns, "
-          f"task-tool turns excluded; LLM wall-clock-anchored):")
+          f"task-tool turns excluded; wall = turn.start->next turn.start, "
+          f"llm = dynamo queue+prefill+decode):")
     hdr = f"{'component':<18} {'mean':>9} {'median':>9} {'p90':>9} {'p99':>9}"
     print(hdr)
     print("-" * len(hdr))
@@ -1141,10 +1169,10 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
               f"{s['p90']:>9.1%} {s['p99']:>9.1%}")
 
     # ----- legacy stream-event split (start-step anchor), for reference -----
-    # The primary tables above are now wall-clock-anchored; show the old
-    # stream-based llm/others alongside so the correction's effect is visible.
+    # The primary tables above are the canonical decomposition; show the old
+    # stream-based llm/others alongside so the redefinition's effect is visible.
     if n_corr < len(rows):
-        print(f"\n  (wall-clock-anchored on {n_corr}/{len(rows)} turns; the rest "
+        print(f"\n  (canonical llm on {n_corr}/{len(rows)} turns; the rest "
               f"fell back to the stream-based split)")
     if n_corr:
         mask = ~np.isnan(llm_true)
@@ -1159,8 +1187,7 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
             s = _summary_stats(vals)
             print(f"{name:<18} {s['mean']:>9.3f} {s['median']:>9.3f} "
                   f"{s['p90']:>9.3f} {s['p99']:>9.3f}")
-        print(f"  mean LLM time the stream split misattributed to 'others': "
-              f"{moved:+.3f}s/turn (now folded back into llm_wall_s)")
+        print(f"  mean delta canonical-vs-stream llm: {moved:+.3f}s/turn")
 
     # ----- CSV -----
     import csv
@@ -1197,7 +1224,7 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         w = csv.writer(f)
         w.writerow(["session_id", "step", "duration_s",
                     "llm_wall_s", "tool_wall_s", "others_s",
-                    "llm_wall_true_s", "others_true_s"])
+                    "llm_canon_s", "others_canon_s"])
         for sid, step, d, lw, tw, po, llm_t, oth_t in rows:
             w.writerow([sid, step,
                         f"{d:.6f}", f"{lw:.6f}", f"{tw:.6f}", f"{po:.6f}",
@@ -1634,10 +1661,11 @@ def _lat_fig_bucket_stacked(cond_rows, comps, path: Path) -> Path:
 
 
 def analyze_latency_composition(sessions: dict[str, Session], out: Path) -> Path | None:
-    """Per-request (per-turn) latency-composition analysis on the WALL-CLOCK-
-    anchored components (llm = llm.end - turn.start - tool, with the stream-based
-    split as fallback where timestamps are missing; task-tool turns excluded via
-    _collect_turn_decomposition). Merged in from the former standalone
+    """Per-request (per-turn) latency-composition analysis on the CANONICAL
+    components (wall = turn.start->next turn.start; llm = dynamo elapsed_s =
+    queue+prefill+decode, anchored/stream fallback; others = wall - llm -
+    tool; task-tool turns excluded via _collect_turn_decomposition). Merged
+    in from the former standalone
     analyze_latency_breakdown.py so all profile analysis lives in one script and
     shares the corrected LLM timing.
 

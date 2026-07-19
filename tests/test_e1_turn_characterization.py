@@ -155,6 +155,47 @@ def test_eviction_loss_pct(mod):
     assert mod.eviction_loss_pct([]) == (0, 0, None)
 
 
+class _TS:
+    """Turn double for session_spans with dynamo timing + request_id."""
+    def __init__(self, sid, step, start, end, elapsed=None, rid=None):
+        self.session_id = sid
+        self.step = step
+        self.llm_start_ts = start
+        self.llm_end_ts = end
+        self.elapsed_s = elapsed
+        self.request_id = rid
+
+
+def test_session_spans_prefill_decode_segments_with_queue_join(mod):
+    # turn1: llm_end 110, elapsed 10, queue 4s -> active 6 -> seg (104, 110)
+    # turn2: llm_end 120, elapsed 5, queue 1s -> active 4 -> seg (116, 120)
+    turns = [_TS("A", 1, 100.0, 110.0, elapsed=10.0, rid="r1"),
+             _TS("A", 2, 115.0, 120.0, elapsed=5.0, rid="r2")]
+    sp = mod.session_spans(turns, {"r1": 4000.0, "r2": 1000.0})
+    assert sp[0]["segments"] == [(104.0, 110.0), (116.0, 120.0)]
+    assert sp[0]["queue_s"] == pytest.approx(5.0)
+    # span = 104..120 = 16; active 10; queue 5; host 1
+    bd = mod.session_breakdown(sp)[0]
+    assert bd["llm_active"] == pytest.approx(10 / 16)
+    assert bd["queue"] == pytest.approx(5 / 16)
+    assert bd["host"] == pytest.approx(1 / 16)
+
+
+def test_session_spans_no_queue_join_counts_queue_as_active(mod):
+    # elapsed present but no queue map -> active = elapsed (queue inside)
+    turns = [_TS("A", 1, 100.0, 110.0, elapsed=10.0, rid="r1")]
+    sp = mod.session_spans(turns)
+    assert sp[0]["segments"] == [(100.0, 110.0)]
+    assert sp[0]["queue_s"] == 0.0
+
+
+def test_session_spans_legacy_fallback_without_elapsed(mod):
+    # no dynamo timing -> decode-only legacy segment (llm_start..llm_end)
+    turns = [_TS("A", 1, 100.0, 110.0)]
+    sp = mod.session_spans(turns)
+    assert sp[0]["segments"] == [(100.0, 110.0)]
+
+
 def test_session_utilizations_active_over_span(mod):
     spans = [
         {"session_id": "A", "start": 0.0, "end": 4.0,

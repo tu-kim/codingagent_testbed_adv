@@ -395,32 +395,55 @@ def prefix_mismatch_pct(events: list[dict]) -> tuple[float, float, float | None]
     return missed, reusable, pct
 
 
-def session_spans(turns: list) -> list[dict]:
-    """Per session: {session_id, start, end, segments} ordered by start.
-    start = first turn's llm_start, end = latest turn's llm_end, segments =
-    each turn's (start, end) LLM-active interval. The (end - start) span is
-    the session's total wall time; the light area between segments is the
-    turn-gap delay (tool + scaffold + queue) we want to visualize."""
+def session_spans(turns: list,
+                  queue_ms_by_rid: dict[str, float] | None = None) -> list[dict]:
+    """Per session: {session_id, start, end, segments, queue_s} ordered by
+    start. Segments are per-turn LLM-ACTIVE intervals = PREFILL + DECODE:
+    anchored at llm_end and extending back by (dynamo elapsed_s - engine
+    queue wait), where queue wait comes from the SCHED_DELAY join
+    (queue_ms_by_rid, keyed by request_id). Fallback chain per turn:
+      elapsed - queue  ->  elapsed (queue unknown: queue counted as active)
+      -> llm_end - llm_start (no dynamo timing: decode-only, first-token
+         anchored; queue+prefill land in the gap).
+    queue_s = summed engine queue wait for the session's turns (0.0 when
+    no join). The (end - start) span is the session's total wall time;
+    span - active - queue = host time (tool + scaffold + post)."""
     by: dict[str, list[tuple[float, float]]] = {}
+    queue_by_sess: dict[str, float] = {}
     for t in turns:
         s, e = t.llm_start_ts, t.llm_end_ts
-        if s is None or e is None:
+        if e is None:
             continue
-        by.setdefault(t.session_id, []).append((s, e))
+        q_s = None
+        rid = getattr(t, "request_id", None)
+        if queue_ms_by_rid and rid and rid in queue_ms_by_rid:
+            q_s = queue_ms_by_rid[rid] / 1000.0
+        elapsed = getattr(t, "elapsed_s", None)
+        if elapsed is not None:
+            active = max(0.0, elapsed - (q_s or 0.0))
+            seg = (e - active, e)
+        elif s is not None:
+            seg = (s, e)
+        else:
+            continue
+        by.setdefault(t.session_id, []).append(seg)
+        if q_s is not None:
+            queue_by_sess[t.session_id] = \
+                queue_by_sess.get(t.session_id, 0.0) + q_s
     out: list[dict] = []
     for sid, segs in by.items():
         segs = sorted(segs)
         out.append({"session_id": sid, "start": segs[0][0],
-                    "end": max(e for _, e in segs), "segments": segs})
+                    "end": max(e for _, e in segs), "segments": segs,
+                    "queue_s": queue_by_sess.get(sid, 0.0)})
     out.sort(key=lambda d: d["start"])
     return out
 
 
 def session_utilizations(spans: list[dict]) -> list[float]:
-    """Per-session utilization = LLM-active time / total span, i.e. the
-    fraction of the session's wall time actually spent in the LLM (the
-    complement, 1 - util, is the turn-gap share). Sessions with a
-    non-positive span are skipped."""
+    """Per-session utilization = LLM-active time / total span (active =
+    prefill + decode when the spans were built with dynamo timing/queue
+    join; see session_spans). Sessions with a non-positive span skipped."""
     out: list[float] = []
     for sp in spans:
         span = sp["end"] - sp["start"]
@@ -428,6 +451,28 @@ def session_utilizations(spans: list[dict]) -> list[float]:
             continue
         active = sum(e - s for s, e in sp["segments"])
         out.append(active / span)
+    return out
+
+
+def session_breakdown(spans: list[dict]) -> list[dict]:
+    """Per-session 3-way share of the wall span:
+      llm_active = prefill + decode          (the segments)
+      queue      = engine queue wait          (SCHED_DELAY join; 0 without --logs)
+      host       = tool + scaffold + post     (span - active - queue, clamped)
+    Each entry: {session_id, span_s, llm_active, queue, host} with the
+    three shares summing to <= 1 (clamp guards timing noise). Sessions
+    with a non-positive span are skipped."""
+    out: list[dict] = []
+    for sp in spans:
+        span = sp["end"] - sp["start"]
+        if span <= 0:
+            continue
+        active = sum(e - s for s, e in sp["segments"])
+        queue = sp.get("queue_s", 0.0)
+        host = max(0.0, span - active - queue)
+        out.append({"session_id": sp["session_id"], "span_s": span,
+                    "llm_active": active / span, "queue": queue / span,
+                    "host": host / span})
     return out
 
 
@@ -464,10 +509,10 @@ def _draw_mean_p50(ax, vals: list[float], unit: str = "") -> None:
 def fig_session_span(e0, spans: list[dict], path: Path) -> None:
     """Gantt of session wall time: one row per session (first-started at
     top), x = time from the earliest session start. Each row shows the full
-    span (first turn start -> last turn end) as a light bar and the
-    LLM-active turns as dark segments on top; the light gaps between dark
-    segments are the turn-gap delays (tool + scaffold + queue wait) that
-    stretch the session's end-to-end time."""
+    span as a light bar and the LLM-ACTIVE (prefill + decode; see
+    session_spans) turns as dark segments on top; the light gaps between
+    dark segments are the turn-gap delays (tool + scaffold + post + queue
+    wait) that stretch the session's end-to-end time."""
     plt = e0._mpl()
     n = len(spans)
     # wide/landscape aspect: keep height compact even for ~50 sessions so
@@ -926,6 +971,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--metrics", type=Path, default=None,
                     help="vLLM scrape NDJSON for the KV-usage + prefix-hit "
                          "panel (fig3) and the LMCache panels (fig7)")
+    ap.add_argument("--logs", type=Path, default=None,
+                    help="worker logs dir (SCHED_DELAY lines). Joins engine "
+                         "queue wait by request_id so the session breakdown "
+                         "can split queue from LLM-active; without it queue "
+                         "is counted inside LLM-active")
     ap.add_argument("--compaction-drop-ratio", type=float, default=0.6,
                     help="fig5/6: a reuse shortfall is COMPACTION (not "
                          "eviction) when effective_input(N) < ratio * "
@@ -1020,15 +1070,32 @@ def main(argv: list[str] | None = None) -> int:
               f"turns; corr(shortfall, displaced) = "
               f"{r:.3f}" if r is not None else "n/a")
 
-    # session utilization = LLM-active / total span (1 - util = turn-gap share)
-    spans = session_spans(turns)
+    # session 3-way breakdown of the wall span:
+    #   llm_active (prefill+decode) / host (tool+scaffold+post) / queue wait
+    queue_ms_by_rid: dict[str, float] = {}
+    if args.logs is not None and args.logs.exists():
+        sched = ats.load_sched(args.logs)
+        queue_ms_by_rid = {rid: rec.total_queue_ms
+                           for rid, rec in sched.items()}
+        n_joined = sum(1 for t in turns
+                       if getattr(t, "request_id", None) in queue_ms_by_rid)
+        print(f"queue join: {n_joined}/{len(turns)} turns matched a "
+              f"SCHED_DELAY record")
+    spans = session_spans(turns, queue_ms_by_rid or None)
     utils = session_utilizations(spans)
-    if utils:
-        mean = sum(utils) / len(utils)
-        print(f"session utilization (LLM-active / span): mean {mean:.3f}, "
-              f"p50 {_percentile(utils, 50):.3f}, "
-              f"p90 {_percentile(utils, 90):.3f}, "
-              f"p99 {_percentile(utils, 99):.3f} (n={len(utils)})")
+    bd = session_breakdown(spans)
+    if bd:
+        note = "" if queue_ms_by_rid else \
+            "  [no --logs: queue counted inside llm_active]"
+        print(f"session wall-span breakdown (n={len(bd)} sessions){note}")
+        print(f"  {'component':<28} {'mean':>7} {'p50':>7} {'p90':>7}")
+        for key, label in (("llm_active", "llm_active (prefill+decode)"),
+                           ("host", "host (tool+scaffold+post)"),
+                           ("queue", "queue waiting")):
+            vals = [d[key] for d in bd]
+            print(f"  {label:<28} {sum(vals)/len(vals):>7.3f} "
+                  f"{_percentile(vals, 50):>7.3f} "
+                  f"{_percentile(vals, 90):>7.3f}")
 
     if not args.no_figures:
         try:
