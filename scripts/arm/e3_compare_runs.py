@@ -145,20 +145,21 @@ def fig_share_by_run(e0, per_run: dict[str, list], path: Path) -> None:
             mean = sum(shares) / len(shares)
             ax.scatter([pos], [mean], color="black", marker="o", s=8,
                        zorder=3)
-            ax.text(pos, mean, f" {mean:.2f}", color="black", fontsize=7,
+            ax.text(pos, mean, f" {mean:.0%}", color="black", fontsize=7,
                     va="bottom", ha="left", zorder=4)
             pos += 1
         ticks.append(group_center)
         tick_labels.append(run)
         pos += 1                              # gap between run groups
     ax.set_xticks(ticks, tick_labels)
-    ax.set_ylabel("per-request share of wall")
+    ax.set_ylabel("per-request share (%)")
     ax.set_ylim(0, 1.05)
+    ax.yaxis.set_major_formatter(
+        plt.matplotlib.ticker.FuncFormatter(lambda v, _: f"{v * 100:.0f}"))
     for comp in COMPONENTS:
         ax.plot([], [], color=colors[comp], lw=6, alpha=0.6, label=comp)
     ax.legend(fontsize=8, framealpha=0.7, ncol=3, loc="upper right")
-    ax.set_title("Per-request latency-component share by run "
-                 "(llm / tool / scaffold)")
+    ax.set_title("Latency Breakdown")
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
