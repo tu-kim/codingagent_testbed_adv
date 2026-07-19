@@ -346,6 +346,44 @@ def test_session_spans_no_elapsed_queue_clamped_to_bracket(mod):
     assert sp[0]["queue_s"] == pytest.approx(10.0)
 
 
+def test_session_spans_queued_ts_anchor_beats_collapsed_bracket(mod):
+    # BUFFERED turn: start-step fires only after the stream is consumed,
+    # so the client bracket collapses (109.9..110.0) even though the true
+    # queue wait was 30s. With the SCHED_DELAY queued_ts anchor the queue
+    # segment is placed absolutely: (qts, qts+q) then active to llm_end.
+    class _TQ:
+        session_id = "A"
+        step = 1
+        llm_start_ts = 109.9
+        llm_end_ts = 110.0
+        elapsed_s = None
+        request_id = "r1"
+    sp = mod.session_spans([_TQ()], {"r1": 30000.0}, {"r1": 75.0})
+    assert sp[0]["queue_segments"] == [(75.0, 105.0)]
+    assert sp[0]["segments"] == [(105.0, 110.0)]
+    assert sp[0]["queue_s"] == pytest.approx(30.0)
+    assert sp[0]["start"] == pytest.approx(75.0)
+    bd = mod.session_breakdown(sp)[0]
+    assert bd["queue"] == pytest.approx(30.0 / 35.0)
+    assert bd["gpu_active"] == pytest.approx(5.0 / 35.0)
+
+
+def test_session_spans_queued_ts_anchor_clamps_at_llm_end(mod):
+    # qts + queue would run past llm_end (clock skew / over-report):
+    # the queue segment clamps at llm_end and active collapses to zero.
+    class _TQ:
+        session_id = "A"
+        step = 1
+        llm_start_ts = None
+        llm_end_ts = 110.0
+        elapsed_s = None
+        request_id = "r1"
+    sp = mod.session_spans([_TQ()], {"r1": 50000.0}, {"r1": 100.0})
+    assert sp[0]["queue_segments"] == [(100.0, 110.0)]
+    assert sp[0]["segments"] == [(110.0, 110.0)]
+    assert sp[0]["queue_s"] == pytest.approx(10.0)
+
+
 def test_session_spans_clamps_queue_to_elapsed(mod):
     # queue (6s) EXCEEDS elapsed (4s) -- SCHED_DELAY queue can't exceed the
     # dynamo server wall, so q_eff clamps to elapsed: active == 0, and the

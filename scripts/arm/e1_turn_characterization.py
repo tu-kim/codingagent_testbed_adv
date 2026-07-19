@@ -462,7 +462,9 @@ def prefix_mismatch_pct(events: list[dict]) -> tuple[float, float, float | None]
 
 
 def session_spans(turns: list,
-                  queue_ms_by_rid: dict[str, float] | None = None) -> list[dict]:
+                  queue_ms_by_rid: dict[str, float] | None = None,
+                  queued_ts_by_rid: dict[str, float] | None = None,
+                  ) -> list[dict]:
     """Per session: {session_id, start, end, segments, queue_segments,
     queue_s} ordered by start. Segments are per-turn GPU-ACTIVE intervals
     = PREFILL + DECODE: anchored at llm_end and extending back by (dynamo
@@ -473,12 +475,13 @@ def session_spans(turns: list,
     llm_end - (elapsed - queue)] (empty when no join). Fallback chain per
     turn:
       elapsed - queue  ->  elapsed (queue unknown: queue counted as active)
-      -> llm_end - llm_start (no dynamo timing: the client llm bracket.
-         Queue sits at the FRONT of that bracket — request lands, waits
-         in the scheduler queue, then prefill+decode run to llm_end — so
-         with a queue join the bracket is split (s, s+q) queue /
-         (s+q, e) active; without a join the whole bracket counts as
-         active).
+      -> SCHED_DELAY queued_ts anchor (no dynamo timing but
+         queued_ts_by_rid joined): queue = (qts, qts+q), active =
+         (qts+q, llm_end) — robust against buffered turns where the
+         client bracket collapses
+      -> llm_end - llm_start (client llm bracket; with a queue join the
+         bracket is split (s, s+q) queue / (s+q, e) active; without a
+         join the whole bracket counts as active).
     queue_s = summed engine queue wait actually carved out of active
     (per-turn clamped to the bracket it was carved from; 0.0 when no
     join), so it always equals the drawn queue_segments total and the 3
@@ -506,24 +509,36 @@ def session_spans(turns: list,
                     (e - elapsed, e - active))
                 queue_by_sess[t.session_id] = \
                     queue_by_sess.get(t.session_id, 0.0) + q_eff
-        elif s is not None:
-            # no dynamo timing: fall back to the client llm bracket
-            # (s, e) = setup + queue + prefill + decode. The queue wait
-            # sits at the FRONT of it, so with a join we carve it out of
-            # the bracket's head instead of adding it ON TOP (the old
-            # double count: queue_s grew while active still contained
-            # the queue and no queue segment was drawn).
-            if q_s and e > s:
+        else:
+            # No dynamo timing. PREFERRED: anchor on the SCHED_DELAY
+            # absolute queued_ts — queue = (qts, qts+q), active
+            # (prefill+decode) = (qts+q, llm_end). This is immune to the
+            # buffered-turn collapse of the client llm bracket (start-step
+            # fires only after the stream is consumed, so llm.start ≈
+            # llm.end and a bracket-clamped queue leaks into others).
+            qts = None
+            if queued_ts_by_rid and rid and rid in queued_ts_by_rid:
+                qts = queued_ts_by_rid[rid]
+            if q_s and qts is not None and qts < e:
+                q_end = min(qts + q_s, e)
+                qsegs_by_sess.setdefault(t.session_id, []).append(
+                    (qts, q_end))
+                queue_by_sess[t.session_id] = \
+                    queue_by_sess.get(t.session_id, 0.0) + (q_end - qts)
+                seg = (q_end, e)
+            elif s is not None and q_s and e > s:
+                # bracket-head carve fallback (no queued_ts): clamp to
+                # the client llm bracket.
                 q_eff = min(q_s, e - s)
                 qsegs_by_sess.setdefault(t.session_id, []).append(
                     (s, s + q_eff))
                 queue_by_sess[t.session_id] = \
                     queue_by_sess.get(t.session_id, 0.0) + q_eff
                 seg = (s + q_eff, e)
-            else:
+            elif s is not None:
                 seg = (s, e)
-        else:
-            continue
+            else:
+                continue
         by.setdefault(t.session_id, []).append(seg)
     out: list[dict] = []
     for sid, segs in by.items():
@@ -1214,10 +1229,14 @@ def main(argv: list[str] | None = None) -> int:
     # session 3-way breakdown of the wall span:
     #   gpu_active (prefill+decode) / queue wait / others (tool+scaffold)
     queue_ms_by_rid: dict[str, float] = {}
+    queued_ts_by_rid: dict[str, float] = {}
     if args.logs is not None and args.logs.exists():
         sched = ats.load_sched(args.logs)
         queue_ms_by_rid = {rid: rec.total_queue_ms
                            for rid, rec in sched.items()}
+        queued_ts_by_rid = {rid: rec.anchor_ts
+                            for rid, rec in sched.items()
+                            if rec.anchor_ts is not None}
         n_joined = sum(1 for t in turns
                        if getattr(t, "request_id", None) in queue_ms_by_rid)
         joined_q_s = sum(queue_ms_by_rid[t.request_id] / 1000.0
@@ -1240,7 +1259,8 @@ def main(argv: list[str] | None = None) -> int:
         if q_metrics is not None:
             print(f"engine queue total (vllm request_queue_time metrics): "
                   f"{q_metrics:.1f}s")
-    spans = session_spans(turns, queue_ms_by_rid or None)
+    spans = session_spans(turns, queue_ms_by_rid or None,
+                          queued_ts_by_rid or None)
     utils = session_utilizations(spans)
     bd = session_breakdown(spans)
     if bd:
@@ -1248,10 +1268,15 @@ def main(argv: list[str] | None = None) -> int:
             "  [no --logs: queue counted inside gpu_active]"
         n_el = sum(1 for t in turns
                    if getattr(t, "elapsed_s", None) is not None)
+        n_qts = sum(1 for t in turns
+                    if getattr(t, "request_id", None) in queued_ts_by_rid)
         n_qseg = sum(len(sp.get("queue_segments", [])) for sp in spans)
+        drawn_q = sum(e - s for sp in spans
+                      for s, e in sp.get("queue_segments", []))
         print(f"session wall-span breakdown (n={len(bd)} sessions){note}")
         print(f"  [turns with dynamo elapsed_s: {n_el}/{len(turns)}; "
-              f"queue segments drawn: {n_qseg}]")
+              f"queued_ts anchored: {n_qts}; queue segments drawn: "
+              f"{n_qseg} ({drawn_q:.1f}s)]")
         print(f"  {'component':<28} {'mean':>7}")
         for key, label in (("gpu_active", "gpu_active (prefill+decode)"),
                            ("queue", "queue waiting"),
