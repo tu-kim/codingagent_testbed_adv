@@ -17,9 +17,11 @@ Everything else (fig1 panels, fig2 CDF, fig4 reuse-vs-gap) reuses the E0
 implementations. fig3 top = cached-vs-reused per turn (cached tokens vs
 hit tokens, eviction gap in red); fig3 bottom = GPU KV-usage (left y) +
 the vLLM prefix-cache hit rate (right y), both from the scrape NDJSON.
-fig8 is a per-session Gantt (first turn start -> last turn end) splitting
-each session's wall time into GPU active (prefill+decode) / queue wait
-(SCHED_DELAY join) / others (tool + scaffold).
+fig8 (needs --logs [+ --frontend]) plots per-request engine queue wait
+vs time and its share of the frontend elapsed_ms (request_id join).
+fig9 (needs --logs + --frontend) joins each LMCache retrieve transfer
+(worker-log "Retrieved ... cost N ms" lines) to the same request's
+frontend ttft_ms — how much of TTFT was host->device KV onboarding.
 
 Usage:
   scripts/arm/e1_turn_characterization.py \\
@@ -42,6 +44,7 @@ import argparse
 import importlib.util
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -622,55 +625,170 @@ def _draw_mean_p50(ax, vals: list[float], unit: str = "") -> None:
             fontsize=8, va="top", ha="right", transform=tr)
 
 
-def fig_session_span(e0, spans: list[dict], path: Path) -> None:
-    """Gantt of session wall time: one row per session (first-started at
-    top), x = time from the earliest session start. Each row splits the
-    span into 3 colors: GPU-ACTIVE (prefill + decode; dark blue), QUEUE
-    WAIT (engine queue, orange; only with the SCHED_DELAY join), and
-    OTHERS (tool + scaffold, the light remainder) — the non-GPU time that
-    stretches the session's end-to-end wall."""
+_ARW_PATH = Path(__file__).resolve().parents[1] / "analyze_request_wait.py"
+
+
+def _load_arw():
+    spec = importlib.util.spec_from_file_location("analyze_request_wait",
+                                                  _ARW_PATH)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["analyze_request_wait"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# LMCache per-request retrieve join (vllm-*.log). Two line shapes:
+#   lookup (vllm_v1_adapter, repeated once per scheduler step while the
+#   request sits in WAITING — dedup by Reqid):
+#     LMCache INFO: Reqid: <rid>-<suffix>, Total tokens N, Inference
+#     Engine computed tokens: C, LMCache hit tokens: H, need to load: L
+#   retrieve completion (cache_engine, once per actual transfer; carries
+#   NO Reqid, so it is attributed to the most recent NEW lookup whose
+#   hit-token count matches "from H total tokens"):
+#     Retrieved R out of Q required tokens (from H total tokens).
+#     size: S gb, cost M ms, throughput: T GB/s
+_LMC_LOOKUP_RE = re.compile(
+    r"LMCache INFO: Reqid: (?P<reqid>\S+?),\s+Total tokens (?P<total>\d+).*?"
+    r"LMCache hit tokens: (?P<hit>\d+),\s+need to load: (?P<need>\d+)")
+_LMC_RETR_RE = re.compile(
+    r"Retrieved (?P<got>\d+) out of (?P<req>\d+) required tokens "
+    r"\(from (?P<hit>\d+) total tokens\)\..*?cost (?P<cost_ms>[\d.]+) ms")
+
+
+def parse_lmcache_retrieves(logs: Path) -> dict[str, dict]:
+    """{request_id: {cost_ms, tokens, hit_tokens, waits}} per request from
+    the worker logs. request_id = the lookup Reqid with the engine's
+    trailing '-<suffix>' stripped (the remaining 5-group UUID equals the
+    frontend/SCHED_DELAY Context UUID). `waits` counts the repeated
+    lookup lines for the Reqid (~ scheduler steps spent in WAITING before
+    the transfer). A Retrieved line is attributed to the most recent
+    lookup whose hit count matches its "from N total tokens"; unmatched
+    Retrieved lines are dropped. Last retrieve wins per request."""
+    out: dict[str, dict] = {}
+    files = [logs] if logs.is_file() else sorted(logs.glob("vllm-*.log"))
+    for fpath in files:
+        last_by_hit: dict[int, str] = {}     # hit tokens -> reqid
+        waits: dict[str, int] = {}
+        with fpath.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = _LMC_LOOKUP_RE.search(line)
+                if m:
+                    reqid = m.group("reqid")
+                    waits[reqid] = waits.get(reqid, 0) + 1
+                    last_by_hit[int(m.group("hit"))] = reqid
+                    continue
+                m = _LMC_RETR_RE.search(line)
+                if not m:
+                    continue
+                reqid = last_by_hit.get(int(m.group("hit")))
+                if reqid is None:
+                    continue
+                rid = reqid.rsplit("-", 1)[0]
+                out[rid] = {
+                    "cost_ms": float(m.group("cost_ms")),
+                    "tokens": int(m.group("got")),
+                    "hit_tokens": int(m.group("hit")),
+                    "waits": waits.get(reqid, 0),
+                }
+    return out
+
+
+def _stat_line(name: str, vals: list[float], fmt: str = "{:.3f}") -> None:
+    if not vals:
+        print(f"  {name:<26} (no data)")
+        return
+    mean = sum(vals) / len(vals)
+    print(f"  {name:<26} mean {fmt.format(mean)}  "
+          f"p50 {fmt.format(_percentile(vals, 50))}  "
+          f"p90 {fmt.format(_percentile(vals, 90))}  "
+          f"p99 {fmt.format(_percentile(vals, 99))}  n={len(vals)}")
+
+
+def fig_queue_share(e0, sched: dict, frontend: dict, path: Path) -> None:
+    """fig8: per-request engine queue wait joined to the frontend by
+    request_id. Top panel: queue_ms vs time (x = SCHED_DELAY queued_ts).
+    Bottom panel: queue_ms / frontend elapsed_ms share vs time — how much
+    of each request's end-to-end wall was scheduler queue. Stats printed
+    by the caller."""
     plt = e0._mpl()
-    n = len(spans)
-    # wide/landscape aspect: keep height compact even for ~50 sessions so
-    # the figure stays horizontal rather than a tall strip.
-    fig, ax = plt.subplots(figsize=(22, max(3.5, 0.14 * n)))
-    if not spans:
-        ax.text(0.5, 0.5, "no sessions", transform=ax.transAxes,
-                ha="center", va="center", color="grey")
+    pts = []                                   # (queued_ts, queue_ms, share)
+    for rid, rec in sched.items():
+        fr = frontend.get(rid)
+        qts = rec.anchor_ts
+        q = rec.total_queue_ms
+        if qts is None or q <= 0:
+            continue
+        share = (q / fr.total_ms) if fr and fr.total_ms > 0 else None
+        pts.append((qts, q, share))
+    fig, (ax_q, ax_s) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    if not pts:
+        ax_q.text(0.5, 0.5, "no SCHED_DELAY records", transform=ax_q.transAxes,
+                  ha="center", va="center", color="grey")
         fig.savefig(path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return
-    t0 = spans[0]["start"]
-    bar_h = 0.4                             # thin bars (rows are 1 apart)
-    for i, sp in enumerate(spans):
-        y = n - 1 - i                      # first-started session at the top
-        ax.broken_barh([(sp["start"] - t0, max(sp["end"] - sp["start"], 1e-9))],
-                       (y - bar_h / 2, bar_h), facecolors="tab:blue",
-                       alpha=0.2, zorder=1)
-        qsegs = [(s - t0, max(e - s, 1e-3))
-                 for s, e in sp.get("queue_segments", [])]
-        if qsegs:
-            ax.broken_barh(qsegs, (y - bar_h / 2, bar_h),
-                           facecolors="tab:orange", alpha=0.9, zorder=2)
-        segs = [(s - t0, max(e - s, 1e-3)) for s, e in sp["segments"]]
-        ax.broken_barh(segs, (y - bar_h / 2, bar_h), facecolors="tab:blue",
-                       alpha=0.9, zorder=3)
-    ax.set_ylim(-1, n)
-    ax.set_yticks([n - 1 - i for i in range(n)])
-    ax.set_yticklabels([sp["session_id"][-8:] for sp in spans],
-                       fontsize=max(4, min(8, int(400 / max(n, 1)))))
-    ax.set_xlim(left=0)
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("session (first-started at top)")
-    ax.set_title("Session span: session start -> end")
-    ax.plot([], [], color="tab:blue", lw=6, alpha=0.9,
-            label="GPU active (prefill+decode)")
-    ax.plot([], [], color="tab:orange", lw=6, alpha=0.9, label="queue wait")
-    ax.plot([], [], color="tab:blue", lw=6, alpha=0.2,
-            label="others (tool+scaffold)")
-    ax.legend(fontsize=8, loc="lower right", framealpha=0.7)
+    pts.sort()
+    t0 = pts[0][0]
+    xs = [p[0] - t0 for p in pts]
+    ax_q.scatter(xs, [p[1] / 1000.0 for p in pts], s=6, alpha=0.5,
+                 color="tab:orange")
+    ax_q.set_yscale("log")
+    ax_q.set_ylabel("queue wait (s, log)")
+    ax_q.set_title("Engine queue wait per request vs time")
+    _draw_mean_p50(ax_q, [p[1] / 1000.0 for p in pts], "s")
+    sh = [(x, p[2]) for x, p in zip(xs, pts) if p[2] is not None]
+    if sh:
+        ax_s.scatter([x for x, _ in sh], [v for _, v in sh], s=6, alpha=0.5,
+                     color="tab:red")
+        _draw_mean_p50(ax_s, [v for _, v in sh])
+    else:
+        ax_s.text(0.5, 0.5, "no frontend join (missing --frontend?)",
+                  transform=ax_s.transAxes, ha="center", va="center",
+                  color="grey")
+    ax_s.set_ylim(0, 1.05)
+    ax_s.set_ylabel("queue / frontend elapsed")
+    ax_s.set_xlabel("time (s)")
+    ax_s.set_title("Queue share of end-to-end elapsed per request")
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+def fig_retrieve_ttft(e0, retrieves: dict, frontend: dict,
+                      path: Path) -> list[float]:
+    """fig9: LMCache retrieve transfer cost as a share of the SAME
+    request's frontend ttft_ms (retrieve rides TTFT: it happens between
+    scheduling and first token). Scatter of the share vs time + printed
+    stats. Returns the share list for the caller's stats block."""
+    plt = e0._mpl()
+    pts = []                                    # (ts-ish order idx, share)
+    shares: list[float] = []
+    for rid, rec in retrieves.items():
+        fr = frontend.get(rid)
+        if fr is None or fr.ttft_ms is None or fr.ttft_ms <= 0:
+            continue
+        shares.append(rec["cost_ms"] / fr.ttft_ms)
+        pts.append((rid, rec["cost_ms"], fr.ttft_ms))
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if pts:
+        # x = ttft, y = retrieve cost; the diagonal band shows the share.
+        ax.scatter([p[2] / 1000.0 for p in pts], [p[1] / 1000.0 for p in pts],
+                   s=10, alpha=0.6, color="tab:purple")
+        lim = max(max(p[2] for p in pts), max(p[1] for p in pts)) / 1000.0
+        for frac, style in ((1.0, "-"), (0.5, "--"), (0.1, ":")):
+            ax.plot([0, lim], [0, lim * frac], color="grey", lw=0.8,
+                    ls=style, label=f"retrieve = {int(frac*100)}% of TTFT")
+        ax.set_xlabel("frontend TTFT (s)")
+        ax.set_ylabel("LMCache retrieve cost (s)")
+        ax.legend(fontsize=8, loc="upper left", framealpha=0.7)
+    else:
+        ax.text(0.5, 0.5, "no retrieve<->frontend joins",
+                transform=ax.transAxes, ha="center", va="center",
+                color="grey")
+    ax.set_title("LMCache retrieve transfer vs TTFT per request")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return shares
 
 
 def fig_eviction_vs_displacement(events: list[dict], path: Path, e0) -> None:
@@ -1096,6 +1214,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--metrics", type=Path, default=None,
                     help="vLLM scrape NDJSON for the KV-usage + prefix-hit "
                          "panel (fig3) and the LMCache panels (fig7)")
+    ap.add_argument("--frontend", type=Path, default=None,
+                    help="dynamo frontend.log: joins elapsed_ms/ttft_ms by "
+                         "request_id for fig8 (queue share) and fig9 "
+                         "(retrieve/TTFT share)")
     ap.add_argument("--logs", type=Path, default=None,
                     help="worker logs dir (SCHED_DELAY lines). Joins engine "
                          "queue wait by request_id so the session breakdown "
@@ -1230,6 +1352,12 @@ def main(argv: list[str] | None = None) -> int:
     #   gpu_active (prefill+decode) / queue wait / others (tool+scaffold)
     queue_ms_by_rid: dict[str, float] = {}
     queued_ts_by_rid: dict[str, float] = {}
+    sched: dict = {}
+    frontend: dict = {}
+    if args.frontend is not None and args.frontend.exists():
+        arw = _load_arw()
+        frontend = arw.parse_frontend(args.frontend)
+        print(f"frontend log: {len(frontend)} completed requests parsed")
     if args.logs is not None and args.logs.exists():
         sched = ats.load_sched(args.logs)
         queue_ms_by_rid = {rid: rec.total_queue_ms
@@ -1284,6 +1412,34 @@ def main(argv: list[str] | None = None) -> int:
             vals = [d[key] for d in bd]
             print(f"  {label:<28} {sum(vals)/len(vals):>7.3f}")
 
+    # fig8/fig9 companion stats: per-request joins by request_id.
+    retrieves: dict = {}
+    if args.logs is not None and args.logs.exists():
+        retrieves = parse_lmcache_retrieves(args.logs)
+    if sched:
+        q_all = [rec.total_queue_ms / 1000.0 for rec in sched.values()
+                 if rec.total_queue_ms > 0]
+        q_share = [rec.total_queue_ms / frontend[rid].total_ms
+                   for rid, rec in sched.items()
+                   if rid in frontend and frontend[rid].total_ms > 0]
+        print(f"per-request queue (SCHED_DELAY, n={len(q_all)}; "
+              f"frontend join {len(q_share)}/{len(sched)}):")
+        _stat_line("queue wait (s)", q_all)
+        _stat_line("queue / elapsed share", q_share)
+    if retrieves:
+        r_share = [rec["cost_ms"] / frontend[rid].ttft_ms
+                   for rid, rec in retrieves.items()
+                   if rid in frontend and frontend[rid].ttft_ms]
+        print(f"lmcache retrieve joins: {len(retrieves)} transfers, "
+              f"frontend ttft join {len(r_share)}")
+        _stat_line("retrieve cost (ms)",
+                   [rec["cost_ms"] for rec in retrieves.values()],
+                   "{:.1f}")
+        _stat_line("retrieve / TTFT share", r_share)
+        _stat_line("WAITING lookups per transfer",
+                   [float(rec["waits"]) for rec in retrieves.values()],
+                   "{:.1f}")
+
     if not args.no_figures:
         try:
             fig_turn_llm_time(e0, grouped,
@@ -1296,7 +1452,12 @@ def main(argv: list[str] | None = None) -> int:
             e0.fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
             fig_eviction_vs_displacement(
                 events, out_dir / "fig6_eviction_vs_displacement.pdf", e0)
-            fig_session_span(e0, spans, out_dir / "fig8_session_span.pdf")
+            if sched:
+                fig_queue_share(e0, sched, frontend,
+                                out_dir / "fig8_queue_share.pdf")
+            if retrieves:
+                fig_retrieve_ttft(e0, retrieves, frontend,
+                                  out_dir / "fig9_retrieve_ttft.pdf")
             if lmc:
                 prof_end = max((t.llm_end_ts for t in turns
                                 if t.llm_end_ts is not None), default=None)
