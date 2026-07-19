@@ -241,6 +241,102 @@ def test_eviction_events_min_shortfall_noise_is_ok(mod):
     assert ev[0]["label"] == "ok"
 
 
+def test_order_turns_grouped_interleaved_sessions(mod):
+    # A@0, B@1, A@2, B@3 chronologically interleaved -> grouped keeps each
+    # session contiguous, ordered by first-turn start (A first).
+    turns = [_T("A", 1, 0.0, 0.5), _T("B", 1, 1.0, 1.5),
+             _T("A", 2, 2.0, 2.5), _T("B", 2, 3.0, 3.5)]
+    ordered, boundaries = mod.order_turns_grouped(turns)
+    assert [(t.session_id, t.step) for t in ordered] == \
+        [("A", 1), ("A", 2), ("B", 1), ("B", 2)]
+    assert boundaries == [0, 2]
+
+
+def test_order_turns_grouped_missing_start_falls_back_to_end_ts(mod):
+    # llm_start_ts is None -> key falls back to llm_end_ts for both the
+    # per-turn sort key and the session's first-turn ordinal.
+    turns = [_T("A", 1, None, 5.0), _T("B", 1, 1.0, 1.5)]
+    ordered, boundaries = mod.order_turns_grouped(turns)
+    # B's start (1.0) < A's fallback key (5.0) -> B first
+    assert [(t.session_id, t.step) for t in ordered] == [("B", 1), ("A", 1)]
+    assert boundaries == [0, 1]
+
+
+def test_counter_delta_total_sums_workers_and_tolerates_reset(mod, tmp_path):
+    def row(ts, worker, val):
+        return {"ts": ts, "worker": worker, "ok": True,
+                "metrics": {"vllm:x_seconds_sum": [{"labels": {}, "value": val}]}}
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        json.dumps(row(0.0, "w0", 5.0)) + "\n"
+        + json.dumps(row(1.0, "w0", 12.5)) + "\n"      # monotonic: 7.5
+        + json.dumps(row(0.0, "w1", 3.0)) + "\n"
+        + json.dumps(row(1.0, "w1", 1.0)) + "\n")       # reset: degrades to last (1.0)
+    assert mod.counter_delta_total(p, "vllm:x_seconds_sum") == pytest.approx(8.5)
+
+
+def test_counter_delta_total_window_filter_excludes_ticks(mod, tmp_path):
+    def row(ts, val):
+        return {"ts": ts, "worker": "w0", "ok": True,
+                "metrics": {"vllm:x_seconds_sum": [{"labels": {}, "value": val}]}}
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        json.dumps(row(0.0, 5.0)) + "\n"
+        + json.dumps(row(1.0, 10.0)) + "\n"
+        + json.dumps(row(2.0, 20.0)) + "\n")     # excluded by hi=1.5
+    assert mod.counter_delta_total(p, "vllm:x_seconds_sum", lo=0.0, hi=1.5) \
+        == pytest.approx(5.0)
+
+
+def test_counter_delta_total_total_suffix_fallback(mod, tmp_path):
+    def row(ts, val):
+        return {"ts": ts, "worker": "w0", "ok": True,
+                "metrics": {"vllm:x_seconds_sum_total": [{"labels": {}, "value": val}]}}
+    p = tmp_path / "m.ndjson"
+    p.write_text(json.dumps(row(0.0, 1.0)) + "\n" + json.dumps(row(1.0, 4.0)) + "\n")
+    assert mod.counter_delta_total(p, "vllm:x_seconds_sum") == pytest.approx(3.0)
+
+
+def test_counter_delta_total_none_when_absent_and_skips_not_ok(mod, tmp_path):
+    p = tmp_path / "m.ndjson"
+    p.write_text(
+        json.dumps({"ts": 0.0, "worker": "w0", "ok": False,
+                    "metrics": {"vllm:x_seconds_sum": [{"labels": {}, "value": 99.0}]}}) + "\n"
+        + json.dumps({"ts": 1.0, "worker": "w0", "ok": True,
+                      "metrics": {"vllm:other_metric": [{"labels": {}, "value": 1.0}]}}) + "\n")
+    assert mod.counter_delta_total(p, "vllm:x_seconds_sum") is None
+
+
+def test_session_spans_no_elapsed_join_does_not_double_count_queue(mod):
+    # elapsed_s is None (no dynamo join) but the turn DOES have a request_id
+    # in queue_ms_by_rid -- the fallback-to-llm-bracket path must NOT add
+    # this queue wait to queue_s / queue_segments (it's already inside the
+    # (s, e) active segment).
+    class _TQ:
+        session_id = "A"
+        step = 1
+        llm_start_ts = 100.0
+        llm_end_ts = 110.0
+        elapsed_s = None
+        request_id = "r1"
+    sp = mod.session_spans([_TQ()], {"r1": 4000.0})
+    assert sp[0]["segments"] == [(100.0, 110.0)]
+    assert sp[0]["queue_s"] == 0.0
+    assert sp[0]["queue_segments"] == []
+
+
+def test_session_spans_clamps_queue_to_elapsed(mod):
+    # queue (6s) EXCEEDS elapsed (4s) -- SCHED_DELAY queue can't exceed the
+    # dynamo server wall, so q_eff clamps to elapsed: active == 0, and the
+    # queue segment covers the full elapsed window.
+    turns = [_TS("A", 1, 100.0, 110.0, elapsed=4.0, rid="r1")]
+    sp = mod.session_spans(turns, {"r1": 6000.0})
+    assert sp[0]["queue_s"] == pytest.approx(4.0)
+    # active = max(0, 4 - 4) = 0 -> segment collapses to a point at e
+    assert sp[0]["segments"] == [(110.0, 110.0)]
+    assert sp[0]["queue_segments"] == [(106.0, 110.0)]
+
+
 def test_window_avg_speed_delta_sum_over_delta_count(mod):
     # window mean = delta(_sum)/delta(_count); zero-delta and gap skipped
     recs = [{"ts": 0, "s": 100.0, "c": 2},
