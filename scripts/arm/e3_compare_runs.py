@@ -13,6 +13,11 @@ wall - llm - tool) and emits:
                            distributions (the analyze_profiles violin
                            view) side by side per run, one violin per
                            component, with the MEAN drawn and labeled.
+  resource_usage.csv       host.cpu_util_pct / host.mem_used_gib (mean/
+                           p50/p90) per run, from monitor_resources.py's
+                           resource.ndjson (auto-detected at
+                           <root>/resource.ndjson or <root>/logs/
+                           resource.ndjson; skipped when absent).
 
 Run entries (positional, repeatable):
   <dir>            a run/workspace dir; profiles input auto-detected as
@@ -51,6 +56,35 @@ def _load(name: str, path: Path):
 COMPONENTS = ("llm", "tool", "scaffold")
 
 
+def load_resource_host(path: Path) -> tuple[list[float], list[float]]:
+    """(cpu_util_pct, mem_used_gib) series from a resource.ndjson (see
+    monitor_resources.py: {"host": {"cpu_util_pct": ..., "mem_used_bytes":
+    ...}}). mem_used_bytes -> GiB (/2**30). Malformed/missing-host lines
+    skipped."""
+    import json
+    cpu: list[float] = []
+    mem: list[float] = []
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            host = rec.get("host")
+            if not isinstance(host, dict):
+                continue
+            c = host.get("cpu_util_pct")
+            if isinstance(c, (int, float)):
+                cpu.append(float(c))
+            m = host.get("mem_used_bytes")
+            if isinstance(m, (int, float)):
+                mem.append(float(m) / (2 ** 30))
+    return cpu, mem
+
+
 def resolve_run(entry: str) -> tuple[str, Path, Path | None]:
     """(label, profiles_input, trace_or_None) from a CLI run entry."""
     label, _, rest = entry.partition("=")
@@ -69,6 +103,17 @@ def resolve_run(entry: str) -> tuple[str, Path, Path | None]:
         raise FileNotFoundError(f"run not found: {entry}")
     trace = root / "trace.jsonl"
     return label, inp, trace if trace.is_file() else None
+
+
+def resolve_resource_ndjson(entry: str) -> Path | None:
+    """<root>/resource.ndjson or <root>/logs/resource.ndjson, whichever
+    exists (root = the entry's dir, same resolution as resolve_run)."""
+    _, _, root_str = entry.partition("=")
+    root = Path(root_str) if root_str else Path(entry)
+    for cand in (root / "resource.ndjson", root / "logs" / "resource.ndjson"):
+        if cand.is_file():
+            return cand
+    return None
 
 
 def run_decomposition(ap_mod, e0, inp: Path,
@@ -224,6 +269,34 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             print("matplotlib unavailable -- figure skipped",
                   file=sys.stderr)
+
+    # host resource usage (resource.ndjson: cpu_util_pct, mem_used_gib)
+    resource_csv = args.out / "resource_usage.csv"
+    resource_rows: list[list[str]] = []
+    print(f"\n{'run':<20} {'metric':<16} {'mean':>10} {'p50':>10} "
+          f"{'p90':>10} {'n':>8}")
+    for entry in args.runs:
+        rpath = resolve_resource_ndjson(entry)
+        label = entry.partition("=")[0] if "=" in entry else Path(entry).name
+        if rpath is None:
+            continue
+        cpu, mem = load_resource_host(rpath)
+        for metric, vals in (("host.cpu_util_pct", cpu),
+                             ("host.mem_used_gib", mem)):
+            if not vals:
+                continue
+            mean = sum(vals) / len(vals)
+            p50, p90 = _percentile(vals, 50), _percentile(vals, 90)
+            print(f"{label:<20} {metric:<16} {mean:>10.2f} {p50:>10.2f} "
+                  f"{p90:>10.2f} {len(vals):>8}")
+            resource_rows.append([label, metric, f"{mean:.4f}",
+                                  f"{p50:.4f}", f"{p90:.4f}", str(len(vals))])
+    if resource_rows:
+        with resource_csv.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["run", "metric", "mean", "p50", "p90", "n"])
+            w.writerows(resource_rows)
+
     print(f"\noutputs in {args.out}")
     return 0
 
