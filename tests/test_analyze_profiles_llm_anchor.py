@@ -4,7 +4,7 @@
 
 Row shape returned by ``_collect_turn_decomposition``:
     (session_id, step, wall_s, llm_wall_s_stream, tool_wall_s,
-     others_s_stream, llm_canon_s, others_canon_s)
+     others_s_stream, llm_canon_s, scaffold_s)
 
   * ``wall_s`` (position 2) = turn.start(N+1).ts - turn.start(N).ts for all
     but the last turn of a session; the last turn falls back to
@@ -17,7 +17,7 @@ Row shape returned by ``_collect_turn_decomposition``:
     tool_wall_s`` when dynamo timing is absent; falling back further to the
     stream-based ``llm_wall_s`` when even the anchor timestamps are
     missing. It is therefore ALWAYS populated (no more `None` fallback).
-  * ``others_canon_s`` (position 7) = ``max(0, wall - llm_canon - tool)``.
+  * ``scaffold_s`` (position 7) = ``max(0, wall - llm_canon - tool)``.
     The identity ``llm_canon + tool + others_canon == wall`` holds exactly
     whenever the clamp doesn't fire (checked below) -- the old identity
     against ``duration_s`` no longer applies in general because ``wall`` is
@@ -127,7 +127,7 @@ def rows(mod, tmp_path):
 
 # column layout of a decomposition row:
 # (sid, step, wall_s, llm_wall_s_stream, tool_wall_s, others_s_stream,
-#  llm_canon_s, others_canon_s)
+#  llm_canon_s, scaffold_s)
 _W, _LW, _TW, _PO, _LC, _OC = 2, 3, 4, 5, 6, 7
 
 
@@ -148,7 +148,7 @@ def test_wall_is_next_turn_start_gap(rows):
 
 def test_buffered_turn_recovers_hidden_llm_time(rows):
     r = rows[1]
-    # stream-based split badly under-measures LLM, dumps it into "others"
+    # stream-based split badly under-measures LLM, dumps it into "scaffold"
     # (legacy stream fields are untouched by the wall/others redefinition)
     assert r[_LW] == pytest.approx(0.007, abs=1e-6)
     assert r[_PO] == pytest.approx(75.512, abs=1e-6)
@@ -159,7 +159,7 @@ def test_buffered_turn_recovers_hidden_llm_time(rows):
     # gap (inter-turn idle/scaffold time), not just the old ~0.1s slice.
     wall = 2000.000 - 1000.000
     assert r[_OC] == pytest.approx(wall - r[_LC] - 0.016, abs=1e-6)  # 924.567
-    # the correction still moved ~75s from the stream "others" into LLM
+    # the correction still moved ~75s from the stream "scaffold" into LLM
     assert r[_LC] > 75.0
     assert r[_LC] - r[_LW] > 50.0
 
@@ -258,7 +258,7 @@ def test_dynamo_elapsed_s_wins_over_anchored_fallback(mod, tmp_path):
 
 
 def test_per_turn_csv_has_canonical_columns(mod, tmp_path):
-    """plot_turn_decomposition emits llm_canon_s / others_canon_s columns
+    """plot_turn_decomposition emits llm_canon_s / scaffold_s columns
     (renamed from llm_wall_true_s / others_true_s) with the recovered
     values. llm_canon_s is populated for EVERY turn now, including the
     fallback turn (no more blank cells)."""
@@ -275,13 +275,13 @@ def test_per_turn_csv_has_canonical_columns(mod, tmp_path):
         recs = {int(row["step"]): row for row in csv.DictReader(f)}
 
     assert "llm_canon_s" in recs[1]
-    assert "others_canon_s" in recs[1]
+    assert "scaffold_s" in recs[1]
     assert float(recs[1]["llm_canon_s"]) == pytest.approx(75.417, abs=1e-3)
     assert float(recs[2]["llm_canon_s"]) == pytest.approx(7.220, abs=1e-3)
     # fallback turn: llm_canon_s is now populated (fell back to stream lw),
     # not blank.
     assert float(recs[3]["llm_canon_s"]) == pytest.approx(4.000, abs=1e-3)
-    assert float(recs[3]["others_canon_s"]) == pytest.approx(0.500, abs=1e-3)
+    assert float(recs[3]["scaffold_s"]) == pytest.approx(0.500, abs=1e-3)
 
 
 def test_turn_share_distribution_figure_created(mod, tmp_path):
@@ -303,7 +303,7 @@ def test_turn_share_distribution_figure_created(mod, tmp_path):
 #
 # analyze_latency_composition consumes the SAME canonical rows as
 # _collect_turn_decomposition (dur == wall_s at position 2, llm == llm_canon_s
-# at position 6 with stream fallback, others == others_canon_s at position 7
+# at position 6 with stream fallback, others == scaffold_s at position 7
 # with stream fallback). With the new wall-bracket definition:
 #
 #   step1 (buffered):  wall 1000.000  llm  75.417  tool 0.016  others 924.567
@@ -350,9 +350,9 @@ def test_latency_pooled_share_uses_canonical_components(mod, tmp_path):
     others_sum = 924.567 + 992.769 + 0.500  # 1917.836
     assert float(recs["llm_wall_s"]["pooled_share"]) == pytest.approx(llm_sum / grand, abs=1e-4)
     assert float(recs["tool_wall_s"]["pooled_share"]) == pytest.approx(tool_sum / grand, abs=1e-4)
-    assert float(recs["others"]["pooled_share"]) == pytest.approx(others_sum / grand, abs=1e-4)
+    assert float(recs["scaffold"]["pooled_share"]) == pytest.approx(others_sum / grand, abs=1e-4)
     # three component shares sum to 1
-    tot = sum(float(recs[c]["pooled_share"]) for c in ("llm_wall_s", "tool_wall_s", "others"))
+    tot = sum(float(recs[c]["pooled_share"]) for c in ("llm_wall_s", "tool_wall_s", "scaffold"))
     assert tot == pytest.approx(1.0, abs=1e-3)
 
 
@@ -360,7 +360,7 @@ def test_latency_per_request_table_structure(mod, tmp_path):
     outdir = _run_latency(mod, tmp_path)
     with (outdir / "latency_per_request_share.csv").open() as f:
         recs = list(csv.DictReader(f))
-    assert [r["component"] for r in recs] == ["llm_wall_s", "tool_wall_s", "others"]
+    assert [r["component"] for r in recs] == ["llm_wall_s", "tool_wall_s", "scaffold"]
     for r in recs:
         assert int(r["n_requests"]) == 3
         assert 0.0 <= float(r["mean"]) <= 1.0
@@ -379,11 +379,11 @@ def test_latency_buckets_all_collapse_into_le_p50(mod, tmp_path):
     assert int(recs[">p99"]["n_requests"]) == 0
     # mean shares in the sole populated bucket sum to ~1
     tot = sum(float(recs["<=p50"][f"{c}_mean_share"])
-              for c in ("llm_wall_s", "tool_wall_s", "others"))
+              for c in ("llm_wall_s", "tool_wall_s", "scaffold"))
     assert tot == pytest.approx(1.0, abs=1e-3)
-    # the "others" component (dominated by the huge inter-turn wall gaps
+    # the "scaffold" component (dominated by the huge inter-turn wall gaps
     # of the two 1000s turns) is now the overwhelming majority share
-    assert float(recs["<=p50"]["others_mean_share"]) > 0.5
+    assert float(recs["<=p50"]["scaffold_mean_share"]) > 0.5
 
 
 # --------------------------------------------------------------------------

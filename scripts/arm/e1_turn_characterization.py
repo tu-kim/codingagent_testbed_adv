@@ -17,8 +17,9 @@ Everything else (fig1 panels, fig2 CDF, fig4 reuse-vs-gap) reuses the E0
 implementations. fig3 top = cached-vs-reused per turn (cached tokens vs
 hit tokens, eviction gap in red); fig3 bottom = GPU KV-usage (left y) +
 the vLLM prefix-cache hit rate (right y), both from the scrape NDJSON.
-fig8 is a per-session Gantt (first turn start -> last turn end) showing how
-much of each session's wall time is turn-gap delay vs LLM-active.
+fig8 is a per-session Gantt (first turn start -> last turn end) splitting
+each session's wall time into GPU active (prefill+decode) / queue wait
+(SCHED_DELAY join) / others (tool + scaffold).
 
 Usage:
   scripts/arm/e1_turn_characterization.py \\
@@ -397,18 +398,23 @@ def prefix_mismatch_pct(events: list[dict]) -> tuple[float, float, float | None]
 
 def session_spans(turns: list,
                   queue_ms_by_rid: dict[str, float] | None = None) -> list[dict]:
-    """Per session: {session_id, start, end, segments, queue_s} ordered by
-    start. Segments are per-turn LLM-ACTIVE intervals = PREFILL + DECODE:
-    anchored at llm_end and extending back by (dynamo elapsed_s - engine
-    queue wait), where queue wait comes from the SCHED_DELAY join
-    (queue_ms_by_rid, keyed by request_id). Fallback chain per turn:
+    """Per session: {session_id, start, end, segments, queue_segments,
+    queue_s} ordered by start. Segments are per-turn GPU-ACTIVE intervals
+    = PREFILL + DECODE: anchored at llm_end and extending back by (dynamo
+    elapsed_s - engine queue wait), where queue wait comes from the
+    SCHED_DELAY join (queue_ms_by_rid, keyed by request_id).
+    queue_segments are the per-turn engine QUEUE-WAIT intervals sitting
+    immediately before their active segment: [llm_end - elapsed,
+    llm_end - (elapsed - queue)] (empty when no join). Fallback chain per
+    turn:
       elapsed - queue  ->  elapsed (queue unknown: queue counted as active)
       -> llm_end - llm_start (no dynamo timing: decode-only, first-token
          anchored; queue+prefill land in the gap).
     queue_s = summed engine queue wait for the session's turns (0.0 when
     no join). The (end - start) span is the session's total wall time;
-    span - active - queue = host time (tool + scaffold + post)."""
+    span - active - queue = others (tool + scaffold)."""
     by: dict[str, list[tuple[float, float]]] = {}
+    qsegs_by_sess: dict[str, list[tuple[float, float]]] = {}
     queue_by_sess: dict[str, float] = {}
     for t in turns:
         s, e = t.llm_start_ts, t.llm_end_ts
@@ -422,6 +428,9 @@ def session_spans(turns: list,
         if elapsed is not None:
             active = max(0.0, elapsed - (q_s or 0.0))
             seg = (e - active, e)
+            if q_s:
+                qsegs_by_sess.setdefault(t.session_id, []).append(
+                    (e - elapsed, e - active))
         elif s is not None:
             seg = (s, e)
         else:
@@ -433,8 +442,13 @@ def session_spans(turns: list,
     out: list[dict] = []
     for sid, segs in by.items():
         segs = sorted(segs)
-        out.append({"session_id": sid, "start": segs[0][0],
+        qsegs = sorted(qsegs_by_sess.get(sid, []))
+        # the first turn's queue wait precedes its active segment; include
+        # it in the span so the 3 shares tile the bar.
+        start = min(segs[0][0], qsegs[0][0]) if qsegs else segs[0][0]
+        out.append({"session_id": sid, "start": start,
                     "end": max(e for _, e in segs), "segments": segs,
+                    "queue_segments": qsegs,
                     "queue_s": queue_by_sess.get(sid, 0.0)})
     out.sort(key=lambda d: d["start"])
     return out
@@ -456,10 +470,11 @@ def session_utilizations(spans: list[dict]) -> list[float]:
 
 def session_breakdown(spans: list[dict]) -> list[dict]:
     """Per-session 3-way share of the wall span:
-      llm_active = prefill + decode          (the segments)
+      gpu_active = prefill + decode          (the segments)
       queue      = engine queue wait          (SCHED_DELAY join; 0 without --logs)
-      host       = tool + scaffold + post     (span - active - queue, clamped)
-    Each entry: {session_id, span_s, llm_active, queue, host} with the
+      others     = tool + scaffold            (span - active - queue, clamped;
+                   scaffold = post overhead + agent-loop plumbing)
+    Each entry: {session_id, span_s, gpu_active, queue, others} with the
     three shares summing to <= 1 (clamp guards timing noise). Sessions
     with a non-positive span are skipped."""
     out: list[dict] = []
@@ -469,10 +484,10 @@ def session_breakdown(spans: list[dict]) -> list[dict]:
             continue
         active = sum(e - s for s, e in sp["segments"])
         queue = sp.get("queue_s", 0.0)
-        host = max(0.0, span - active - queue)
+        others = max(0.0, span - active - queue)
         out.append({"session_id": sp["session_id"], "span_s": span,
-                    "llm_active": active / span, "queue": queue / span,
-                    "host": host / span})
+                    "gpu_active": active / span, "queue": queue / span,
+                    "others": others / span})
     return out
 
 
@@ -508,11 +523,11 @@ def _draw_mean_p50(ax, vals: list[float], unit: str = "") -> None:
 
 def fig_session_span(e0, spans: list[dict], path: Path) -> None:
     """Gantt of session wall time: one row per session (first-started at
-    top), x = time from the earliest session start. Each row shows the full
-    span as a light bar and the LLM-ACTIVE (prefill + decode; see
-    session_spans) turns as dark segments on top; the light gaps between
-    dark segments are the turn-gap delays (tool + scaffold + post + queue
-    wait) that stretch the session's end-to-end time."""
+    top), x = time from the earliest session start. Each row splits the
+    span into 3 colors: GPU-ACTIVE (prefill + decode; dark blue), QUEUE
+    WAIT (engine queue, orange; only with the SCHED_DELAY join), and
+    OTHERS (tool + scaffold, the light remainder) — the non-GPU time that
+    stretches the session's end-to-end wall."""
     plt = e0._mpl()
     n = len(spans)
     # wide/landscape aspect: keep height compact even for ~50 sessions so
@@ -531,9 +546,14 @@ def fig_session_span(e0, spans: list[dict], path: Path) -> None:
         ax.broken_barh([(sp["start"] - t0, max(sp["end"] - sp["start"], 1e-9))],
                        (y - bar_h / 2, bar_h), facecolors="tab:blue",
                        alpha=0.2, zorder=1)
+        qsegs = [(s - t0, max(e - s, 1e-3))
+                 for s, e in sp.get("queue_segments", [])]
+        if qsegs:
+            ax.broken_barh(qsegs, (y - bar_h / 2, bar_h),
+                           facecolors="tab:orange", alpha=0.9, zorder=2)
         segs = [(s - t0, max(e - s, 1e-3)) for s, e in sp["segments"]]
         ax.broken_barh(segs, (y - bar_h / 2, bar_h), facecolors="tab:blue",
-                       alpha=0.9, zorder=2)
+                       alpha=0.9, zorder=3)
     ax.set_ylim(-1, n)
     ax.set_yticks([n - 1 - i for i in range(n)])
     ax.set_yticklabels([sp["session_id"][-8:] for sp in spans],
@@ -542,8 +562,11 @@ def fig_session_span(e0, spans: list[dict], path: Path) -> None:
     ax.set_xlabel("time (s)")
     ax.set_ylabel("session (first-started at top)")
     ax.set_title("Session span: session start -> end")
-    ax.plot([], [], color="tab:blue", lw=6, alpha=0.9, label="LLM active")
-    ax.plot([], [], color="tab:blue", lw=6, alpha=0.2, label="turn-gap delay")
+    ax.plot([], [], color="tab:blue", lw=6, alpha=0.9,
+            label="GPU active (prefill+decode)")
+    ax.plot([], [], color="tab:orange", lw=6, alpha=0.9, label="queue wait")
+    ax.plot([], [], color="tab:blue", lw=6, alpha=0.2,
+            label="others (tool+scaffold)")
     ax.legend(fontsize=8, loc="lower right", framealpha=0.7)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -1071,7 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{r:.3f}" if r is not None else "n/a")
 
     # session 3-way breakdown of the wall span:
-    #   llm_active (prefill+decode) / host (tool+scaffold+post) / queue wait
+    #   gpu_active (prefill+decode) / queue wait / others (tool+scaffold)
     queue_ms_by_rid: dict[str, float] = {}
     if args.logs is not None and args.logs.exists():
         sched = ats.load_sched(args.logs)
@@ -1086,12 +1109,12 @@ def main(argv: list[str] | None = None) -> int:
     bd = session_breakdown(spans)
     if bd:
         note = "" if queue_ms_by_rid else \
-            "  [no --logs: queue counted inside llm_active]"
+            "  [no --logs: queue counted inside gpu_active]"
         print(f"session wall-span breakdown (n={len(bd)} sessions){note}")
         print(f"  {'component':<28} {'mean':>7} {'p50':>7} {'p90':>7}")
-        for key, label in (("llm_active", "llm_active (prefill+decode)"),
-                           ("host", "host (tool+scaffold+post)"),
-                           ("queue", "queue waiting")):
+        for key, label in (("gpu_active", "gpu_active (prefill+decode)"),
+                           ("queue", "queue waiting"),
+                           ("others", "others (tool+scaffold)")):
             vals = [d[key] for d in bd]
             print(f"  {label:<28} {sum(vals)/len(vals):>7.3f} "
                   f"{_percentile(vals, 50):>7.3f} "

@@ -174,11 +174,11 @@ def test_session_spans_prefill_decode_segments_with_queue_join(mod):
     sp = mod.session_spans(turns, {"r1": 4000.0, "r2": 1000.0})
     assert sp[0]["segments"] == [(104.0, 110.0), (116.0, 120.0)]
     assert sp[0]["queue_s"] == pytest.approx(5.0)
-    # span = 104..120 = 16; active 10; queue 5; host 1
+    # span = 104..120 = 16; active 10; queue 5; others 1
     bd = mod.session_breakdown(sp)[0]
-    assert bd["llm_active"] == pytest.approx(10 / 16)
+    assert bd["gpu_active"] == pytest.approx(10 / 16)
     assert bd["queue"] == pytest.approx(5 / 16)
-    assert bd["host"] == pytest.approx(1 / 16)
+    assert bd["others"] == pytest.approx(1 / 16)
 
 
 def test_session_spans_no_queue_join_counts_queue_as_active(mod):

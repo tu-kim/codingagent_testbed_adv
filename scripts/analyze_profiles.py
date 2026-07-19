@@ -48,7 +48,7 @@ Figures emitted:
                                    (mean/median/p90/p99 per component + average
                                    per-turn ratio).
   fig6b_turn_share_distribution.png — empirical CDF of each component's
-                                   (llm/tool/others) per-turn share of duration,
+                                   (llm/tool/scaffold) per-turn share of duration,
                                    overlaid in one graph.
   fig7_post_overhead_breakdown.png — post_overhead (others) split into
                                    snapshot+DB vs the rest (see analyze_post_overhead).
@@ -915,7 +915,7 @@ def plot_tool_tokens(sessions: dict[str, Session], out: Path,
 
 def _collect_turn_decomposition(sessions: dict[str, Session]):
     """Per-turn (session_id, step, wall_s, llm_wall_s_stream, tool_wall_s,
-    others_s_stream, llm_canon_s, others_canon_s).
+    others_s_stream, llm_canon_s, scaffold_s).
 
     Turns that fired the `task` tool are EXCLUDED wholesale: `task` spawns
     a nested agent session (its own LLM loop + tools) whose wall time lands
@@ -936,10 +936,11 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
                     the turn has no in-band dynamo timing: the wall-clock-
                     anchored llm.end - turn.start - tool (over-counts
                     client scaffold), then the stream llm_wall_s.
-      others_canon= wall - llm_canon - tool (clamped >= 0) = request build
-                    (scaffold) + post-stream framework tail + client/server
-                    transport deltas — everything that is neither the
-                    server LLM time nor tool execution.
+      scaffold    = wall - llm_canon - tool (clamped >= 0) = post-stream
+                    framework tail (post overhead) + agent-loop plumbing
+                    (DB write, resolveTools, reminder/plugin transforms,
+                    prompt assembly) + transport deltas — everything that
+                    is neither the server LLM time nor tool execution.
     Positions 3/5 keep the legacy stream-based llm_wall_s /
     post_overhead_s for the CSV/reference tables.
 
@@ -978,12 +979,12 @@ def _collect_turn_decomposition(sessions: dict[str, Session]):
                 llm_canon = max(0.0, t.llm_end_ts - t.turn_start_ts - tw)
             if llm_canon is None:
                 llm_canon = lw
-            others_canon = max(0.0, wall - llm_canon - tw)
-            rows.append((sid, step, wall, lw, tw, po, llm_canon, others_canon))
+            scaffold = max(0.0, wall - llm_canon - tw)
+            rows.append((sid, step, wall, lw, tw, po, llm_canon, scaffold))
     return rows
 
 
-_SHARE_COLORS = {"llm_wall_s": "C0", "tool_wall_s": "C2", "others": "0.5"}
+_SHARE_COLORS = {"llm_wall_s": "C0", "tool_wall_s": "C2", "scaffold": "0.5"}
 
 
 def _smooth_cdf(xs, xmax: float):
@@ -1077,7 +1078,7 @@ def _fig_turn_share_dist(share_arrays: dict, share_components, path: Path) -> Pa
     ax.set_ylabel("cumulative fraction of turns")
     ax.set_xlim(0.0, xmax)
     ax.set_ylim(0.0, 1.02)
-    ax.set_title("Per-turn share CDF (llm / tool / others)", fontsize=9)
+    ax.set_title("Per-turn share CDF (llm / tool / scaffold)", fontsize=9)
     ax.legend(fontsize=7, frameon=False, loc="lower right")
     fig.tight_layout()
     fig.savefig(path)
@@ -1093,11 +1094,11 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
                   (fallback: wall-anchored llm.end - turn.start - tool,
                   then stream llm_wall_s)
       tool_wall = tool execution
-      others    = wall - llm - tool = scaffold (request build) + post-
-                  stream framework tail + transport deltas
+      scaffold  = wall - llm - tool = post-stream framework tail (post
+                  overhead) + agent-loop plumbing + transport deltas
     plus the per-turn share distribution. The legacy stream-based numbers
     are printed below for reference, and the per-turn CSV carries both
-    (llm_wall_s/others_s = stream, llm_canon_s/others_canon_s = canonical).
+    (llm_wall_s/others_s = stream, llm_canon_s/scaffold_s = canonical).
     Emits a horizontal stacked bar figure + companion CSVs + stdout tables."""
     rows = _collect_turn_decomposition(sessions)
     if not rows:
@@ -1108,7 +1109,7 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     dur, llm, tool, post = arr.T
 
     # Canonical values from _collect_turn_decomposition: llm = dynamo
-    # elapsed_s (queue+prefill+decode; anchored/stream fallback), others =
+    # elapsed_s (queue+prefill+decode; anchored/stream fallback), scaffold =
     # wall - llm - tool. Always populated (total fallback chain).
     corr = np.array(
         [(r[6] if r[6] is not None else np.nan,
@@ -1126,16 +1127,16 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         ("duration_s", dur),      # wall bracket: turn.start(N) -> turn.start(N+1)
         ("llm_wall_s", llm),      # dynamo elapsed = queue + prefill + decode
         ("tool_wall_s", tool),
-        ("others", post),         # wall - llm - tool = scaffold + post + transport
+        ("scaffold", post),       # wall - llm - tool = post overhead + loop plumbing
     ]
     stats = {name: _summary_stats(vals) for name, vals in components}
-    share_components = ("llm_wall_s", "tool_wall_s", "others")
+    share_components = ("llm_wall_s", "tool_wall_s", "scaffold")
 
     # Per-turn share distribution (each turn weighted equally -- this is the
     # mean-OF-ratios family, NOT ratio-of-means, so long turns don't dominate).
     # Skip turns with zero duration to avoid div-by-zero.
     safe = dur > 0
-    by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "others": post}
+    by_name = {"llm_wall_s": llm, "tool_wall_s": tool, "scaffold": post}
     share_arrays = {
         name: (by_name[name][safe] / dur[safe]) if safe.any() else np.array([])
         for name in share_components
@@ -1224,7 +1225,7 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
         w = csv.writer(f)
         w.writerow(["session_id", "step", "duration_s",
                     "llm_wall_s", "tool_wall_s", "others_s",
-                    "llm_canon_s", "others_canon_s"])
+                    "llm_canon_s", "scaffold_s"])
         for sid, step, d, lw, tw, po, llm_t, oth_t in rows:
             w.writerow([sid, step,
                         f"{d:.6f}", f"{lw:.6f}", f"{tw:.6f}", f"{po:.6f}",
@@ -1236,7 +1237,7 @@ def plot_turn_decomposition(sessions: dict[str, Session], out: Path) -> Path | N
     pieces = [
         ("llm_wall",       float(llm.mean()),  "C0"),
         ("tool_wall",      float(tool.mean()), "C2"),
-        ("others",         float(post.mean()), "0.6"),
+        ("scaffold",       float(post.mean()), "0.6"),
     ]
     mean_dur = float(dur.mean()) or 1.0
     left = 0.0
@@ -1663,7 +1664,7 @@ def _lat_fig_bucket_stacked(cond_rows, comps, path: Path) -> Path:
 def analyze_latency_composition(sessions: dict[str, Session], out: Path) -> Path | None:
     """Per-request (per-turn) latency-composition analysis on the CANONICAL
     components (wall = turn.start->next turn.start; llm = dynamo elapsed_s =
-    queue+prefill+decode, anchored/stream fallback; others = wall - llm -
+    queue+prefill+decode, anchored/stream fallback; scaffold = wall - llm -
     tool; task-tool turns excluded via _collect_turn_decomposition). Merged
     in from the former standalone
     analyze_latency_breakdown.py so all profile analysis lives in one script and
@@ -1695,7 +1696,7 @@ def analyze_latency_composition(sessions: dict[str, Session], out: Path) -> Path
     others = np.where(np.isnan(oth_t), post_s, oth_t)
 
     comps = [("llm_wall_s", llm, "C0"), ("tool_wall_s", tool, "C2"),
-             ("others", others, "0.6")]
+             ("scaffold", others, "0.6")]
     safe = dur > 0
 
     def _pct(v, q):
