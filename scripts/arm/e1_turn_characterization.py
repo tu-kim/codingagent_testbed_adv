@@ -1026,6 +1026,7 @@ def main(argv: list[str] | None = None) -> int:
     if utils:
         mean = sum(utils) / len(utils)
         print(f"session utilization (LLM-active / span): mean {mean:.3f}, "
+              f"p50 {_percentile(utils, 50):.3f}, "
               f"p90 {_percentile(utils, 90):.3f}, "
               f"p99 {_percentile(utils, 99):.3f} (n={len(utils)})")
 
