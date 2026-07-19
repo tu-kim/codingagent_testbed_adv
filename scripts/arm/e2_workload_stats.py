@@ -158,7 +158,8 @@ def fig_isl_osl(e0, isl: list[float], osl: list[float], path: Path) -> None:
                               (_percentile(vals, 50), "p50", ":",
                                "tab:purple"),
                               (_percentile(vals, 90), "p90", "-.",
-                               "tab:orange")):
+                               "tab:orange"),
+                              (max(vals), "max", "-", "tab:brown")):
             ax.axvline(v, color=c, ls=ls, lw=1.2,
                        label=f"{lab} {v:,.0f}")
         ax.set_xlabel(f"{name} (tokens)")
@@ -270,7 +271,8 @@ def main(argv: list[str] | None = None) -> int:
         if vals:
             print(f"  {name:<4} mean {sum(vals)/len(vals):>10,.0f}  "
                   f"p50 {_percentile(vals, 50):>10,.0f}  "
-                  f"p90 {_percentile(vals, 90):>10,.0f}  n={len(vals)}")
+                  f"p90 {_percentile(vals, 90):>10,.0f}  "
+                  f"max {max(vals):>10,.0f}  n={len(vals)}")
 
     counts = tool_counts(turns)
     print("tool invocation counts:")
