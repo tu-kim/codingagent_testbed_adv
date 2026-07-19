@@ -470,7 +470,9 @@ def fig_session_span(e0, spans: list[dict], path: Path) -> None:
     stretch the session's end-to-end time."""
     plt = e0._mpl()
     n = len(spans)
-    fig, ax = plt.subplots(figsize=(18, max(4.0, 0.32 * n)))
+    # wide/landscape aspect: keep height compact even for ~50 sessions so
+    # the figure stays horizontal rather than a tall strip.
+    fig, ax = plt.subplots(figsize=(22, max(3.5, 0.14 * n)))
     if not spans:
         ax.text(0.5, 0.5, "no sessions", transform=ax.transAxes,
                 ha="center", va="center", color="grey")
@@ -478,13 +480,14 @@ def fig_session_span(e0, spans: list[dict], path: Path) -> None:
         plt.close(fig)
         return
     t0 = spans[0]["start"]
+    bar_h = 0.4                             # thin bars (rows are 1 apart)
     for i, sp in enumerate(spans):
         y = n - 1 - i                      # first-started session at the top
         ax.broken_barh([(sp["start"] - t0, max(sp["end"] - sp["start"], 1e-9))],
-                       (y - 0.4, 0.8), facecolors="tab:blue", alpha=0.2,
-                       zorder=1)
+                       (y - bar_h / 2, bar_h), facecolors="tab:blue",
+                       alpha=0.2, zorder=1)
         segs = [(s - t0, max(e - s, 1e-3)) for s, e in sp["segments"]]
-        ax.broken_barh(segs, (y - 0.4, 0.8), facecolors="tab:blue",
+        ax.broken_barh(segs, (y - bar_h / 2, bar_h), facecolors="tab:blue",
                        alpha=0.9, zorder=2)
     ax.set_ylim(-1, n)
     ax.set_yticks([n - 1 - i for i in range(n)])
