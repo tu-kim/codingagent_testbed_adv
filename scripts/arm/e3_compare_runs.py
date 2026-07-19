@@ -143,7 +143,7 @@ def fig_share_by_run(e0, per_run: dict[str, list], path: Path) -> None:
             ax.vlines(pos, min(shares), max(shares), color="black",
                       lw=0.9, zorder=2)
             mean = sum(shares) / len(shares)
-            ax.scatter([pos], [mean], color="black", marker="D", s=18,
+            ax.scatter([pos], [mean], color="black", marker="o", s=8,
                        zorder=3)
             ax.text(pos, mean, f" {mean:.2f}", color="black", fontsize=7,
                     va="bottom", ha="left", zorder=4)
@@ -156,8 +156,7 @@ def fig_share_by_run(e0, per_run: dict[str, list], path: Path) -> None:
     ax.set_ylim(0, 1.05)
     for comp in COMPONENTS:
         ax.plot([], [], color=colors[comp], lw=6, alpha=0.6, label=comp)
-    ax.scatter([], [], color="black", marker="D", s=18, label="mean")
-    ax.legend(fontsize=8, framealpha=0.7, ncol=4)
+    ax.legend(fontsize=8, framealpha=0.7, ncol=3, loc="upper right")
     ax.set_title("Per-request latency-component share by run "
                  "(llm / tool / scaffold)")
     fig.tight_layout()
