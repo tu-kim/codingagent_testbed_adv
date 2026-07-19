@@ -778,38 +778,57 @@ def fig_queue_share(e0, sched: dict, frontend: dict, path: Path) -> None:
     plt.close(fig)
 
 
-def fig_retrieve_ttft(e0, retrieves: dict, frontend: dict,
-                      path: Path) -> list[float]:
-    """fig9: LMCache retrieve transfer cost as a share of the SAME
-    request's frontend ttft_ms (retrieve rides TTFT: it happens between
-    scheduling and first token). Scatter of the share vs time + printed
-    stats. Returns the share list for the caller's stats block."""
+def fig_retrieve_ttft(e0, retrieves: dict, frontend: dict, path: Path,
+                      sched: dict | None = None) -> list[float]:
+    """fig9: LMCache retrieve transfer cost vs the SAME request's frontend
+    ttft_ms. NOTE the frontend TTFT includes the engine queue wait
+    (ttft = first_token - request_received), so with a SCHED_DELAY join
+    (`sched`) a second panel plots retrieve vs (TTFT - queue_ms) — the
+    queue-removed prefill-side wall, the honest denominator for "how much
+    of prefill was KV onboarding". Returns the raw-TTFT share list."""
     plt = e0._mpl()
-    pts = []                                    # (ts-ish order idx, share)
+    pts = []                     # (cost_ms, ttft_ms, net_ttft_ms|None)
     shares: list[float] = []
     for rid, rec in retrieves.items():
         fr = frontend.get(rid)
         if fr is None or fr.ttft_ms is None or fr.ttft_ms <= 0:
             continue
+        net = None
+        if sched and rid in sched:
+            q = sched[rid].total_queue_ms
+            if q is not None and 0 < q < fr.ttft_ms:
+                net = fr.ttft_ms - q
         shares.append(rec["cost_ms"] / fr.ttft_ms)
-        pts.append((rid, rec["cost_ms"], fr.ttft_ms))
-    fig, ax = plt.subplots(figsize=(10, 5))
-    if pts:
-        # x = ttft, y = retrieve cost; the diagonal band shows the share.
-        ax.scatter([p[2] / 1000.0 for p in pts], [p[1] / 1000.0 for p in pts],
+        pts.append((rec["cost_ms"], fr.ttft_ms, net))
+    have_net = any(p[2] is not None for p in pts)
+    fig, axes = plt.subplots(1, 2 if have_net else 1, figsize=(15, 5))
+    axes = axes if have_net else [axes]
+
+    def _panel(ax, xs_ms, ys_ms, xlabel):
+        ax.scatter([x / 1000.0 for x in xs_ms], [y / 1000.0 for y in ys_ms],
                    s=10, alpha=0.6, color="tab:purple")
-        lim = max(max(p[2] for p in pts), max(p[1] for p in pts)) / 1000.0
+        lim = max(max(xs_ms), max(ys_ms)) / 1000.0
         for frac, style in ((1.0, "-"), (0.5, "--"), (0.1, ":")):
             ax.plot([0, lim], [0, lim * frac], color="grey", lw=0.8,
-                    ls=style, label=f"retrieve = {int(frac*100)}% of TTFT")
-        ax.set_xlabel("frontend TTFT (s)")
+                    ls=style, label=f"retrieve = {int(frac*100)}%")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("LMCache retrieve cost (s)")
         ax.legend(fontsize=8, loc="upper left", framealpha=0.7)
+
+    if pts:
+        _panel(axes[0], [p[1] for p in pts], [p[0] for p in pts],
+               "frontend TTFT (s)  [includes queue wait]")
+        axes[0].set_title("retrieve vs raw TTFT")
+        if have_net:
+            np_ = [(p[0], p[2]) for p in pts if p[2] is not None]
+            _panel(axes[1], [p[1] for p in np_], [p[0] for p in np_],
+                   "TTFT - queue_ms (s)  [prefill-side wall]")
+            axes[1].set_title("retrieve vs queue-removed TTFT")
     else:
-        ax.text(0.5, 0.5, "no retrieve<->frontend joins",
-                transform=ax.transAxes, ha="center", va="center",
-                color="grey")
-    ax.set_title("LMCache retrieve transfer vs TTFT per request")
+        axes[0].text(0.5, 0.5, "no retrieve<->frontend joins",
+                     transform=axes[0].transAxes, ha="center", va="center",
+                     color="grey")
+    fig.suptitle("LMCache retrieve transfer vs TTFT per request")
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return shares
@@ -1460,12 +1479,24 @@ def main(argv: list[str] | None = None) -> int:
         r_share = [rec["cost_ms"] / frontend[rid].ttft_ms
                    for rid, rec in retrieves.items()
                    if rid in frontend and frontend[rid].ttft_ms]
+        # queue-removed denominator: frontend ttft INCLUDES the engine
+        # queue wait, so retrieve/(ttft - queue_ms) is the share of the
+        # actual prefill-side wall spent on KV onboarding.
+        r_share_net = []
+        for rid, rec in retrieves.items():
+            fr = frontend.get(rid)
+            if fr is None or not fr.ttft_ms or rid not in sched:
+                continue
+            q = sched[rid].total_queue_ms
+            if q is not None and 0 < q < fr.ttft_ms:
+                r_share_net.append(rec["cost_ms"] / (fr.ttft_ms - q))
         print(f"lmcache retrieve joins: {len(retrieves)} transfers, "
               f"frontend ttft join {len(r_share)}")
         _stat_line("retrieve cost (ms)",
                    [rec["cost_ms"] for rec in retrieves.values()],
                    "{:.1f}")
         _stat_line("retrieve / TTFT share", r_share)
+        _stat_line("retrieve / (TTFT-queue) share", r_share_net)
         _stat_line("WAITING lookups per transfer",
                    [float(rec["waits"]) for rec in retrieves.values()],
                    "{:.1f}")
@@ -1487,7 +1518,8 @@ def main(argv: list[str] | None = None) -> int:
                                 out_dir / "fig8_queue_share.pdf")
             if retrieves:
                 fig_retrieve_ttft(e0, retrieves, frontend,
-                                  out_dir / "fig9_retrieve_ttft.pdf")
+                                  out_dir / "fig9_retrieve_ttft.pdf",
+                                  sched=sched)
             if lmc:
                 prof_end = max((t.llm_end_ts for t in turns
                                 if t.llm_end_ts is not None), default=None)
