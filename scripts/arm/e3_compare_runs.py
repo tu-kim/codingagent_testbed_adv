@@ -118,7 +118,7 @@ def fig_share_by_run(e0, per_run: dict[str, list], path: Path) -> None:
     plt = e0._mpl()
     runs = list(per_run)
     colors = {"llm": "C0", "tool": "C2", "scaffold": "0.5"}
-    fig, ax = plt.subplots(figsize=(max(8, 2.6 * len(runs)), 5))
+    fig, ax = plt.subplots(figsize=(max(12, 4.0 * len(runs)), 4.5))
     pos = 0
     ticks, tick_labels = [], []
     for run in runs:
