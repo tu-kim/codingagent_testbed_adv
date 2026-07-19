@@ -307,11 +307,12 @@ def test_counter_delta_total_none_when_absent_and_skips_not_ok(mod, tmp_path):
     assert mod.counter_delta_total(p, "vllm:x_seconds_sum") is None
 
 
-def test_session_spans_no_elapsed_join_does_not_double_count_queue(mod):
-    # elapsed_s is None (no dynamo join) but the turn DOES have a request_id
-    # in queue_ms_by_rid -- the fallback-to-llm-bracket path must NOT add
-    # this queue wait to queue_s / queue_segments (it's already inside the
-    # (s, e) active segment).
+def test_session_spans_no_elapsed_join_carves_queue_from_bracket_head(mod):
+    # elapsed_s is None (no dynamo timing) but the turn DOES have a
+    # request_id in queue_ms_by_rid -- the queue wait sits at the FRONT of
+    # the client llm bracket, so it is carved out of the bracket's head:
+    # (s, s+q) queue / (s+q, e) active. No double count: queue_s equals
+    # the drawn queue segment and active shrinks by the same amount.
     class _TQ:
         session_id = "A"
         step = 1
@@ -320,9 +321,29 @@ def test_session_spans_no_elapsed_join_does_not_double_count_queue(mod):
         elapsed_s = None
         request_id = "r1"
     sp = mod.session_spans([_TQ()], {"r1": 4000.0})
-    assert sp[0]["segments"] == [(100.0, 110.0)]
-    assert sp[0]["queue_s"] == 0.0
-    assert sp[0]["queue_segments"] == []
+    assert sp[0]["queue_segments"] == [(100.0, 104.0)]
+    assert sp[0]["segments"] == [(104.0, 110.0)]
+    assert sp[0]["queue_s"] == pytest.approx(4.0)
+    bd = mod.session_breakdown(sp)[0]
+    assert bd["queue"] == pytest.approx(0.4)
+    assert bd["gpu_active"] == pytest.approx(0.6)
+    assert bd["others"] == pytest.approx(0.0)
+
+
+def test_session_spans_no_elapsed_queue_clamped_to_bracket(mod):
+    # joined queue (20s) exceeds the whole client bracket (10s): clamp to
+    # the bracket so shares still tile the span (active collapses to 0).
+    class _TQ:
+        session_id = "A"
+        step = 1
+        llm_start_ts = 100.0
+        llm_end_ts = 110.0
+        elapsed_s = None
+        request_id = "r1"
+    sp = mod.session_spans([_TQ()], {"r1": 20000.0})
+    assert sp[0]["queue_segments"] == [(100.0, 110.0)]
+    assert sp[0]["segments"] == [(110.0, 110.0)]
+    assert sp[0]["queue_s"] == pytest.approx(10.0)
 
 
 def test_session_spans_clamps_queue_to_elapsed(mod):
