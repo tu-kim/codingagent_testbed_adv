@@ -473,13 +473,17 @@ def session_spans(turns: list,
     llm_end - (elapsed - queue)] (empty when no join). Fallback chain per
     turn:
       elapsed - queue  ->  elapsed (queue unknown: queue counted as active)
-      -> llm_end - llm_start (no dynamo timing: the client llm bracket;
-         queue+prefill are inside it, so queue_s deliberately does NOT
-         count this turn's queue — it can't be separated out).
+      -> llm_end - llm_start (no dynamo timing: the client llm bracket.
+         Queue sits at the FRONT of that bracket — request lands, waits
+         in the scheduler queue, then prefill+decode run to llm_end — so
+         with a queue join the bracket is split (s, s+q) queue /
+         (s+q, e) active; without a join the whole bracket counts as
+         active).
     queue_s = summed engine queue wait actually carved out of active
-    (per-turn min(queue, elapsed); 0.0 when no join), so it always equals
-    the drawn queue_segments total and the 3 breakdown shares tile the
-    span. span - active - queue = others (tool + scaffold)."""
+    (per-turn clamped to the bracket it was carved from; 0.0 when no
+    join), so it always equals the drawn queue_segments total and the 3
+    breakdown shares tile the span. span - active - queue = others
+    (tool + scaffold)."""
     by: dict[str, list[tuple[float, float]]] = {}
     qsegs_by_sess: dict[str, list[tuple[float, float]]] = {}
     queue_by_sess: dict[str, float] = {}
@@ -503,12 +507,21 @@ def session_spans(turns: list,
                 queue_by_sess[t.session_id] = \
                     queue_by_sess.get(t.session_id, 0.0) + q_eff
         elif s is not None:
-            # no dynamo timing: fall back to the client llm bracket. The
-            # queue wait is INSIDE (s, e) here, so do NOT add it to
-            # queue_s — that would double-count it against the active
-            # segment (breakdown shares would sum past 1 while the graph
-            # shows no queue segment).
-            seg = (s, e)
+            # no dynamo timing: fall back to the client llm bracket
+            # (s, e) = setup + queue + prefill + decode. The queue wait
+            # sits at the FRONT of it, so with a join we carve it out of
+            # the bracket's head instead of adding it ON TOP (the old
+            # double count: queue_s grew while active still contained
+            # the queue and no queue segment was drawn).
+            if q_s and e > s:
+                q_eff = min(q_s, e - s)
+                qsegs_by_sess.setdefault(t.session_id, []).append(
+                    (s, s + q_eff))
+                queue_by_sess[t.session_id] = \
+                    queue_by_sess.get(t.session_id, 0.0) + q_eff
+                seg = (s + q_eff, e)
+            else:
+                seg = (s, e)
         else:
             continue
         by.setdefault(t.session_id, []).append(seg)
@@ -1207,8 +1220,26 @@ def main(argv: list[str] | None = None) -> int:
                            for rid, rec in sched.items()}
         n_joined = sum(1 for t in turns
                        if getattr(t, "request_id", None) in queue_ms_by_rid)
+        joined_q_s = sum(queue_ms_by_rid[t.request_id] / 1000.0
+                         for t in turns
+                         if getattr(t, "request_id", None) in queue_ms_by_rid)
         print(f"queue join: {n_joined}/{len(turns)} turns matched a "
-              f"SCHED_DELAY record")
+              f"SCHED_DELAY record (joined queue total {joined_q_s:.1f}s)")
+    # cross-check the SCHED_DELAY join against the engine's own
+    # request_queue_time histogram from the scrape (window = profile
+    # turns). A large metrics total with a ~0 joined total means the
+    # join is broken (request_id mismatch / logs missing SCHED_DELAY),
+    # not that there was no queueing.
+    if have_metrics:
+        ts_win = [t.llm_end_ts for t in turns if t.llm_end_ts is not None] \
+            + [t.llm_start_ts for t in turns if t.llm_start_ts is not None]
+        q_metrics = counter_delta_total(
+            args.metrics, "vllm:request_queue_time_seconds_sum",
+            min(ts_win) if ts_win else None,
+            max(ts_win) if ts_win else None)
+        if q_metrics is not None:
+            print(f"engine queue total (vllm request_queue_time metrics): "
+                  f"{q_metrics:.1f}s")
     spans = session_spans(turns, queue_ms_by_rid or None)
     utils = session_utilizations(spans)
     bd = session_breakdown(spans)
