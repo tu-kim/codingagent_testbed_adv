@@ -656,34 +656,58 @@ _LMC_RETR_RE = re.compile(
     r"\(from (?P<hit>\d+) total tokens\)\..*?cost (?P<cost_ms>[\d.]+) ms")
 
 
-def parse_lmcache_retrieves(logs: Path) -> dict[str, dict]:
+_LMC_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHJ]")
+
+
+def parse_lmcache_retrieves(logs: Path,
+                            stats: dict | None = None) -> dict[str, dict]:
     """{request_id: {cost_ms, tokens, hit_tokens, waits}} per request from
     the worker logs. request_id = the lookup Reqid with the engine's
     trailing '-<suffix>' stripped (the remaining 5-group UUID equals the
     frontend/SCHED_DELAY Context UUID). `waits` counts the repeated
     lookup lines for the Reqid (~ scheduler steps spent in WAITING before
     the transfer). A Retrieved line is attributed to the most recent
-    lookup whose hit count matches its "from N total tokens"; unmatched
-    Retrieved lines are dropped. Last retrieve wins per request."""
+    lookup whose hit count matches its "from N total tokens", falling
+    back to the most recent lookup of ANY hit count (hit counts can
+    shift between lookup and transfer when more chunks land in the
+    meantime); only retrieves with no prior lookup at all are dropped.
+    Last retrieve wins per request. `stats` (optional dict) receives
+    {lookup_lines, retrieve_lines, matched, fallback_matched} for the
+    caller's diagnostics."""
     out: dict[str, dict] = {}
+    st = stats if stats is not None else {}
+    st.setdefault("lookup_lines", 0)
+    st.setdefault("retrieve_lines", 0)
+    st.setdefault("matched", 0)
+    st.setdefault("fallback_matched", 0)
     files = [logs] if logs.is_file() else sorted(logs.glob("vllm-*.log"))
     for fpath in files:
         last_by_hit: dict[int, str] = {}     # hit tokens -> reqid
+        last_reqid: str | None = None
         waits: dict[str, int] = {}
         with fpath.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
+                line = _LMC_ANSI_RE.sub("", line)
                 m = _LMC_LOOKUP_RE.search(line)
                 if m:
                     reqid = m.group("reqid")
+                    st["lookup_lines"] += 1
                     waits[reqid] = waits.get(reqid, 0) + 1
                     last_by_hit[int(m.group("hit"))] = reqid
+                    last_reqid = reqid
                     continue
                 m = _LMC_RETR_RE.search(line)
                 if not m:
                     continue
+                st["retrieve_lines"] += 1
                 reqid = last_by_hit.get(int(m.group("hit")))
                 if reqid is None:
-                    continue
+                    if last_reqid is None:
+                        continue
+                    reqid = last_reqid
+                    st["fallback_matched"] += 1
+                else:
+                    st["matched"] += 1
                 rid = reqid.rsplit("-", 1)[0]
                 out[rid] = {
                     "cost_ms": float(m.group("cost_ms")),
@@ -1415,7 +1439,13 @@ def main(argv: list[str] | None = None) -> int:
     # fig8/fig9 companion stats: per-request joins by request_id.
     retrieves: dict = {}
     if args.logs is not None and args.logs.exists():
-        retrieves = parse_lmcache_retrieves(args.logs)
+        lmc_stats: dict = {}
+        retrieves = parse_lmcache_retrieves(args.logs, lmc_stats)
+        print(f"lmcache log scan: {lmc_stats['lookup_lines']} lookup lines, "
+              f"{lmc_stats['retrieve_lines']} retrieve lines, "
+              f"{lmc_stats['matched']} hit-matched + "
+              f"{lmc_stats['fallback_matched']} fallback-matched -> "
+              f"{len(retrieves)} requests")
     if sched:
         q_all = [rec.total_queue_ms / 1000.0 for rec in sched.values()
                  if rec.total_queue_ms > 0]
