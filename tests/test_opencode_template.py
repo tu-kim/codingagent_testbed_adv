@@ -116,9 +116,26 @@ def test_rendered_template_pins_seed_as_flat_option():
     cfg = _render(seed="42")
     for name in ("build", "plan", "general", "title", "summary", "compaction"):
         opts = cfg["agent"][name].get("options", {})
-        assert opts == {"seed": 42}, (
-            f"agent.{name}.options must be flat {{seed: 42}} (no provider "
-            f"key wrap; ProviderTransform handles wrapping), got {opts!r}"
+        assert opts == {"seed": 42,
+                        "nvext": {"extra_fields": ["timing"]}}, (
+            f"agent.{name}.options must be flat (no provider key wrap; "
+            f"ProviderTransform handles wrapping) with the seed and the "
+            f"nvext timing opt-in, got {opts!r}"
+        )
+
+
+def test_rendered_template_opts_into_nvext_timing():
+    """Since dynamo v1.3.0-minimax-m3-dev.1, nvext.timing on the response
+    is PER-REQUEST OPT-IN: the frontend attaches it only when the request
+    body carries nvext.extra_fields containing "timing"
+    (dynamo/lib/llm/src/protocols/openai/nvext.rs:215-234,297). Without
+    this every profile llm.end.dynamo is null and elapsed-based analyses
+    degrade to client-bracket approximations."""
+    cfg = _render()
+    for name in ("build", "plan", "general", "title", "summary", "compaction"):
+        nv = cfg["agent"][name].get("options", {}).get("nvext")
+        assert nv == {"extra_fields": ["timing"]}, (
+            f"agent.{name}.options.nvext must opt into timing, got {nv!r}"
         )
 
 

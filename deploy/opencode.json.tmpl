@@ -19,11 +19,11 @@
   "model": "{{PROVIDER_ID}}/{{MODEL_SERVED_NAME}}",
   "permission": { "*": "allow" },
   "agent": {
-    "build":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}} } },
-    "plan":       { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}} } },
-    "general":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}} } },
-    "title":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}} } },
-    "summary":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}} } },
-    "compaction": { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}} } }
+    "build":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}}, "nvext": { "extra_fields": ["timing"] } } },
+    "plan":       { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}}, "nvext": { "extra_fields": ["timing"] } } },
+    "general":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}}, "nvext": { "extra_fields": ["timing"] } } },
+    "title":      { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}}, "nvext": { "extra_fields": ["timing"] } } },
+    "summary":    { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}}, "nvext": { "extra_fields": ["timing"] } } },
+    "compaction": { "temperature": {{TEMPERATURE}}, "top_p": {{TOP_P}}, "options": { "seed": {{SEED}}, "nvext": { "extra_fields": ["timing"] } } }
   }
 }
