@@ -76,6 +76,31 @@ def session_first_ordinals(ordered: list) -> list[int]:
     return out
 
 
+def order_turns_grouped(turns: list) -> tuple[list, list[int]]:
+    """Session-grouped ordering for per-turn ORDINAL figures under a
+    CONCURRENT run: sessions in first-turn start order, each session's
+    turns contiguous (chronological within the session). Returns
+    (ordered, boundaries) with boundaries = ordinal of each session's
+    first turn. Under mif>1 the global chronological order interleaves
+    sessions, so first-turn ordinals stop being block edges — grouping
+    restores contiguous per-session blocks (same convention as fig3's
+    top panel)."""
+    def key(t):
+        return (t.llm_start_ts if t.llm_start_ts is not None
+                else t.llm_end_ts if t.llm_end_ts is not None
+                else float("inf"))
+    by: dict[str, list] = {}
+    for t in turns:
+        by.setdefault(t.session_id, []).append(t)
+    sess = sorted(by, key=lambda s: min(key(t) for t in by[s]))
+    ordered: list = []
+    boundaries: list[int] = []
+    for sid in sess:
+        boundaries.append(len(ordered))
+        ordered.extend(sorted(by[sid], key=key))
+    return ordered, boundaries
+
+
 def session_first_times_abs(ordered: list) -> list[float]:
     """ABSOLUTE start ts of each session's first turn (no overlap filter,
     see session_first_ordinals)."""
@@ -246,6 +271,46 @@ def counter_rate(recs: list[dict], key: str) -> list[tuple[float, float]]:
     return out
 
 
+def counter_delta_total(metrics_path: Path, name: str,
+                        lo: float | None = None,
+                        hi: float | None = None) -> float | None:
+    """Total increase of a cumulative counter over the [lo, hi] window,
+    summed across workers, from the scrape NDJSON. Tries the bare name
+    then the OpenMetrics `_total` variant. Per worker: last - first value
+    inside the window; a counter reset (last < first) degrades to the
+    last value. None when the metric never appears in the window."""
+    per: dict[str, tuple[float, float]] = {}   # worker -> (first, last)
+    with metrics_path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not row.get("ok"):
+                continue
+            ts = row.get("ts")
+            if ts is None or (lo is not None and ts < lo) \
+                    or (hi is not None and ts > hi):
+                continue
+            v = _sum_series(row, name)
+            if v is None:
+                v = _sum_series(row, name + "_total")
+            if v is None:
+                continue
+            w = str(row.get("worker", "?"))
+            first, _last = per.get(w, (v, v))
+            per[w] = (first, v)
+    if not per:
+        return None
+    tot = 0.0
+    for first, last in per.values():
+        tot += (last - first) if last >= first else last
+    return tot
+
+
 def transfer_batches(recs: list[dict], tok_key: str, sum_key: str,
                      count_key: str) -> list[tuple[float, float, float]]:
     """Per window: (ts, tokens_transferred, seconds_to_transfer).
@@ -408,11 +473,13 @@ def session_spans(turns: list,
     llm_end - (elapsed - queue)] (empty when no join). Fallback chain per
     turn:
       elapsed - queue  ->  elapsed (queue unknown: queue counted as active)
-      -> llm_end - llm_start (no dynamo timing: decode-only, first-token
-         anchored; queue+prefill land in the gap).
-    queue_s = summed engine queue wait for the session's turns (0.0 when
-    no join). The (end - start) span is the session's total wall time;
-    span - active - queue = others (tool + scaffold)."""
+      -> llm_end - llm_start (no dynamo timing: the client llm bracket;
+         queue+prefill are inside it, so queue_s deliberately does NOT
+         count this turn's queue — it can't be separated out).
+    queue_s = summed engine queue wait actually carved out of active
+    (per-turn min(queue, elapsed); 0.0 when no join), so it always equals
+    the drawn queue_segments total and the 3 breakdown shares tile the
+    span. span - active - queue = others (tool + scaffold)."""
     by: dict[str, list[tuple[float, float]]] = {}
     qsegs_by_sess: dict[str, list[tuple[float, float]]] = {}
     queue_by_sess: dict[str, float] = {}
@@ -426,19 +493,25 @@ def session_spans(turns: list,
             q_s = queue_ms_by_rid[rid] / 1000.0
         elapsed = getattr(t, "elapsed_s", None)
         if elapsed is not None:
-            active = max(0.0, elapsed - (q_s or 0.0))
+            # clamp: SCHED_DELAY queue can't exceed dynamo's server wall
+            q_eff = min(q_s, elapsed) if q_s else 0.0
+            active = max(0.0, elapsed - q_eff)
             seg = (e - active, e)
-            if q_s:
+            if q_eff > 0:
                 qsegs_by_sess.setdefault(t.session_id, []).append(
                     (e - elapsed, e - active))
+                queue_by_sess[t.session_id] = \
+                    queue_by_sess.get(t.session_id, 0.0) + q_eff
         elif s is not None:
+            # no dynamo timing: fall back to the client llm bracket. The
+            # queue wait is INSIDE (s, e) here, so do NOT add it to
+            # queue_s — that would double-count it against the active
+            # segment (breakdown shares would sum past 1 while the graph
+            # shows no queue segment).
             seg = (s, e)
         else:
             continue
         by.setdefault(t.session_id, []).append(seg)
-        if q_s is not None:
-            queue_by_sess[t.session_id] = \
-                queue_by_sess.get(t.session_id, 0.0) + q_s
     out: list[dict] = []
     for sid, segs in by.items():
         segs = sorted(segs)
@@ -604,9 +677,10 @@ def fig_eviction_vs_displacement(events: list[dict], path: Path, e0) -> None:
 
 def fig_turn_llm_time(e0, ordered: list, path: Path,
                       sample_ordinals: list[int]) -> None:
-    """E0's three stacked fig1 panels, but with boundary lines at the
-    given ordinals (each trace session's first turn) instead of E0's
-    overlap-filtered set."""
+    """E0's three stacked fig1 panels over SESSION-GROUPED turn order
+    (see order_turns_grouped), with boundary lines at each session
+    block's first ordinal — contiguous per-session blocks even when
+    mif>1 interleaves sessions in time."""
     plt = e0._mpl()
     import math as _math
     n = len(ordered)
@@ -1040,7 +1114,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     ordered = e0.order_turns(turns)
-    sample_ords = session_first_ordinals(ordered)
+    # per-turn ordinal figures (fig1) use SESSION-GROUPED order so each
+    # session is a contiguous block even when mif>1 interleaves them.
+    grouped, grouped_bounds = order_turns_grouped(turns)
     samples_abs = session_first_times_abs(ordered)
     reuse = e0.gap_reuse_pairs(turns)
     events = eviction_events(turns, args.compaction_drop_ratio,
@@ -1065,6 +1141,35 @@ def main(argv: list[str] | None = None) -> int:
             if extra:
                 print("  other lmcache: names present (candidate renames): "
                       + ", ".join(extra), file=sys.stderr)
+
+    # LMCache retrieve transfer time as a share of total prefill compute.
+    # Onboard (host->device) rides TTFT, so its cost surfaces inside the
+    # engine's prefill wall; this quantifies how much of that wall was
+    # spent moving KV in from the CPU tier.
+    if lmc:
+        ts_win = [t.llm_end_ts for t in turns if t.llm_end_ts is not None] \
+            + [t.llm_start_ts for t in turns if t.llm_start_ts is not None]
+        lo_w = min(ts_win) if ts_win else None
+        hi_w = max(ts_win) if ts_win else None
+        xfer_s = 0.0
+        for recs in lmc.values():
+            for bts, _tok, sec in transfer_batches(
+                    recs, "hit_tokens", "retrieve_sum", "retrieve_count"):
+                if (lo_w is None or bts >= lo_w) \
+                        and (hi_w is None or bts <= hi_w):
+                    xfer_s += sec
+        prefill_s = counter_delta_total(
+            args.metrics, "vllm:request_prefill_time_seconds_sum",
+            lo_w, hi_w)
+        if prefill_s and prefill_s > 0:
+            print(f"lmcache retrieve transfer: {xfer_s:.1f}s = "
+                  f"{100.0 * xfer_s / prefill_s:.1f}% of total prefill "
+                  f"compute {prefill_s:.1f}s")
+        else:
+            print(f"lmcache retrieve transfer: {xfer_s:.1f}s "
+                  f"(no vllm:request_prefill_time_seconds_sum in scrape — "
+                  f"re-run scrape_metrics with the updated allowlist for "
+                  f"the prefill share)")
 
     out_dir = args.out or (args.profiles / "e1")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1110,23 +1215,27 @@ def main(argv: list[str] | None = None) -> int:
     if bd:
         note = "" if queue_ms_by_rid else \
             "  [no --logs: queue counted inside gpu_active]"
+        n_el = sum(1 for t in turns
+                   if getattr(t, "elapsed_s", None) is not None)
+        n_qseg = sum(len(sp.get("queue_segments", [])) for sp in spans)
         print(f"session wall-span breakdown (n={len(bd)} sessions){note}")
-        print(f"  {'component':<28} {'mean':>7} {'p50':>7} {'p90':>7}")
+        print(f"  [turns with dynamo elapsed_s: {n_el}/{len(turns)}; "
+              f"queue segments drawn: {n_qseg}]")
+        print(f"  {'component':<28} {'mean':>7}")
         for key, label in (("gpu_active", "gpu_active (prefill+decode)"),
                            ("queue", "queue waiting"),
                            ("others", "others (tool+scaffold)")):
             vals = [d[key] for d in bd]
-            print(f"  {label:<28} {sum(vals)/len(vals):>7.3f} "
-                  f"{_percentile(vals, 50):>7.3f} "
-                  f"{_percentile(vals, 90):>7.3f}")
+            print(f"  {label:<28} {sum(vals)/len(vals):>7.3f}")
 
     if not args.no_figures:
         try:
-            fig_turn_llm_time(e0, ordered, out_dir / "fig1_turn_llm_time.pdf",
-                              sample_ords)
+            fig_turn_llm_time(e0, grouped,
+                              out_dir / "fig1_turn_llm_time.pdf",
+                              grouped_bounds)
             e0.fig_llm_time_cdf(turns, out_dir / "fig2_llm_time_cdf.pdf")
             fig_hit_vs_kv(e0, ordered, kv, out_dir / "fig3_hit_vs_kv.pdf",
-                          sample_ords, samples_abs, prefix_hit=prefix_hit,
+                          grouped_bounds, samples_abs, prefix_hit=prefix_hit,
                           events=events, turns=turns)
             e0.fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
             fig_eviction_vs_displacement(

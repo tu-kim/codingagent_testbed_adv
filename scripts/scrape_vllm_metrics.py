@@ -106,6 +106,12 @@ DEFAULT_METRIC_NAMES = frozenset({
     # Token throughput counters (cumulative; analyze_vllm_metrics derives delta+rate)
     "vllm:prompt_tokens_total",
     "vllm:generation_tokens_total",
+    # Per-request prefill compute time (histogram _sum/_count only; no
+    # buckets needed). Denominator for "LMCache retrieve transfer time as
+    # a share of total prefill" in e1 (onboard rides TTFT, so transfer
+    # cost surfaces inside prefill).
+    "vllm:request_prefill_time_seconds_sum",
+    "vllm:request_prefill_time_seconds_count",
 })
 
 # KVBM (dynamo KV Block Manager) exposes a SEPARATE Prometheus endpoint
