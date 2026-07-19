@@ -1256,16 +1256,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--trace", required=True, type=Path)
     ap.add_argument("--metrics", type=Path, default=None,
                     help="vLLM scrape NDJSON for the KV-usage + prefix-hit "
-                         "panel (fig3) and the LMCache panels (fig7)")
+                         "panel (fig3) and the LMCache panels (fig7). "
+                         "Default: <logs>/vllm_metrics.ndjson when --logs "
+                         "is given and the file exists")
     ap.add_argument("--frontend", type=Path, default=None,
                     help="dynamo frontend.log: joins elapsed_ms/ttft_ms by "
                          "request_id for fig8 (queue share) and fig9 "
-                         "(retrieve/TTFT share)")
+                         "(retrieve/TTFT share). Default: <logs>/frontend.log "
+                         "when --logs is given and the file exists")
     ap.add_argument("--logs", type=Path, default=None,
-                    help="worker logs dir (SCHED_DELAY lines). Joins engine "
-                         "queue wait by request_id so the session breakdown "
-                         "can split queue from LLM-active; without it queue "
-                         "is counted inside LLM-active")
+                    help="logs/ dir: vllm-*.log (SCHED_DELAY + LMCache "
+                         "lines) and, unless overridden, frontend.log and "
+                         "vllm_metrics.ndjson are auto-picked from here too")
     ap.add_argument("--compaction-drop-ratio", type=float, default=0.6,
                     help="fig5/6: a reuse shortfall is COMPACTION (not "
                          "eviction) when effective_input(N) < ratio * "
@@ -1283,6 +1285,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
+    # --logs is the one-stop logs/ dir: auto-pick the frontend log and the
+    # scrape NDJSON from it unless explicitly overridden.
+    if args.logs is not None and args.logs.is_dir():
+        if args.frontend is None and (args.logs / "frontend.log").exists():
+            args.frontend = args.logs / "frontend.log"
+        if args.metrics is None \
+                and (args.logs / "vllm_metrics.ndjson").exists():
+            args.metrics = args.logs / "vllm_metrics.ndjson"
 
     if not args.profiles.is_dir():
         print(f"error: profiles dir not found: {args.profiles}", file=sys.stderr)
