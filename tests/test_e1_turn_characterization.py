@@ -642,3 +642,87 @@ def test_main_missing_trace_returns_2(mod, tmp_path):
     prof = tmp_path / "profiles"; prof.mkdir()
     rc = mod.main(["--profiles", str(prof), "--trace", str(tmp_path / "no")])
     assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# parse_lmcache_retrieves (db96d81) — vllm-*.log lookup/retrieve line join.
+# ---------------------------------------------------------------------------
+
+def _lookup_line(rid_full, total, hit, need):
+    return (f"LMCache INFO: Reqid: {rid_full}, Total tokens {total}, "
+            f"Inference Engine computed tokens: 0, LMCache hit tokens: {hit}, "
+            f"need to load: {need}\n")
+
+
+def _retrieve_line(got, req, hit, cost_ms, size_gb=1.0, tput=5.0):
+    return (f"Retrieved {got} out of {req} required tokens (from {hit} total "
+            f"tokens). size: {size_gb} gb, cost {cost_ms} ms, "
+            f"throughput: {tput} GB/s\n")
+
+
+def test_parse_lmcache_retrieves_dedup_waits_and_strip_suffix(mod, tmp_path):
+    """Two duplicate lookups (repeated scheduler-step lines) then one
+    Retrieved line -> waits==2, cost/tokens taken from the retrieve, and
+    the request key has the engine '-<suffix>' stripped off."""
+    rid_uuid = "12345678-1234-5678-1234-567812345678"
+    rid_full = f"{rid_uuid}-a5412fb6"
+    log = tmp_path / "vllm-0.log"
+    log.write_text(
+        _lookup_line(rid_full, 51968, 51968, 0)
+        + _lookup_line(rid_full, 51968, 51968, 0)
+        + _retrieve_line(51968, 51968, 51968, 226.8057)
+    )
+    out = mod.parse_lmcache_retrieves(tmp_path)
+    assert list(out) == [rid_uuid]
+    rec = out[rid_uuid]
+    assert rec["waits"] == 2
+    assert rec["cost_ms"] == pytest.approx(226.8057)
+    assert rec["tokens"] == 51968
+    assert rec["hit_tokens"] == 51968
+
+
+def test_parse_lmcache_retrieves_two_interleaved_requests_by_hit_count(mod, tmp_path):
+    """Two requests with DIFFERENT hit counts interleaved in the log: each
+    Retrieved line must attach to the lookup with the matching hit count,
+    not to whichever lookup came most recently overall."""
+    rid_a = "aaaaaaaa-1111-1111-1111-111111111111-a1"
+    rid_b = "bbbbbbbb-2222-2222-2222-222222222222-b2"
+    log = tmp_path / "vllm-0.log"
+    log.write_text(
+        _lookup_line(rid_a, 1000, 100, 900)
+        + _lookup_line(rid_b, 2000, 200, 1800)
+        + _retrieve_line(100, 900, 100, 10.0)   # matches A (hit=100)
+        + _retrieve_line(200, 1800, 200, 20.0)  # matches B (hit=200)
+    )
+    out = mod.parse_lmcache_retrieves(tmp_path)
+    assert out["aaaaaaaa-1111-1111-1111-111111111111"]["cost_ms"] == pytest.approx(10.0)
+    assert out["bbbbbbbb-2222-2222-2222-222222222222"]["cost_ms"] == pytest.approx(20.0)
+
+
+def test_parse_lmcache_retrieves_unmatched_retrieve_dropped(mod, tmp_path):
+    """A Retrieved line whose hit count matches no prior lookup is silently
+    dropped, not attached to some other request."""
+    rid = "cccccccc-3333-3333-3333-333333333333-c3"
+    log = tmp_path / "vllm-0.log"
+    log.write_text(
+        _lookup_line(rid, 500, 50, 450)
+        + _retrieve_line(999, 999, 777, 15.0)  # hit=777 matches nothing
+    )
+    out = mod.parse_lmcache_retrieves(tmp_path)
+    assert out == {}
+
+
+def test_parse_lmcache_retrieves_last_retrieve_wins(mod, tmp_path):
+    """Repeated transfer for the same request (same hit count re-looked-up
+    then retrieved twice) -> the LAST Retrieved line's values are kept."""
+    rid_full = "dddddddd-4444-4444-4444-444444444444-d4"
+    log = tmp_path / "vllm-0.log"
+    log.write_text(
+        _lookup_line(rid_full, 800, 80, 720)
+        + _retrieve_line(80, 720, 80, 5.0)
+        + _lookup_line(rid_full, 800, 80, 720)
+        + _retrieve_line(80, 720, 80, 9.0)
+    )
+    out = mod.parse_lmcache_retrieves(tmp_path)
+    assert out["dddddddd-4444-4444-4444-444444444444"]["cost_ms"] == pytest.approx(9.0)
+    assert out["dddddddd-4444-4444-4444-444444444444"]["waits"] == 2
