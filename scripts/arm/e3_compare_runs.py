@@ -136,12 +136,16 @@ def fig_share_by_run(e0, per_run: dict[str, list], path: Path) -> None:
                 for b in parts["bodies"]:
                     b.set_facecolor(colors[comp])
                     b.set_alpha(0.6)
+                parts["cmedians"].set_color("black")
             else:
-                ax.scatter([pos], shares[:1], color=colors[comp], s=12)
+                ax.scatter([pos], shares[:1], color="black", s=12)
+            # black vertical min-max line through the violin
+            ax.vlines(pos, min(shares), max(shares), color="black",
+                      lw=0.9, zorder=2)
             mean = sum(shares) / len(shares)
-            ax.scatter([pos], [mean], color="tab:red", marker="D", s=18,
+            ax.scatter([pos], [mean], color="black", marker="D", s=18,
                        zorder=3)
-            ax.text(pos, mean, f" {mean:.2f}", color="tab:red", fontsize=7,
+            ax.text(pos, mean, f" {mean:.2f}", color="black", fontsize=7,
                     va="bottom", ha="left", zorder=4)
             pos += 1
         ticks.append(group_center)
@@ -152,7 +156,7 @@ def fig_share_by_run(e0, per_run: dict[str, list], path: Path) -> None:
     ax.set_ylim(0, 1.05)
     for comp in COMPONENTS:
         ax.plot([], [], color=colors[comp], lw=6, alpha=0.6, label=comp)
-    ax.scatter([], [], color="tab:red", marker="D", s=18, label="mean")
+    ax.scatter([], [], color="black", marker="D", s=18, label="mean")
     ax.legend(fontsize=8, framealpha=0.7, ncol=4)
     ax.set_title("Per-request latency-component share by run "
                  "(llm / tool / scaffold)")
