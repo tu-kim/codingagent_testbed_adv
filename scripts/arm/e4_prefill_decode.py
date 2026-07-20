@@ -15,20 +15,21 @@ Outputs (into --out):
                             decode_ms, itl_ms, output_tokens, decode_share
   fig1_prefill_decode.pdf   left: prefill_ms vs decode_ms histograms
                             (log x); right: decode-ratio distribution
-  fig2_batch_size_scrape.pdf     batch size by ROLE (prefill/decode),
-                            zeros excluded, from --metrics
-                            (vllm:num_requests_running)
-  fig3_batch_size_worker_log.pdf batch size by WORKER from --logs
-                            vllm-*.log 'Running: N reqs', zeros excluded
+  fig2_batch_size.pdf       batch size by ROLE (prefill/decode), zeros
+                            excluded, from --metrics
+                            (vllm:num_requests_running), CLIPPED to the
+                            frontend run window (first request start ->
+                            last completion) so leading/trailing idle
+                            scrape ticks don't skew the distribution
   stdout                    mean/p50/p90 of each quantity (+ batch size)
 
 Note: frontend.log carries NO batch/concurrency field — batch size comes
-from the scrape gauge (--metrics) or the engine-stats line (--logs).
+from the scrape gauge (--metrics). Both are interval snapshots, so short
+prefill bursts are under-sampled (see also the run-window clip).
 
 Usage:
   scripts/arm/e4_prefill_decode.py --frontend logs/frontend.log \
-      [--metrics logs/vllm_metrics.ndjson] [--logs logs/] \
-      [--out <dir>] [--no-figures]
+      [--metrics logs/vllm_metrics.ndjson] [--out <dir>] [--no-figures]
 """
 
 from __future__ import annotations
@@ -44,12 +45,28 @@ _REQID_RE = re.compile(r'(?:\b|")request_id\b"?\s*[=:]\s*"?(?P<v>[^\s",}]+)"?')
 _ELAPSED_RE = re.compile(r'(?:\b|")elapsed_ms\b"?\s*[=:]\s*"?(?P<v>\d+)"?')
 _TTFT_RE = re.compile(r'(?:\b|")ttft_ms\b"?\s*[=:]\s*"?(?P<v>[\d.]+)"?')
 _OUT_RE = re.compile(r'(?:\b|")output_tokens\b"?\s*[=:]\s*"?(?P<v>\d+)"?')
+# leading ISO-8601 timestamp of the log line (dynamo default): the moment
+# the request COMPLETED.
+_ISO_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
+
+
+def _iso_to_unix(s: str) -> float | None:
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def parse_frontend(path: Path) -> list[dict]:
     """Per-request dicts with elapsed_ms/ttft_ms/output_tokens and the
-    derived prefill_ms/decode_ms/itl_ms/decode_share. Lines missing any
-    of the three source fields, or with decode_ms < 0 (clock skew), are
+    derived prefill_ms/decode_ms/itl_ms/decode_share, plus completed_unix_s
+    (the log line's ISO timestamp) when parseable. Lines missing any of
+    the three source fields, or with decode_ms < 0 (clock skew), are
     dropped. Last write wins on duplicate request_id."""
     by_rid: dict[str, dict] = {}
     with path.open(encoding="utf-8", errors="replace") as f:
@@ -70,6 +87,8 @@ def parse_frontend(path: Path) -> list[dict]:
             if decode < 0:
                 continue
             itl = decode / max(out - 1, 1)
+            tsm = _ISO_RE.match(line)
+            completed = _iso_to_unix(tsm.group("ts")) if tsm else None
             by_rid[rid.group("v")] = {
                 "request_id": rid.group("v"),
                 "elapsed_ms": elapsed,
@@ -78,18 +97,38 @@ def parse_frontend(path: Path) -> list[dict]:
                 "itl_ms": itl,
                 "output_tokens": out,
                 "decode_share": (decode / elapsed) if elapsed > 0 else 0.0,
+                "completed_unix_s": completed,
             }
     return list(by_rid.values())
 
 
+def run_window(rows: list[dict]) -> tuple[float, float] | None:
+    """(lo, hi) unix seconds spanning the run: earliest request START
+    (completed_unix_s - elapsed_ms/1000) to latest completion. None when
+    no line carried a parseable timestamp."""
+    starts, ends = [], []
+    for r in rows:
+        c = r.get("completed_unix_s")
+        if c is None:
+            continue
+        ends.append(c)
+        starts.append(c - r["elapsed_ms"] / 1000.0)
+    if not ends:
+        return None
+    return min(starts), max(ends)
+
+
 def load_batch_sizes(metrics_path: Path,
+                     window: tuple[float, float] | None = None,
                      metric: str = "vllm:num_requests_running"
                      ) -> dict[str, list[float]]:
     """{role: [running-batch sizes]} per scrape-tick/worker, grouped by
     the row's `role` (prefill / decode / agg). NON-ZERO samples only —
     a 0 means the engine was idle at that poll (between requests; for
     prefill it's mostly the poller missing the short prefill burst), not
-    a real batch. ok:false rows and missing-metric ticks skipped."""
+    a real batch. When `window` (lo, hi) is given, only ticks whose ts is
+    inside [lo, hi] are kept (clips the scrape's pre/post-run idle tail).
+    ok:false rows and missing-metric ticks skipped."""
     import json
     out: dict[str, list[float]] = {}
     with metrics_path.open(encoding="utf-8", errors="replace") as fh:
@@ -103,6 +142,10 @@ def load_batch_sizes(metrics_path: Path,
                 continue
             if not row.get("ok"):
                 continue
+            if window is not None:
+                ts = row.get("ts")
+                if ts is None or ts < window[0] or ts > window[1]:
+                    continue
             series = (row.get("metrics") or {}).get(metric)
             if not series:
                 continue
@@ -111,30 +154,6 @@ def load_batch_sizes(metrics_path: Path,
                 v = e.get("value")
                 if isinstance(v, (int, float)) and v > 0:
                     out.setdefault(role, []).append(float(v))
-    return out
-
-
-_RUNNING_RE = re.compile(r"Running:\s*(?P<n>\d+)\s*reqs")
-
-
-def load_batch_sizes_from_worker_logs(logs: Path) -> dict[str, list[float]]:
-    """{worker: [running-batch sizes]} from each vllm-*.log's periodic
-    engine-stats line ('Running: N reqs'). NON-ZERO only. This is the
-    engine's own scheduler count at its logging interval — closer to the
-    true running batch than the 1s scrape gauge. Role is not in the log
-    line; the worker name (file stem) is the key. frontend.log carries
-    NO batch/concurrency field, so it cannot supply this."""
-    out: dict[str, list[float]] = {}
-    files = [logs] if logs.is_file() else sorted(logs.glob("vllm-*.log"))
-    for fpath in files:
-        worker = fpath.stem.replace("vllm-", "")
-        with fpath.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                mm = _RUNNING_RE.search(line)
-                if mm:
-                    n = int(mm.group("n"))
-                    if n > 0:
-                        out.setdefault(worker, []).append(float(n))
     return out
 
 
@@ -254,12 +273,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--metrics", type=Path, default=None,
                     help="vLLM scrape NDJSON (logs/vllm_metrics.ndjson): "
                          "running-batch-size distribution split by role "
-                         "(prefill/decode), zeros excluded")
-    ap.add_argument("--logs", type=Path, default=None,
-                    help="worker logs dir/file: batch size from each "
-                         "vllm-*.log 'Running: N reqs' engine-stats line "
-                         "(per worker; the engine's own count, zeros "
-                         "excluded)")
+                         "(prefill/decode), zeros excluded, clipped to the "
+                         "frontend run window")
     ap.add_argument("--out", type=Path, default=Path("e4_prefill_decode"))
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -299,39 +314,32 @@ def main(argv: list[str] | None = None) -> int:
 
     batch_by_role: dict[str, list[float]] = {}
     if args.metrics is not None and args.metrics.exists():
-        batch_by_role = load_batch_sizes(args.metrics)
+        window = run_window(rows)
+        if window is not None:
+            print(f"clip window (frontend): "
+                  f"{window[1] - window[0]:.0f}s of activity")
+        else:
+            print("clip window: no parseable frontend timestamps "
+                  "(scrape NOT clipped)")
+        batch_by_role = load_batch_sizes(args.metrics, window)
         if batch_by_role:
-            print("running batch size by role (scrape, zeros excluded):")
+            print("running batch size by role "
+                  "(scrape, zeros excluded, clipped):")
             for role in sorted(batch_by_role):
                 vals = batch_by_role[role]
                 _stat_row(role, vals, "{:.1f}")
                 print(f"    {role} min {min(vals):.0f} max {max(vals):.0f}")
         else:
             print("  batch_size: no non-zero vllm:num_requests_running "
-                  "in scrape")
-
-    batch_by_worker: dict[str, list[float]] = {}
-    if args.logs is not None and args.logs.exists():
-        batch_by_worker = load_batch_sizes_from_worker_logs(args.logs)
-        if batch_by_worker:
-            print("running batch size by worker (vllm-*.log 'Running: N "
-                  "reqs', zeros excluded):")
-            for w in sorted(batch_by_worker):
-                _stat_row(w, batch_by_worker[w], "{:.1f}")
-        else:
-            print("  batch_size: no 'Running: N reqs' lines in worker logs")
+                  "in the window")
 
     if not args.no_figures:
         try:
             fig_prefill_decode(rows, args.out / "fig1_prefill_decode.pdf")
             if batch_by_role:
                 fig_batch_sizes(batch_by_role,
-                                args.out / "fig2_batch_size_scrape.pdf",
-                                "scrape num_requests_running")
-            if batch_by_worker:
-                fig_batch_sizes(batch_by_worker,
-                                args.out / "fig3_batch_size_worker_log.pdf",
-                                "vllm-*.log Running reqs")
+                                args.out / "fig2_batch_size.pdf",
+                                "scrape num_requests_running, clipped")
         except ImportError:
             print("matplotlib/numpy unavailable -- figure skipped",
                   file=sys.stderr)
