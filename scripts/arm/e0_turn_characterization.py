@@ -320,6 +320,36 @@ def _percentile_value(vals: list[float], q: float) -> float:
     return s[idx]
 
 
+def write_turn_stats_csv(turns: list, path: Path) -> None:
+    """turn_stats.csv: for each per-turn metric, mean / p50 / p90 / min /
+    max over the turns that carry it. Metrics: llm_time_s (dynamo elapsed
+    preference chain), tool_time_s (0 when no tool ran), output_tokens,
+    effective_input (= input + cache.read). NaN-safe: a metric with no
+    data emits an all-empty row."""
+    def series(fn):
+        return [v for v in (fn(t) for t in turns) if v is not None]
+
+    metrics = [
+        ("llm_time_s", series(_llm_time)),
+        ("tool_time_s", [(_tool_time(t) or 0.0) for t in turns]),
+        ("output_tokens", series(lambda t: getattr(t, "output_tokens", None))),
+        ("effective_input", series(lambda t: t.effective_input)),
+    ]
+    with path.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["metric", "n", "mean", "p50", "p90", "min", "max"])
+        for name, vals in metrics:
+            if not vals:
+                w.writerow([name, 0, "", "", "", "", ""])
+                continue
+            fvals = [float(v) for v in vals]
+            mean = sum(fvals) / len(fvals)
+            w.writerow([name, len(fvals), f"{mean:.4f}",
+                        f"{_percentile_value(fvals, 0.50):.4f}",
+                        f"{_percentile_value(fvals, 0.90):.4f}",
+                        f"{min(fvals):.4f}", f"{max(fvals):.4f}"])
+
+
 def bottom_pct_tool_dist(turns: list, cutoffs: list[float]) -> list[dict]:
     """For each cutoff q (e.g. 0.9), take turns whose LLM time (llm_time_s
     preference chain) is in the bottom q of the distribution, and report
@@ -925,8 +955,10 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out or (args.profiles / "e0")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Figures only. CSV side-outputs and the stdout digest are intentionally
-    # omitted for now (analyzed later off the figures / raw profiles).
+    # per-turn summary stats (mean/p50/p90/min/max per metric)
+    write_turn_stats_csv(turns, out_dir / "turn_stats.csv")
+    print(f"wrote {out_dir / 'turn_stats.csv'} ({len(turns)} turns)")
+
     if not args.no_figures:
         try:
             fig_turn_llm_time(ordered, out_dir / "fig1_turn_llm_time.pdf",
