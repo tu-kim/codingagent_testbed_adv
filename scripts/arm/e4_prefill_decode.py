@@ -330,23 +330,22 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
     itl = [r["itl_ms"] for r in rows if r["output_tokens"] > 1]
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(14, 5))
 
-    # left: prefill vs decode ms, shared log-spaced bins
-    pos = [v for v in prefill + decode if v > 0]
+    # left: prefill vs decode ms, shared log-spaced bins.
+    # prefill = the queue-removed value when the SCHED_DELAY join is
+    # available (prefill_net); raw ttft only as fallback without it.
+    pf = prefill_net if prefill_net else prefill
+    pos = [v for v in pf + decode if v > 0]
     if pos:
         lo, hi = min(pos), max(pos)
         bins = np.logspace(np.log10(max(lo, 1e-3)), np.log10(hi), 40)
-        axL.hist(prefill, bins=bins, alpha=0.55, color="tab:blue",
+        axL.hist(pf, bins=bins, alpha=0.55, color="tab:blue",
                  label="prefill")
-        if prefill_net:
-            axL.hist(prefill_net, bins=bins, alpha=0.45, color="tab:green",
-                     label="prefill w/o queue")
         axL.hist(decode, bins=bins, alpha=0.55, color="tab:orange",
                  label="decode")
         axL.set_xscale("log")
     axL.set_xlabel("time (ms)")
     axL.set_ylabel("requests")
-    for vals, c, name in ((prefill, "tab:blue", "prefill"),
-                          (prefill_net, "tab:green", "prefill_net"),
+    for vals, c, name in ((pf, "tab:blue", "prefill"),
                           (decode, "tab:orange", "decode")):
         if vals:
             mv = sum(vals) / len(vals)
