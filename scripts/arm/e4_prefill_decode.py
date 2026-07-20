@@ -122,9 +122,14 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
         axL.set_xscale("log")
     axL.set_xlabel("time (ms)")
     axL.set_ylabel("requests")
-    for vals, c in ((prefill, "tab:blue"), (decode, "tab:orange")):
+    for vals, c, name in ((prefill, "tab:blue", "prefill"),
+                          (decode, "tab:orange", "decode")):
         if vals:
-            axL.axvline(sum(vals) / len(vals), color=c, ls="--", lw=1.2)
+            mv = sum(vals) / len(vals)
+            axL.axvline(mv, color=c, ls="--", lw=1.2)
+            axL.text(mv, 0.98, f" {name} mean {mv:,.0f} ms", color=c,
+                     rotation=90, fontsize=8, va="top", ha="left",
+                     transform=axL.get_xaxis_transform())
     axL.set_title("Prefill vs decode time distribution")
     axL.legend(fontsize=9, framealpha=0.7)
 
