@@ -320,34 +320,35 @@ def _percentile_value(vals: list[float], q: float) -> float:
     return s[idx]
 
 
-def write_turn_stats_csv(turns: list, path: Path) -> None:
-    """turn_stats.csv: for each per-turn metric, mean / p50 / p90 / min /
-    max over the turns that carry it. Metrics: llm_time_s (dynamo elapsed
-    preference chain), tool_time_s (0 when no tool ran), output_tokens,
-    effective_input (= input + cache.read). NaN-safe: a metric with no
-    data emits an all-empty row."""
-    def series(fn):
-        return [v for v in (fn(t) for t in turns) if v is not None]
+def session_turn_counts(turns: list) -> dict[str, int]:
+    """{session_id: number of turns} over the given turns."""
+    counts: dict[str, int] = {}
+    for t in turns:
+        counts[t.session_id] = counts.get(t.session_id, 0) + 1
+    return counts
 
-    metrics = [
-        ("llm_time_s", series(_llm_time)),
-        ("tool_time_s", [(_tool_time(t) or 0.0) for t in turns]),
-        ("output_tokens", series(lambda t: getattr(t, "output_tokens", None))),
-        ("effective_input", series(lambda t: t.effective_input)),
-    ]
+
+def write_turn_stats_csv(turns: list, path: Path) -> None:
+    """turn_stats.csv: distribution of turns-per-SESSION. One detail row
+    per session (session_id, n_turns), then a summary row
+    (session_id='ALL') with mean / p50 / p90 / min / max of the per-
+    session turn counts."""
+    counts = session_turn_counts(turns)
     with path.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["metric", "n", "mean", "p50", "p90", "min", "max"])
-        for name, vals in metrics:
-            if not vals:
-                w.writerow([name, 0, "", "", "", "", ""])
-                continue
-            fvals = [float(v) for v in vals]
-            mean = sum(fvals) / len(fvals)
-            w.writerow([name, len(fvals), f"{mean:.4f}",
-                        f"{_percentile_value(fvals, 0.50):.4f}",
-                        f"{_percentile_value(fvals, 0.90):.4f}",
-                        f"{min(fvals):.4f}", f"{max(fvals):.4f}"])
+        w.writerow(["session_id", "n_turns"])
+        for sid in sorted(counts):
+            w.writerow([sid, counts[sid]])
+        vals = [float(c) for c in counts.values()]
+        if vals:
+            w.writerow([])
+            w.writerow(["stat", "value"])
+            w.writerow(["n_sessions", len(vals)])
+            w.writerow(["mean", f"{sum(vals)/len(vals):.4f}"])
+            w.writerow(["p50", f"{_percentile_value(vals, 0.50):.4f}"])
+            w.writerow(["p90", f"{_percentile_value(vals, 0.90):.4f}"])
+            w.writerow(["min", f"{min(vals):.0f}"])
+            w.writerow(["max", f"{max(vals):.0f}"])
 
 
 def bottom_pct_tool_dist(turns: list, cutoffs: list[float]) -> list[dict]:
@@ -955,9 +956,15 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out or (args.profiles / "e0")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # per-turn summary stats (mean/p50/p90/min/max per metric)
+    # per-session turn-count distribution (mean/p50/p90/min/max)
     write_turn_stats_csv(turns, out_dir / "turn_stats.csv")
-    print(f"wrote {out_dir / 'turn_stats.csv'} ({len(turns)} turns)")
+    counts = session_turn_counts(turns)
+    cvals = [float(c) for c in counts.values()]
+    print(f"turns per session (n={len(counts)}): "
+          f"mean {sum(cvals)/len(cvals):.2f}  "
+          f"p50 {_percentile_value(cvals, 0.5):.0f}  "
+          f"p90 {_percentile_value(cvals, 0.9):.0f}  "
+          f"min {min(cvals):.0f}  max {max(cvals):.0f}")
 
     if not args.no_figures:
         try:
