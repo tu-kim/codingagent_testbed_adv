@@ -15,13 +15,20 @@ Outputs (into --out):
                             decode_ms, itl_ms, output_tokens, decode_share
   fig1_prefill_decode.pdf   left: prefill_ms vs decode_ms histograms
                             (log x); right: decode-ratio distribution
-  fig2_batch_size.pdf       running-batch-size distribution (only with
-                            --metrics; vllm:num_requests_running)
+  fig2_batch_size_scrape.pdf     batch size by ROLE (prefill/decode),
+                            zeros excluded, from --metrics
+                            (vllm:num_requests_running)
+  fig3_batch_size_worker_log.pdf batch size by WORKER from --logs
+                            vllm-*.log 'Running: N reqs', zeros excluded
   stdout                    mean/p50/p90 of each quantity (+ batch size)
+
+Note: frontend.log carries NO batch/concurrency field — batch size comes
+from the scrape gauge (--metrics) or the engine-stats line (--logs).
 
 Usage:
   scripts/arm/e4_prefill_decode.py --frontend logs/frontend.log \
-      [--metrics logs/vllm_metrics.ndjson] [--out <dir>] [--no-figures]
+      [--metrics logs/vllm_metrics.ndjson] [--logs logs/] \
+      [--out <dir>] [--no-figures]
 """
 
 from __future__ import annotations
@@ -77,13 +84,14 @@ def parse_frontend(path: Path) -> list[dict]:
 
 def load_batch_sizes(metrics_path: Path,
                      metric: str = "vllm:num_requests_running"
-                     ) -> list[float]:
-    """Per scrape-tick, per worker: the running-batch size gauge
-    (vllm:num_requests_running = requests in the engine's current
-    running batch). Each (tick, worker) value is one sample. ok:false
-    rows and missing-metric ticks are skipped."""
+                     ) -> dict[str, list[float]]:
+    """{role: [running-batch sizes]} per scrape-tick/worker, grouped by
+    the row's `role` (prefill / decode / agg). NON-ZERO samples only —
+    a 0 means the engine was idle at that poll (between requests; for
+    prefill it's mostly the poller missing the short prefill burst), not
+    a real batch. ok:false rows and missing-metric ticks skipped."""
     import json
-    out: list[float] = []
+    out: dict[str, list[float]] = {}
     with metrics_path.open(encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
@@ -98,33 +106,63 @@ def load_batch_sizes(metrics_path: Path,
             series = (row.get("metrics") or {}).get(metric)
             if not series:
                 continue
+            role = str(row.get("role", "?"))
             for e in series:
                 v = e.get("value")
-                if isinstance(v, (int, float)):
-                    out.append(float(v))
+                if isinstance(v, (int, float)) and v > 0:
+                    out.setdefault(role, []).append(float(v))
     return out
 
 
-def fig_batch_sizes(sizes: list[float], path: Path) -> None:
+_RUNNING_RE = re.compile(r"Running:\s*(?P<n>\d+)\s*reqs")
+
+
+def load_batch_sizes_from_worker_logs(logs: Path) -> dict[str, list[float]]:
+    """{worker: [running-batch sizes]} from each vllm-*.log's periodic
+    engine-stats line ('Running: N reqs'). NON-ZERO only. This is the
+    engine's own scheduler count at its logging interval — closer to the
+    true running batch than the 1s scrape gauge. Role is not in the log
+    line; the worker name (file stem) is the key. frontend.log carries
+    NO batch/concurrency field, so it cannot supply this."""
+    out: dict[str, list[float]] = {}
+    files = [logs] if logs.is_file() else sorted(logs.glob("vllm-*.log"))
+    for fpath in files:
+        worker = fpath.stem.replace("vllm-", "")
+        with fpath.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                mm = _RUNNING_RE.search(line)
+                if mm:
+                    n = int(mm.group("n"))
+                    if n > 0:
+                        out.setdefault(worker, []).append(float(n))
+    return out
+
+
+def fig_batch_sizes(by_group: dict[str, list[float]], path: Path,
+                    source: str) -> None:
+    """Overlaid batch-size histograms, one per group (role or worker)."""
     plt = _mpl()
-    fig, ax = plt.subplots(figsize=(8, 5))
-    if sizes:
-        hi = int(max(sizes))
+    fig, ax = plt.subplots(figsize=(9, 5))
+    groups = {g: v for g, v in by_group.items() if v}
+    if groups:
+        hi = int(max(max(v) for v in groups.values()))
         bins = range(0, hi + 2)
-        ax.hist(sizes, bins=bins, color="tab:purple", alpha=0.8,
-                align="left")
-        mean = sum(sizes) / len(sizes)
-        ax.axvline(mean, color="tab:red", ls="--", lw=1.2,
-                   label=f"mean {mean:.1f}")
-        ax.axvline(_pct(sizes, 0.5), color="tab:orange", ls=":", lw=1.2,
-                   label=f"p50 {_pct(sizes, 0.5):.0f}")
+        palette = ["tab:blue", "tab:orange", "tab:green", "tab:purple",
+                   "tab:red", "tab:brown"]
+        for i, (g, vals) in enumerate(sorted(groups.items())):
+            c = palette[i % len(palette)]
+            mean = sum(vals) / len(vals)
+            ax.hist(vals, bins=bins, color=c, alpha=0.5, align="left",
+                    label=f"{g} (mean {mean:.1f})")
+            ax.axvline(mean, color=c, ls="--", lw=1.2)
         ax.legend(fontsize=9, framealpha=0.7)
     else:
-        ax.text(0.5, 0.5, "no batch-size samples", transform=ax.transAxes,
-                ha="center", va="center", color="grey")
-    ax.set_xlabel("running batch size (num_requests_running)")
-    ax.set_ylabel("scrape ticks")
-    ax.set_title("Running batch size distribution")
+        ax.text(0.5, 0.5, "no non-zero batch samples",
+                transform=ax.transAxes, ha="center", va="center",
+                color="grey")
+    ax.set_xlabel("running batch size (non-zero)")
+    ax.set_ylabel("samples")
+    ax.set_title(f"Running batch size distribution ({source})")
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -215,8 +253,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="dynamo frontend.log")
     ap.add_argument("--metrics", type=Path, default=None,
                     help="vLLM scrape NDJSON (logs/vllm_metrics.ndjson): "
-                         "adds the running-batch-size distribution "
-                         "(vllm:num_requests_running)")
+                         "running-batch-size distribution split by role "
+                         "(prefill/decode), zeros excluded")
+    ap.add_argument("--logs", type=Path, default=None,
+                    help="worker logs dir/file: batch size from each "
+                         "vllm-*.log 'Running: N reqs' engine-stats line "
+                         "(per worker; the engine's own count, zeros "
+                         "excluded)")
     ap.add_argument("--out", type=Path, default=Path("e4_prefill_decode"))
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -254,23 +297,41 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  aggregate prefill:decode = "
               f"{tot_p/(tot_p+tot_d):.1%} : {tot_d/(tot_p+tot_d):.1%}")
 
-    batch_sizes: list[float] = []
+    batch_by_role: dict[str, list[float]] = {}
     if args.metrics is not None and args.metrics.exists():
-        batch_sizes = load_batch_sizes(args.metrics)
-        if batch_sizes:
-            _stat_row("batch_size", batch_sizes, "{:.1f}")
-            print(f"  batch_size min {min(batch_sizes):.0f}  "
-                  f"max {max(batch_sizes):.0f}  "
-                  f"n={len(batch_sizes)} scrape samples")
+        batch_by_role = load_batch_sizes(args.metrics)
+        if batch_by_role:
+            print("running batch size by role (scrape, zeros excluded):")
+            for role in sorted(batch_by_role):
+                vals = batch_by_role[role]
+                _stat_row(role, vals, "{:.1f}")
+                print(f"    {role} min {min(vals):.0f} max {max(vals):.0f}")
         else:
-            print("  batch_size: no vllm:num_requests_running in scrape")
+            print("  batch_size: no non-zero vllm:num_requests_running "
+                  "in scrape")
+
+    batch_by_worker: dict[str, list[float]] = {}
+    if args.logs is not None and args.logs.exists():
+        batch_by_worker = load_batch_sizes_from_worker_logs(args.logs)
+        if batch_by_worker:
+            print("running batch size by worker (vllm-*.log 'Running: N "
+                  "reqs', zeros excluded):")
+            for w in sorted(batch_by_worker):
+                _stat_row(w, batch_by_worker[w], "{:.1f}")
+        else:
+            print("  batch_size: no 'Running: N reqs' lines in worker logs")
 
     if not args.no_figures:
         try:
             fig_prefill_decode(rows, args.out / "fig1_prefill_decode.pdf")
-            if batch_sizes:
-                fig_batch_sizes(batch_sizes,
-                                args.out / "fig2_batch_size.pdf")
+            if batch_by_role:
+                fig_batch_sizes(batch_by_role,
+                                args.out / "fig2_batch_size_scrape.pdf",
+                                "scrape num_requests_running")
+            if batch_by_worker:
+                fig_batch_sizes(batch_by_worker,
+                                args.out / "fig3_batch_size_worker_log.pdf",
+                                "vllm-*.log Running reqs")
         except ImportError:
             print("matplotlib/numpy unavailable -- figure skipped",
                   file=sys.stderr)
