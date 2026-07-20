@@ -172,6 +172,96 @@ def load_batch_sizes(metrics_path: Path,
     return out
 
 
+def load_queue_hist(metrics_path: Path,
+                    window: tuple[float, float] | None = None
+                    ) -> dict[str, dict]:
+    """Per role: engine queue-wait stats over the window, from the
+    vllm:request_queue_time_seconds histogram (cumulative _sum/_count/
+    _bucket; per-role first/last snapshot inside the window -> deltas).
+    Returns {role: {total_s, n_requests, mean_s, p50_s, p90_s}} — p50/p90
+    are linear-interpolated within the winning bucket (upper-bounded by
+    each bucket's le), NaN when the delta-count is 0. Buckets are summed
+    across a role's workers per tick."""
+    import json
+    import math
+
+    def bucket_le(entry) -> float | None:
+        le = (entry.get("labels") or {}).get("le")
+        if le is None:
+            return None
+        return float("inf") if le in ("+Inf", "inf") else float(le)
+
+    # (role) -> {"sum": (first,last), "count": (first,last),
+    #            "buckets": {le: (first,last)}}
+    acc: dict[str, dict] = {}
+    with metrics_path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not row.get("ok"):
+                continue
+            if window is not None:
+                ts = row.get("ts")
+                if ts is None or ts < window[0] or ts > window[1]:
+                    continue
+            metrics = row.get("metrics") or {}
+            role = str(row.get("role", "?"))
+            a = acc.setdefault(role, {"sum": None, "count": None,
+                                      "buckets": {}})
+            for key, name in (("sum", "vllm:request_queue_time_seconds_sum"),
+                              ("count",
+                               "vllm:request_queue_time_seconds_count")):
+                series = metrics.get(name)
+                if series:
+                    v = sum(e.get("value", 0.0) for e in series
+                            if isinstance(e.get("value"), (int, float)))
+                    first = a[key][0] if a[key] else v
+                    a[key] = (first, v)
+            series = metrics.get("vllm:request_queue_time_seconds_bucket")
+            if series:
+                by_le: dict[float, float] = {}
+                for e in series:
+                    le = bucket_le(e)
+                    v = e.get("value")
+                    if le is not None and isinstance(v, (int, float)):
+                        by_le[le] = by_le.get(le, 0.0) + float(v)
+                for le, v in by_le.items():
+                    first = a["buckets"][le][0] if le in a["buckets"] else v
+                    a["buckets"][le] = (first, v)
+
+    out: dict[str, dict] = {}
+    for role, a in acc.items():
+        if not a["sum"] or not a["count"]:
+            continue
+        d_sum = max(0.0, a["sum"][1] - a["sum"][0])
+        d_cnt = max(0.0, a["count"][1] - a["count"][0])
+        stats = {"total_s": d_sum, "n_requests": d_cnt,
+                 "mean_s": (d_sum / d_cnt) if d_cnt > 0 else math.nan,
+                 "p50_s": math.nan, "p90_s": math.nan}
+        deltas = sorted((le, max(0.0, last - first))
+                        for le, (first, last) in a["buckets"].items())
+        total = deltas[-1][1] if deltas else 0.0   # +Inf bucket delta
+        if total > 0:
+            for pname, q in (("p50_s", 0.5), ("p90_s", 0.9)):
+                target = q * total
+                prev_le, prev_c = 0.0, 0.0
+                for le, c in deltas:
+                    if c >= target:
+                        span = c - prev_c
+                        frac = ((target - prev_c) / span) if span > 0 else 1.0
+                        hi = le if le != float("inf") else prev_le
+                        stats[pname] = prev_le + (hi - prev_le) * frac
+                        break
+                    prev_le, prev_c = le, c
+        out[role] = stats
+    return out
+
+
 def fig_batch_sizes(by_group: dict[str, list[float]], path: Path,
                     source: str) -> None:
     """Overlaid batch-size histograms, one per group (role or worker)."""
@@ -381,6 +471,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("  batch_size: no non-zero vllm:num_requests_running "
                   "in the window")
+        qh = load_queue_hist(args.metrics, window)
+        if qh:
+            print("engine queue wait by role (scrape "
+                  "request_queue_time histogram, clipped):")
+            for role in sorted(qh):
+                s = qh[role]
+                print(f"  {role:<10} total {s['total_s']:.1f}s  "
+                      f"n {s['n_requests']:.0f}  mean {s['mean_s']:.3f}s  "
+                      f"p50 {s['p50_s']:.3f}s  p90 {s['p90_s']:.3f}s")
+        else:
+            print("  queue wait: no vllm:request_queue_time_seconds in "
+                  "the window")
 
     if not args.no_figures:
         try:
