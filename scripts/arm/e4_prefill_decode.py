@@ -6,6 +6,8 @@ output_tokens. From those, per request:
 
   prefill_ms = ttft_ms                 (request received -> first token;
                                         includes engine queue + prefill)
+  prefill_net_ms = ttft_ms - queue_ms  (queue-removed prefill; needs the
+                                        --logs SCHED_DELAY join)
   decode_ms  = elapsed_ms - ttft_ms    (first token -> last token)
   itl_ms     = decode_ms / max(output_tokens - 1, 1)   (per-token latency)
   decode_share = decode_ms / elapsed_ms
@@ -36,9 +38,22 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import re
 import sys
 from pathlib import Path
+
+_ATS_PATH = Path(__file__).resolve().parents[1] / "analyze_turn_scheduling.py"
+
+
+def _load_ats():
+    spec = importlib.util.spec_from_file_location("analyze_turn_scheduling",
+                                                  _ATS_PATH)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["analyze_turn_scheduling"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHJ]")
 _REQID_RE = re.compile(r'(?:\b|")request_id\b"?\s*[=:]\s*"?(?P<v>[^\s",}]+)"?')
@@ -218,6 +233,8 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
     plt = _mpl()
     import numpy as np
     prefill = [r["prefill_ms"] for r in rows]
+    prefill_net = [r["prefill_net_ms"] for r in rows
+                   if "prefill_net_ms" in r]
     decode = [r["decode_ms"] for r in rows]
     share = [r["decode_share"] for r in rows]
     itl = [r["itl_ms"] for r in rows if r["output_tokens"] > 1]
@@ -230,12 +247,16 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
         bins = np.logspace(np.log10(max(lo, 1e-3)), np.log10(hi), 40)
         axL.hist(prefill, bins=bins, alpha=0.55, color="tab:blue",
                  label="prefill")
+        if prefill_net:
+            axL.hist(prefill_net, bins=bins, alpha=0.45, color="tab:green",
+                     label="prefill w/o queue")
         axL.hist(decode, bins=bins, alpha=0.55, color="tab:orange",
                  label="decode")
         axL.set_xscale("log")
     axL.set_xlabel("time (ms)")
     axL.set_ylabel("requests")
     for vals, c, name in ((prefill, "tab:blue", "prefill"),
+                          (prefill_net, "tab:green", "prefill_net"),
                           (decode, "tab:orange", "decode")):
         if vals:
             mv = sum(vals) / len(vals)
@@ -275,6 +296,11 @@ def main(argv: list[str] | None = None) -> int:
                          "running-batch-size distribution split by role "
                          "(prefill/decode), zeros excluded, clipped to the "
                          "frontend run window")
+    ap.add_argument("--logs", type=Path, default=None,
+                    help="worker logs dir (SCHED_DELAY lines): joins the "
+                         "engine queue wait by request_id so prefill_net_ms "
+                         "= ttft - queue_ms (queue-removed prefill) can be "
+                         "computed")
     ap.add_argument("--out", type=Path, default=Path("e4_prefill_decode"))
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -289,12 +315,30 @@ def main(argv: list[str] | None = None) -> int:
               "elapsed_ms/ttft_ms/output_tokens", file=sys.stderr)
         return 2
 
+    # SCHED_DELAY join: queue-removed prefill (prefill_net = ttft - queue).
+    n_q = 0
+    if args.logs is not None and args.logs.exists():
+        ats = _load_ats()
+        sched = ats.load_sched(args.logs)
+        for r in rows:
+            rec = sched.get(r["request_id"])
+            if rec is None:
+                continue
+            q = rec.total_queue_ms
+            if q is not None and 0 <= q <= r["prefill_ms"]:
+                r["queue_ms"] = q
+                r["prefill_net_ms"] = r["prefill_ms"] - q
+                n_q += 1
+        print(f"queue join: {n_q}/{len(rows)} requests matched a "
+              f"SCHED_DELAY record")
+
     args.out.mkdir(parents=True, exist_ok=True)
     csv_path = args.out / "prefill_decode.csv"
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
-            "request_id", "elapsed_ms", "prefill_ms", "decode_ms",
-            "itl_ms", "output_tokens", "decode_share"])
+            "request_id", "elapsed_ms", "prefill_ms", "queue_ms",
+            "prefill_net_ms", "decode_ms", "itl_ms", "output_tokens",
+            "decode_share", "completed_unix_s"], extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow({k: (f"{v:.4f}" if isinstance(v, float) else v)
@@ -302,6 +346,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"parsed {len(rows)} requests")
     _stat_row("prefill_ms", [r["prefill_ms"] for r in rows])
+    if n_q:
+        _stat_row("queue_ms", [r["queue_ms"] for r in rows
+                               if "queue_ms" in r])
+        _stat_row("prefill_net_ms", [r["prefill_net_ms"] for r in rows
+                                     if "prefill_net_ms" in r])
     _stat_row("decode_ms", [r["decode_ms"] for r in rows])
     _stat_row("elapsed_ms", [r["elapsed_ms"] for r in rows])
     _stat_row("itl_ms", [r["itl_ms"] for r in rows if r["output_tokens"] > 1])
