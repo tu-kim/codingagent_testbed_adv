@@ -127,7 +127,7 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
         if vals:
             mv = sum(vals) / len(vals)
             axL.axvline(mv, color=c, ls="--", lw=1.2)
-            axL.text(mv, 0.98, f" {name} mean {mv:,.0f} ms", color=c,
+            axL.text(mv, 0.98, f" {mv:,.0f} ms", color=c,
                      rotation=90, fontsize=8, va="top", ha="left",
                      transform=axL.get_xaxis_transform())
     axL.set_title("Prefill vs decode time distribution")
@@ -145,11 +145,7 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
     axR.set_xlim(0, 100)
     axR.set_xlabel("Decode Ratio (%)")
     axR.set_ylabel("requests")
-    itl_txt = ""
-    if itl:
-        itl_txt = (f"\nITL mean {sum(itl)/len(itl):.1f} ms  "
-                   f"p50 {_pct(itl, 0.5):.1f}  p90 {_pct(itl, 0.9):.1f}")
-    axR.set_title("Decode Time Ratio of E2E" + itl_txt)
+    axR.set_title("Decode Time Ratio of E2E")
     axR.legend(fontsize=9, framealpha=0.7)
 
     fig.tight_layout()
