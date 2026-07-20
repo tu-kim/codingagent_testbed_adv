@@ -14,13 +14,14 @@ Outputs (into --out):
   prefill_decode.csv        per request: request_id, elapsed_ms, prefill_ms,
                             decode_ms, itl_ms, output_tokens, decode_share
   fig1_prefill_decode.pdf   left: prefill_ms vs decode_ms histograms
-                            (log x); right: decode_share distribution +
-                            ITL histogram inset stats
-  stdout                    mean/p50/p90 of each quantity
+                            (log x); right: decode-ratio distribution
+  fig2_batch_size.pdf       running-batch-size distribution (only with
+                            --metrics; vllm:num_requests_running)
+  stdout                    mean/p50/p90 of each quantity (+ batch size)
 
 Usage:
   scripts/arm/e4_prefill_decode.py --frontend logs/frontend.log \
-      [--out <dir>] [--no-figures]
+      [--metrics logs/vllm_metrics.ndjson] [--out <dir>] [--no-figures]
 """
 
 from __future__ import annotations
@@ -72,6 +73,61 @@ def parse_frontend(path: Path) -> list[dict]:
                 "decode_share": (decode / elapsed) if elapsed > 0 else 0.0,
             }
     return list(by_rid.values())
+
+
+def load_batch_sizes(metrics_path: Path,
+                     metric: str = "vllm:num_requests_running"
+                     ) -> list[float]:
+    """Per scrape-tick, per worker: the running-batch size gauge
+    (vllm:num_requests_running = requests in the engine's current
+    running batch). Each (tick, worker) value is one sample. ok:false
+    rows and missing-metric ticks are skipped."""
+    import json
+    out: list[float] = []
+    with metrics_path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not row.get("ok"):
+                continue
+            series = (row.get("metrics") or {}).get(metric)
+            if not series:
+                continue
+            for e in series:
+                v = e.get("value")
+                if isinstance(v, (int, float)):
+                    out.append(float(v))
+    return out
+
+
+def fig_batch_sizes(sizes: list[float], path: Path) -> None:
+    plt = _mpl()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    if sizes:
+        hi = int(max(sizes))
+        bins = range(0, hi + 2)
+        ax.hist(sizes, bins=bins, color="tab:purple", alpha=0.8,
+                align="left")
+        mean = sum(sizes) / len(sizes)
+        ax.axvline(mean, color="tab:red", ls="--", lw=1.2,
+                   label=f"mean {mean:.1f}")
+        ax.axvline(_pct(sizes, 0.5), color="tab:orange", ls=":", lw=1.2,
+                   label=f"p50 {_pct(sizes, 0.5):.0f}")
+        ax.legend(fontsize=9, framealpha=0.7)
+    else:
+        ax.text(0.5, 0.5, "no batch-size samples", transform=ax.transAxes,
+                ha="center", va="center", color="grey")
+    ax.set_xlabel("running batch size (num_requests_running)")
+    ax.set_ylabel("scrape ticks")
+    ax.set_title("Running batch size distribution")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _pct(vals: list[float], q: float) -> float:
@@ -157,6 +213,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--frontend", required=True, type=Path,
                     help="dynamo frontend.log")
+    ap.add_argument("--metrics", type=Path, default=None,
+                    help="vLLM scrape NDJSON (logs/vllm_metrics.ndjson): "
+                         "adds the running-batch-size distribution "
+                         "(vllm:num_requests_running)")
     ap.add_argument("--out", type=Path, default=Path("e4_prefill_decode"))
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -194,9 +254,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  aggregate prefill:decode = "
               f"{tot_p/(tot_p+tot_d):.1%} : {tot_d/(tot_p+tot_d):.1%}")
 
+    batch_sizes: list[float] = []
+    if args.metrics is not None and args.metrics.exists():
+        batch_sizes = load_batch_sizes(args.metrics)
+        if batch_sizes:
+            _stat_row("batch_size", batch_sizes, "{:.1f}")
+            print(f"  batch_size min {min(batch_sizes):.0f}  "
+                  f"max {max(batch_sizes):.0f}  "
+                  f"n={len(batch_sizes)} scrape samples")
+        else:
+            print("  batch_size: no vllm:num_requests_running in scrape")
+
     if not args.no_figures:
         try:
             fig_prefill_decode(rows, args.out / "fig1_prefill_decode.pdf")
+            if batch_sizes:
+                fig_batch_sizes(batch_sizes,
+                                args.out / "fig2_batch_size.pdf")
         except ImportError:
             print("matplotlib/numpy unavailable -- figure skipped",
                   file=sys.stderr)
