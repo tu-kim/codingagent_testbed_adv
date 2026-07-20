@@ -116,11 +116,11 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
         lo, hi = min(pos), max(pos)
         bins = np.logspace(np.log10(max(lo, 1e-3)), np.log10(hi), 40)
         axL.hist(prefill, bins=bins, alpha=0.55, color="tab:blue",
-                 label="prefill (ttft)")
+                 label="prefill")
         axL.hist(decode, bins=bins, alpha=0.55, color="tab:orange",
-                 label="decode (elapsed - ttft)")
+                 label="decode")
         axL.set_xscale("log")
-    axL.set_xlabel("time (ms, log)")
+    axL.set_xlabel("time (ms)")
     axL.set_ylabel("requests")
     for vals, c in ((prefill, "tab:blue"), (decode, "tab:orange")):
         if vals:
@@ -130,20 +130,21 @@ def fig_prefill_decode(rows: list[dict], path: Path) -> None:
 
     # right: decode share of end-to-end + ITL summary
     if share:
-        axR.hist(share, bins=30, color="tab:green", alpha=0.75)
+        axR.hist([s * 100 for s in share], bins=30, color="tab:green",
+                 alpha=0.75)
         m = sum(share) / len(share)
-        axR.axvline(m, color="tab:red", ls="--", lw=1.2,
+        axR.axvline(m * 100, color="tab:red", ls="--", lw=1.2,
                     label=f"mean {m:.0%}")
-        axR.axvline(_pct(share, 0.5), color="tab:purple", ls=":", lw=1.2,
-                    label=f"p50 {_pct(share, 0.5):.0%}")
-    axR.set_xlim(0, 1)
-    axR.set_xlabel("decode share of elapsed")
+        axR.axvline(_pct(share, 0.5) * 100, color="tab:purple", ls=":",
+                    lw=1.2, label=f"p50 {_pct(share, 0.5):.0%}")
+    axR.set_xlim(0, 100)
+    axR.set_xlabel("Decode Ratio (%)")
     axR.set_ylabel("requests")
     itl_txt = ""
     if itl:
         itl_txt = (f"\nITL mean {sum(itl)/len(itl):.1f} ms  "
                    f"p50 {_pct(itl, 0.5):.1f}  p90 {_pct(itl, 0.9):.1f}")
-    axR.set_title("Decode share of end-to-end" + itl_txt)
+    axR.set_title("Decode Time Ratio of E2E" + itl_txt)
     axR.legend(fontsize=9, framealpha=0.7)
 
     fig.tight_layout()
