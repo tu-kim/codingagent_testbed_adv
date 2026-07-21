@@ -173,7 +173,11 @@ def fig_isl_osl(e0, isl: list[float], osl: list[float], path: Path) -> None:
 
 def write_tool_stats_csv(counts: Counter, effects: dict, path: Path) -> None:
     """tool_stats.csv: tool, invocations, output_mean/std (turn N),
-    added_mean/std (tokens added to turn N+1's prompt), sample sizes."""
+    added_mean/std (tokens added to turn N+1's prompt), sample sizes.
+
+    NEGATIVE added values (next prompt SMALLER than expected -- almost
+    always compaction shrinking the history) are EXCLUDED from the added
+    mean/std; n_added_neg reports how many were dropped per tool."""
     import csv
     tools = sorted(set(counts) | set(effects),
                    key=lambda k: -counts.get(k, 0))
@@ -182,15 +186,17 @@ def write_tool_stats_csv(counts: Counter, effects: dict, path: Path) -> None:
         w.writerow(["tool", "invocations",
                     "output_tokens_mean", "output_tokens_std", "n_out",
                     "added_next_prompt_mean", "added_next_prompt_std",
-                    "n_added"])
+                    "n_added", "n_added_neg"])
         for tool in tools:
             o = effects.get(tool, {}).get("out", [])
-            a = effects.get(tool, {}).get("added", [])
+            a_all = effects.get(tool, {}).get("added", [])
+            a = [v for v in a_all if v >= 0]
+            n_neg = len(a_all) - len(a)
             om, os_ = _mean_std(o) if o else (0.0, 0.0)
             am, as_ = _mean_std(a) if a else (0.0, 0.0)
             w.writerow([tool, counts.get(tool, 0),
                         f"{om:.1f}", f"{os_:.1f}", len(o),
-                        f"{am:.1f}", f"{as_:.1f}", len(a)])
+                        f"{am:.1f}", f"{as_:.1f}", len(a), n_neg])
 
 
 def fig_tool_transition(e0, trans: dict, path: Path) -> None:
@@ -280,14 +286,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {name:<16} {c}")
 
     effects = tool_token_effects(turns)
-    print("per-tool token effect (mean +- std):")
+    print("per-tool token effect (mean +- std; negative added excluded):")
     print(f"  {'tool':<16} {'output@N':>18} {'added->N+1':>18}")
     for tool in sorted(effects, key=lambda k: -len(effects[k]["out"])):
-        o, a = effects[tool]["out"], effects[tool]["added"]
+        o, a_all = effects[tool]["out"], effects[tool]["added"]
+        a = [v for v in a_all if v >= 0]
+        n_neg = len(a_all) - len(a)
         om, os_ = _mean_std(o) if o else (0.0, 0.0)
         am, as_ = _mean_std(a) if a else (0.0, 0.0)
         print(f"  {tool:<16} {om:>9,.0f} +-{os_:>6,.0f} "
-              f"{am:>9,.0f} +-{as_:>6,.0f}  (n={len(o)}/{len(a)})")
+              f"{am:>9,.0f} +-{as_:>6,.0f}  "
+              f"(n={len(o)}/{len(a)}, {n_neg} neg excluded)")
 
     trans = tool_transitions(turns)
     write_tool_stats_csv(counts, effects, out_dir / "tool_stats.csv")
