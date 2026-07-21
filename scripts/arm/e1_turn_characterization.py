@@ -1070,8 +1070,8 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
         h1, l1 = ax_bot.get_legend_handles_labels()
         h2, l2 = ax_ph.get_legend_handles_labels()
         # legend inside the axes (upper right), drawn ON TOP of the curves
-        leg = ax_bot.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper right",
-                            framealpha=0.9)
+        leg = ax_ph.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper right",
+                           framealpha=0.9)
         leg.set_zorder(5)
 
     fig.savefig(path, dpi=200, bbox_inches="tight")
