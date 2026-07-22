@@ -1219,14 +1219,12 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
     ax_use.set_ylim(bottom=0)
     ax_use.set_ylabel("Host KV usage "
                       + ("(%)" if as_pct else "(GB)"))
-    ax_use.set_title("KV Cache Tier Occupancy", pad=24)
+    ax_use.set_title("KV Cache Tier Occupancy")
     h1, l1 = ax_use.get_legend_handles_labels()
     h2, l2 = ax_hr.get_legend_handles_labels()
     if l1 + l2:
-        # legend ABOVE the panel (across the top), out of the curves
         ax_use.legend(h1 + h2, l1 + l2, fontsize=8,
-                      loc="lower center", bbox_to_anchor=(0.5, 1.0),
-                      ncol=len(l1 + l2), framealpha=0.7)
+                      loc="upper left", framealpha=0.7)
 
     # --- panel 2: transfer speed (tokens/sec, window-avg) ---
     spd_labeled: set[str] = set()
