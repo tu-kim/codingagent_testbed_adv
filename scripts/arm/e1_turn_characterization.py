@@ -519,16 +519,31 @@ def session_spans(turns: list,
             qts = None
             if queued_ts_by_rid and rid and rid in queued_ts_by_rid:
                 qts = queued_ts_by_rid[rid]
+                # SANITY: vLLM's RequestStateStats timestamps are the
+                # MONOTONIC clock on many versions, not epoch. Only trust
+                # queued_ts as an absolute anchor when it lands within a
+                # day of the profile's llm_end epoch time; otherwise it
+                # would place the segment at monotonic scale (~boot
+                # seconds), flooding the whole span (all-blue Gantt,
+                # every session "starting" at the same tiny time).
+                if abs(qts - e) > 86400.0:
+                    qts = None
             if q_s and qts is not None and qts < e:
                 q_end = min(qts + q_s, e)
                 qseg = (qts, q_end)
                 seg = (q_end, e)
-            elif s is not None and q_s and e > s:
-                # bracket-head carve fallback (no queued_ts): clamp to
-                # the client llm bracket.
-                q_eff = min(q_s, e - s)
-                qseg = (s, s + q_eff)
-                seg = (s + q_eff, e)
+            elif q_s:
+                # tail-anchor fallback (no usable queued_ts): estimate
+                # active from the stream wall (duration_s; ~0 on buffered
+                # turns) and place queue immediately before it, both
+                # anchored at llm_end. The chronological clip below
+                # floors any overrun at the previous turn's llm_end.
+                act = getattr(t, "llm_wall_s", None)
+                if act is None and s is not None:
+                    act = max(0.0, e - s)
+                act = act or 0.0
+                qseg = (e - act - q_s, e - act)
+                seg = (e - act, e)
             elif s is not None:
                 seg = (s, e)
             else:
