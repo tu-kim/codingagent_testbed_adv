@@ -192,8 +192,9 @@ def fig_contention(e0, comp: dict[str, dict], tools: dict[str, dict],
     plt = e0._mpl()
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
     runs = list(comp)
-    comps = ("llm", "queue", "tool", "scaffold")
-    colors = {"llm": "C0", "queue": "C1", "tool": "C2", "scaffold": "0.5"}
+    # queue stays in the CSV/digest but is NOT drawn.
+    comps = ("llm", "tool", "scaffold")
+    colors = {"llm": "C0", "tool": "C2", "scaffold": "0.5"}
     w = 0.8 / max(len(runs), 1)
     for ri, run in enumerate(runs):
         for ci, c in enumerate(comps):
