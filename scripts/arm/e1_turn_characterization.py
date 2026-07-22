@@ -657,6 +657,22 @@ _LMC_RETR_RE = re.compile(
 
 
 _LMC_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHJ]")
+# LMCache log-line timestamp: [2026-07-18 16:18:42,810]
+_LMC_TS_RE = re.compile(
+    r"\[(?P<d>\d{4}-\d{2}-\d{2}) (?P<t>\d{2}:\d{2}:\d{2}),(?P<ms>\d{3})\]")
+
+
+def _lmc_line_ts(line: str) -> float | None:
+    from datetime import datetime
+    m = _LMC_TS_RE.search(line)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(f"{m.group('d')} {m.group('t')}",
+                               "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return dt.timestamp() + int(m.group("ms")) / 1000.0
 
 
 def parse_lmcache_retrieves(logs: Path,
@@ -673,7 +689,12 @@ def parse_lmcache_retrieves(logs: Path,
     meantime); only retrieves with no prior lookup at all are dropped.
     Last retrieve wins per request. `stats` (optional dict) receives
     {lookup_lines, retrieve_lines, matched, fallback_matched} for the
-    caller's diagnostics."""
+    caller's diagnostics.
+
+    `pre_wait_ms` (when both line timestamps parse): first lookup line ts
+    -> Retrieved line ts, minus the transfer cost itself = the WAITING-
+    side overhead BEFORE the transfer (GPU KV block allocation / eviction
+    + scheduler re-tries), clamped >= 0. None when timestamps missing."""
     out: dict[str, dict] = {}
     st = stats if stats is not None else {}
     st.setdefault("lookup_lines", 0)
@@ -685,6 +706,7 @@ def parse_lmcache_retrieves(logs: Path,
         last_by_hit: dict[int, str] = {}     # hit tokens -> reqid
         last_reqid: str | None = None
         waits: dict[str, int] = {}
+        first_ts: dict[str, float] = {}      # reqid -> first lookup line ts
         with fpath.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = _LMC_ANSI_RE.sub("", line)
@@ -693,6 +715,10 @@ def parse_lmcache_retrieves(logs: Path,
                     reqid = m.group("reqid")
                     st["lookup_lines"] += 1
                     waits[reqid] = waits.get(reqid, 0) + 1
+                    if reqid not in first_ts:
+                        lts = _lmc_line_ts(line)
+                        if lts is not None:
+                            first_ts[reqid] = lts
                     last_by_hit[int(m.group("hit"))] = reqid
                     last_reqid = reqid
                     continue
@@ -709,11 +735,18 @@ def parse_lmcache_retrieves(logs: Path,
                 else:
                     st["matched"] += 1
                 rid = reqid.rsplit("-", 1)[0]
+                cost_ms = float(m.group("cost_ms"))
+                pre_wait_ms = None
+                rts = _lmc_line_ts(line)
+                if rts is not None and reqid in first_ts:
+                    pre_wait_ms = max(
+                        0.0, (rts - first_ts[reqid]) * 1000.0 - cost_ms)
                 out[rid] = {
-                    "cost_ms": float(m.group("cost_ms")),
+                    "cost_ms": cost_ms,
                     "tokens": int(m.group("got")),
                     "hit_tokens": int(m.group("hit")),
                     "waits": waits.get(reqid, 0),
+                    "pre_wait_ms": pre_wait_ms,
                 }
     return out
 
@@ -1568,6 +1601,13 @@ def main(argv: list[str] | None = None) -> int:
         _stat_line("retrieve / (TTFT-queue) share", r_share_net)
         _stat_line("WAITING lookups per transfer",
                    [float(rec["waits"]) for rec in retrieves.values()],
+                   "{:.1f}")
+        # pre-transfer overhead: first lookup -> Retrieved minus the
+        # transfer cost = block allocation / eviction + scheduler retries
+        # while the request sat in WAITING.
+        _stat_line("pre-transfer wait (ms)",
+                   [rec["pre_wait_ms"] for rec in retrieves.values()
+                    if rec.get("pre_wait_ms") is not None],
                    "{:.1f}")
 
     if not args.no_figures:
