@@ -257,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
 
     comp: dict[str, dict] = {}          # run -> {comp: {mean_s, mean_share}}
     tool_p50: dict[str, dict] = {}      # tool -> {run: p50}
+    tool_mean: dict[str, dict] = {}     # tool -> {run: mean}
     tool_n: dict[str, dict] = {}
     res: dict[str, dict] = {}
     for entry in args.runs:
@@ -276,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         durs = tool_durations(ap_mod, e0, inp, trace)
         for name, vals in durs.items():
             tool_p50.setdefault(name, {})[label] = _pct(vals, 0.5)
+            tool_mean.setdefault(name, {})[label] = sum(vals) / len(vals)
             tool_n.setdefault(name, {})[label] = len(vals)
         res[label] = host_resources(entry, e3)
         print(f"{label}: {len(rows)} turns ({n_q} queue-joined), "
@@ -321,21 +323,35 @@ def main(argv: list[str] | None = None) -> int:
     # ----- per-tool CSV -----
     with (args.out / "per_tool.csv").open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["tool"] + [f"{r}_p50_s" for r in runs]
-                   + [f"{r}_n" for r in runs] + ["p50_ratio"])
-        print(f"\nper-tool p50 duration (s):")
+        w.writerow(["tool"]
+                   + [f"{r}_p50_s" for r in runs]
+                   + [f"{r}_mean_s" for r in runs]
+                   + [f"{r}_n" for r in runs]
+                   + ["p50_ratio", "mean_ratio"])
+        print(f"\nper-tool duration (s):")
+        print(f"  {'tool':<16} "
+              + " ".join(f"{r + '_p50':>12}" for r in runs)
+              + " " + " ".join(f"{r + '_mean':>12}" for r in runs)
+              + f" {'p50_r':>7} {'mean_r':>7}")
         for name in sorted(tool_p50, key=lambda n: -max(
                 tool_n[n].get(r, 0) for r in runs)):
             d = tool_p50[name]
+            dm = tool_mean[name]
             ratio = (d[b] / d[a]) if a in d and b in d and d[a] else \
                 float("nan")
+            m_ratio = (dm[b] / dm[a]) if a in dm and b in dm and dm[a] \
+                else float("nan")
             w.writerow([name]
-                       + [f"{d.get(r, float('nan')):.4f}" for r in runs]
+                       + [f"{d.get(r, float('nan')):.3f}" for r in runs]
+                       + [f"{dm.get(r, float('nan')):.3f}" for r in runs]
                        + [tool_n[name].get(r, 0) for r in runs]
-                       + [f"{ratio:.4f}"])
+                       + [f"{ratio:.3f}", f"{m_ratio:.3f}"])
             print(f"  {name:<16} "
-                  + " ".join(f"{d.get(r, float('nan')):>8.2f}" for r in runs)
-                  + f"  ratio {ratio:.2f}")
+                  + " ".join(f"{d.get(r, float('nan')):>12.3f}"
+                             for r in runs)
+                  + " " + " ".join(f"{dm.get(r, float('nan')):>12.3f}"
+                                   for r in runs)
+                  + f" {ratio:>7.3f} {m_ratio:>7.3f}")
 
     # ----- verdict hint -----
     t_ratio = (comp[b]["tool"]["mean_s"] / comp[a]["tool"]["mean_s"]) \
