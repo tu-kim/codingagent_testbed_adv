@@ -490,9 +490,8 @@ def session_spans(turns: list,
     join), so it always equals the drawn queue_segments total and the 3
     breakdown shares tile the span. span - active - queue = others
     (tool + scaffold)."""
-    by: dict[str, list[tuple[float, float]]] = {}
-    qsegs_by_sess: dict[str, list[tuple[float, float]]] = {}
-    queue_by_sess: dict[str, float] = {}
+    # per-session per-turn records: (llm_end, seg, qseg_or_None)
+    rec_by_sess: dict[str, list] = {}
     for t in turns:
         s, e = t.llm_start_ts, t.llm_end_ts
         if e is None:
@@ -502,16 +501,14 @@ def session_spans(turns: list,
         if queue_ms_by_rid and rid and rid in queue_ms_by_rid:
             q_s = queue_ms_by_rid[rid] / 1000.0
         elapsed = getattr(t, "elapsed_s", None)
+        qseg = None
         if elapsed is not None:
             # clamp: SCHED_DELAY queue can't exceed dynamo's server wall
             q_eff = min(q_s, elapsed) if q_s else 0.0
             active = max(0.0, elapsed - q_eff)
             seg = (e - active, e)
             if q_eff > 0:
-                qsegs_by_sess.setdefault(t.session_id, []).append(
-                    (e - elapsed, e - active))
-                queue_by_sess[t.session_id] = \
-                    queue_by_sess.get(t.session_id, 0.0) + q_eff
+                qseg = (e - elapsed, e - active)
         else:
             # No dynamo timing. PREFERRED: anchor on the SCHED_DELAY
             # absolute queued_ts — queue = (qts, qts+q), active
@@ -524,36 +521,51 @@ def session_spans(turns: list,
                 qts = queued_ts_by_rid[rid]
             if q_s and qts is not None and qts < e:
                 q_end = min(qts + q_s, e)
-                qsegs_by_sess.setdefault(t.session_id, []).append(
-                    (qts, q_end))
-                queue_by_sess[t.session_id] = \
-                    queue_by_sess.get(t.session_id, 0.0) + (q_end - qts)
+                qseg = (qts, q_end)
                 seg = (q_end, e)
             elif s is not None and q_s and e > s:
                 # bracket-head carve fallback (no queued_ts): clamp to
                 # the client llm bracket.
                 q_eff = min(q_s, e - s)
-                qsegs_by_sess.setdefault(t.session_id, []).append(
-                    (s, s + q_eff))
-                queue_by_sess[t.session_id] = \
-                    queue_by_sess.get(t.session_id, 0.0) + q_eff
+                qseg = (s, s + q_eff)
                 seg = (s + q_eff, e)
             elif s is not None:
                 seg = (s, e)
             else:
                 continue
-        by.setdefault(t.session_id, []).append(seg)
+        rec_by_sess.setdefault(t.session_id, []).append((e, seg, qseg))
     out: list[dict] = []
-    for sid, segs in by.items():
-        segs = sorted(segs)
-        qsegs = sorted(qsegs_by_sess.get(sid, []))
+    for sid, recs in rec_by_sess.items():
+        # Chronological clip: a turn's queue+active window may not begin
+        # before the PREVIOUS turn's llm_end (elapsed/queued_ts reaching
+        # back past it would overlap and over-tile the span — e.g. long
+        # queue waits flooding the whole bar as "LLM active").
+        recs.sort(key=lambda r: r[0])
+        segs: list[tuple[float, float]] = []
+        qsegs: list[tuple[float, float]] = []
+        queue_s = 0.0
+        floor = float("-inf")
+        for e, seg, qseg in recs:
+            if qseg is not None:
+                qs, qe = max(qseg[0], floor), qseg[1]
+                if qe > qs:
+                    qsegs.append((qs, qe))
+                    queue_s += qe - qs
+                floor_seg = max(seg[0], qe if qe > qs else floor)
+            else:
+                floor_seg = max(seg[0], floor)
+            if seg[1] > floor_seg:
+                segs.append((floor_seg, seg[1]))
+            floor = e
+        if not segs:
+            continue
         # the first turn's queue wait precedes its active segment; include
         # it in the span so the 3 shares tile the bar.
         start = min(segs[0][0], qsegs[0][0]) if qsegs else segs[0][0]
         out.append({"session_id": sid, "start": start,
                     "end": max(e for _, e in segs), "segments": segs,
                     "queue_segments": qsegs,
-                    "queue_s": queue_by_sess.get(sid, 0.0)})
+                    "queue_s": queue_s})
     out.sort(key=lambda d: d["start"])
     return out
 
