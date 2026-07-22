@@ -63,6 +63,62 @@ def _pct(vals: list[float], q: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
+def resolve_logs(entry: str) -> Path | None:
+    """<root>/logs (or <root> itself) when it contains vllm-*.log."""
+    _, _, root_str = entry.partition("=")
+    root = Path(root_str) if root_str else Path(entry)
+    for cand in (root / "logs", root):
+        if cand.is_dir() and any(cand.glob("vllm-*.log")):
+            return cand
+    return None
+
+
+def turn_queue_map(ats, inp: Path, logs: Path | None,
+                   ) -> dict[tuple[str, int], float]:
+    """{(session_id, step): engine queue seconds} via the profile
+    request_id -> SCHED_DELAY join. Empty when logs are absent or the
+    profiles input is an aggregated file (load_turns needs the
+    per-session dir)."""
+    if logs is None or not inp.is_dir():
+        return {}
+    sched = ats.load_sched(logs)
+    if not sched:
+        return {}
+    out: dict[tuple[str, int], float] = {}
+    for t in ats.load_turns(inp):
+        rid = getattr(t, "request_id", None)
+        if rid and rid in sched:
+            out[(t.session_id, t.step)] = sched[rid].total_queue_ms / 1000.0
+    return out
+
+
+def split_queue(ap_rows, qmap: dict[tuple[str, int], float],
+                ) -> list[tuple[float, float, float, float, float]]:
+    """(wall, llm_compute, queue, tool, scaffold) per turn from the
+    analyze_profiles rows (sid, step, wall, lw, tool, po, llm_canon,
+    scaffold): the canonical llm (queue+prefill+decode) minus the joined
+    engine queue wait, queue capped at llm so the components still
+    tile the wall."""
+    out = []
+    for sid, step, wall, _lw, tool, _po, llm, scaffold in ap_rows:
+        q = min(qmap.get((sid, step), 0.0), llm)
+        out.append((wall, llm - q, q, tool, scaffold))
+    return out
+
+
+def summarize5(rows5) -> dict[str, dict[str, float]]:
+    """{component: {mean_s, mean_share}} over 5-tuples
+    (wall, llm, queue, tool, scaffold)."""
+    comps = ("llm", "queue", "tool", "scaffold")
+    out: dict[str, dict[str, float]] = {}
+    for i, c in enumerate(comps, start=1):
+        secs = [r[i] for r in rows5]
+        shares = [r[i] / r[0] for r in rows5 if r[0] > 0]
+        out[c] = {"mean_s": sum(secs) / len(secs) if secs else 0.0,
+                  "mean_share": sum(shares) / len(shares) if shares else 0.0}
+    return out
+
+
 def tool_durations(ap_mod, e0, inp: Path,
                    trace: Path | None) -> dict[str, list[float]]:
     """{tool_name: [duration_s]} across all main-session turns; the task
@@ -136,8 +192,8 @@ def fig_contention(e0, comp: dict[str, dict], tools: dict[str, dict],
     plt = e0._mpl()
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
     runs = list(comp)
-    comps = ("llm", "tool", "scaffold")
-    colors = {"llm": "C0", "tool": "C2", "scaffold": "0.5"}
+    comps = ("llm", "queue", "tool", "scaffold")
+    colors = {"llm": "C0", "queue": "C1", "tool": "C2", "scaffold": "0.5"}
     w = 0.8 / max(len(runs), 1)
     for ri, run in enumerate(runs):
         for ci, c in enumerate(comps):
@@ -197,25 +253,36 @@ def main(argv: list[str] | None = None) -> int:
     sys.modules["analyze_profiles"] = ap_mod
     spec.loader.exec_module(ap_mod)
     e0 = _load("e0_turn_characterization", "e0_turn_characterization.py")
+    ats = e0._load_ats()
 
-    comp: dict[str, dict] = {}          # run -> {comp: {mean_s, p90_s, ...}}
+    comp: dict[str, dict] = {}          # run -> {comp: {mean_s, mean_share}}
     tool_p50: dict[str, dict] = {}      # tool -> {run: p50}
     tool_n: dict[str, dict] = {}
     res: dict[str, dict] = {}
     for entry in args.runs:
         label, inp, trace = e3.resolve_run(entry)
-        rows = e3.run_decomposition(ap_mod, e0, inp, trace)
-        if not rows:
+        sessions = ap_mod.load_sessions(inp)
+        if trace is not None:
+            keep = e0.trace_session_ids(trace)
+            sessions = {sid: s for sid, s in sessions.items() if sid in keep}
+        ap_rows = ap_mod._collect_turn_decomposition(sessions)
+        if not ap_rows:
             print(f"warning: no turns in {entry}; skipped", file=sys.stderr)
             continue
-        comp[label] = e3.summarize(rows)
+        qmap = turn_queue_map(ats, inp, resolve_logs(entry))
+        rows = split_queue(ap_rows, qmap)
+        comp[label] = summarize5(rows)
+        n_q = sum(1 for r in ap_rows if (r[0], r[1]) in qmap)
         durs = tool_durations(ap_mod, e0, inp, trace)
         for name, vals in durs.items():
             tool_p50.setdefault(name, {})[label] = _pct(vals, 0.5)
             tool_n.setdefault(name, {})[label] = len(vals)
         res[label] = host_resources(entry, e3)
-        print(f"{label}: {len(rows)} turns, {len(durs)} tools, "
-              f"resource fields {len(res[label])}")
+        print(f"{label}: {len(rows)} turns ({n_q} queue-joined), "
+              f"{len(durs)} tools, resource fields {len(res[label])}")
+        if not n_q:
+            print(f"  [no SCHED_DELAY join for {label}: queue stays "
+                  f"inside llm]", file=sys.stderr)
     if len(comp) < 2:
         print("error: fewer than 2 runs with data", file=sys.stderr)
         return 2
@@ -238,9 +305,9 @@ def main(argv: list[str] | None = None) -> int:
         rows_csv.append([metric] + [f"{vals.get(r, float('nan')):.4f}"
                                     for r in runs] + [f"{ratio:.4f}"])
 
-    for c in ("llm", "tool", "scaffold"):
+    for c in ("llm", "queue", "tool", "scaffold"):
         emit(f"{c}_mean_s", {r: comp[r][c]["mean_s"] for r in runs})
-    for c in ("llm", "tool", "scaffold"):
+    for c in ("llm", "queue", "tool", "scaffold"):
         emit(f"{c}_mean_share", {r: comp[r][c]["mean_share"] for r in runs})
     res_keys = sorted({k for d in res.values() for k in d})
     for k in res_keys:
@@ -277,12 +344,15 @@ def main(argv: list[str] | None = None) -> int:
         if comp[a]["scaffold"]["mean_s"] else float("nan")
     l_ratio = (comp[b]["llm"]["mean_s"] / comp[a]["llm"]["mean_s"]) \
         if comp[a]["llm"]["mean_s"] else float("nan")
+    q_ratio = (comp[b]["queue"]["mean_s"] / comp[a]["queue"]["mean_s"]) \
+        if comp[a]["queue"]["mean_s"] else float("nan")
     print(f"\ncontention signature: tool x{t_ratio:.2f}, "
-          f"scaffold x{s_ratio:.2f} vs llm x{l_ratio:.2f} "
-          f"({b} over {a})")
-    print("  interpretation: tool/scaffold inflating much more than llm "
-          "=> CPU-side contention; llm dominating the inflation => "
-          "GPU/queue pressure, CPU not the bottleneck")
+          f"scaffold x{s_ratio:.2f} vs llm(compute) x{l_ratio:.2f}, "
+          f"queue x{q_ratio:.2f} ({b} over {a})")
+    print("  interpretation: tool/scaffold inflating much more than "
+          "llm compute => CPU-side contention; queue dominating => "
+          "engine scheduler pressure; llm compute inflating => batch-"
+          "induced slowdown on the GPU itself")
 
     if not args.no_figures:
         try:
