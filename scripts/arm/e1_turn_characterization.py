@@ -1363,6 +1363,17 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no turns left after trace filter", file=sys.stderr)
         return 2
 
+    # total run wall time: earliest turn start -> latest turn end across
+    # all main sessions.
+    _starts = [t.llm_start_ts for t in turns if t.llm_start_ts is not None]
+    _ends = [t.llm_end_ts for t in turns if t.llm_end_ts is not None]
+    if _starts and _ends:
+        run_lo = min(_starts)
+        run_elapsed = max(_ends) - run_lo
+        print(f"total elapsed time: {run_elapsed:.1f}s "
+              f"({run_elapsed/60:.1f} min) over {len(turns)} turns, "
+              f"{len(main_ids)} sessions")
+
     ordered = e0.order_turns(turns)
     # per-turn ordinal figures (fig1) use SESSION-GROUPED order so each
     # session is a contiguous block even when mif>1 interleaves them.
