@@ -976,14 +976,13 @@ def prefix_hit_rate_series(metrics_path: Path) -> list[tuple[float, float]]:
     return out
 
 
-def queue_wait_series(metrics_path: Path) -> list[tuple[float, float]]:
-    """Windowed mean engine queue wait (seconds) from the scrape NDJSON:
-    per tick, sum vllm:request_queue_time_seconds_{sum,count} across
-    workers, then delta(sum)/delta(count) between ticks = the mean queue
-    wait of the requests that entered compute in that window. Shares the
-    scrape clock with kv_usage_series so it stacks under fig3's panels.
-    Windows with no newly scheduled request (delta count 0) are skipped."""
-    per_ts: dict[float, list[float]] = {}
+def queue_len_series(metrics_path: Path) -> list[tuple[float, float]]:
+    """Engine queue LENGTH over time from the scrape NDJSON: per tick,
+    vllm:num_requests_waiting (requests sitting in the scheduler WAITING
+    queue) summed across workers. A plain gauge — no windowing needed.
+    Shares the scrape clock with kv_usage_series so it stacks under
+    fig3's panels."""
+    per_ts: dict[float, float] = {}
     with metrics_path.open(encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
@@ -995,29 +994,18 @@ def queue_wait_series(metrics_path: Path) -> list[tuple[float, float]]:
                 continue
             if not row.get("ok"):
                 continue
-            s = _sum_series(row, "vllm:request_queue_time_seconds_sum")
-            c = _sum_series(row, "vllm:request_queue_time_seconds_count")
+            v = _sum_series(row, "vllm:num_requests_waiting")
             ts = row.get("ts")
-            if s is None or c is None or ts is None:
+            if v is None or ts is None:
                 continue
-            agg = per_ts.setdefault(float(ts), [0.0, 0.0])
-            agg[0] += s
-            agg[1] += c
-    out: list[tuple[float, float]] = []
-    prev = None
-    for ts, (s, c) in sorted(per_ts.items()):
-        if prev is not None:
-            ds, dc = s - prev[1], c - prev[2]
-            if dc > 0 and ds >= 0:
-                out.append((ts, ds / dc))
-        prev = (ts, s, c)
-    return out
+            per_ts[float(ts)] = per_ts.get(float(ts), 0.0) + v
+    return sorted(per_ts.items())
 
 
 def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
                   sample_ordinals: list[int],
                   sample_times: list[float],
-                  queue_wait: list[tuple[float, float]] | None = None,
+                  queue_len: list[tuple[float, float]] | None = None,
                   prefix_hit: list[tuple[float, float]] | None = None,
                   events: list[dict] | None = None,
                   turns: list | None = None) -> None:
@@ -1027,8 +1015,8 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
     with the gap on eviction turns marked red = tokens missed due to
     eviction. Middle panel: GPU KV-cache usage (left y) + the vLLM
     prefix-cache hit rate (right y, `prefix_hit`) on the scrape time
-    axis. Bottom panel (`queue_wait`): windowed mean engine queue wait
-    from the request_queue_time histogram, same time axis."""
+    axis. Bottom panel (`queue_len`): engine queue length
+    (num_requests_waiting summed across workers), same time axis."""
     plt = e0._mpl()
     fig, (ax_top, ax_bot, ax_q) = plt.subplots(3, 1, figsize=(18, 14))
 
@@ -1114,9 +1102,9 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
                            framealpha=0.9)
         leg.set_zorder(5)
 
-    # bottom panel: windowed mean engine queue wait, same scrape clock,
-    # trimmed to the profile window like the middle panel.
-    qw = [(t, v) for t, v in (queue_wait or []) if t0 <= t <= t0 + hi_x]
+    # bottom panel: engine queue length, same scrape clock, trimmed to
+    # the profile window like the middle panel.
+    qw = [(t, v) for t, v in (queue_len or []) if t0 <= t <= t0 + hi_x]
     for b in sample_times:
         ax_q.axvline(b - t0, color="crimson", linewidth=0.5, alpha=0.7,
                      zorder=1)
@@ -1124,14 +1112,14 @@ def fig_hit_vs_kv(e0, ordered: list, kv: list, path: Path,
         ax_q.plot([t - t0 for t, _ in qw], [v for _, v in qw],
                   color="tab:purple", lw=0.8, zorder=2)
     else:
-        ax_q.text(0.5, 0.5, "no request_queue_time in scrape",
+        ax_q.text(0.5, 0.5, "no num_requests_waiting in scrape",
                   transform=ax_q.transAxes, ha="center", va="center",
                   color="grey")
     ax_q.set_xlim(0, hi_x if hi_x > 0 else 1)
     ax_q.set_ylim(bottom=0)
     ax_q.set_xlabel("time (s)")
-    ax_q.set_ylabel("mean queue wait (s)")
-    ax_q.set_title("Engine queue wait vs time")
+    ax_q.set_ylabel("waiting requests")
+    ax_q.set_title("Engine queue length vs time")
 
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -1386,7 +1374,7 @@ def main(argv: list[str] | None = None) -> int:
     have_metrics = args.metrics is not None and args.metrics.exists()
     kv = e0.kv_usage_series(args.metrics) if have_metrics else []
     prefix_hit = prefix_hit_rate_series(args.metrics) if have_metrics else []
-    queue_wait = queue_wait_series(args.metrics) if have_metrics else []
+    queue_len = queue_len_series(args.metrics) if have_metrics else []
     lmc = lmcache_series(args.metrics) if have_metrics else {}
     if lmc:
         # LMCache metric names drift across versions; when a panel is empty
@@ -1579,7 +1567,7 @@ def main(argv: list[str] | None = None) -> int:
             e0.fig_llm_time_cdf(turns, out_dir / "fig2_llm_time_cdf.pdf")
             fig_hit_vs_kv(e0, ordered, kv, out_dir / "fig3_hit_vs_kv.pdf",
                           grouped_bounds, samples_abs,
-                          queue_wait=queue_wait, prefix_hit=prefix_hit,
+                          queue_len=queue_len, prefix_hit=prefix_hit,
                           events=events, turns=turns)
             e0.fig_gap_vs_hit(reuse, out_dir / "fig4_gap_vs_hit.pdf")
             fig_eviction_vs_displacement(
