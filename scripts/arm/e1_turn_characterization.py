@@ -867,6 +867,75 @@ def fig_retrieve_ttft(e0, retrieves: dict, frontend: dict, path: Path,
     return shares
 
 
+def pick_lifecycle_sessions(spans: list[dict], n_small: int = 5,
+                            n_rand: int = 5, seed: int = 42) -> list[dict]:
+    """Sample sessions for the fig10 lifecycle Gantt: the n_small sessions
+    with the MOST small-LLM-active turns (turn active length below the
+    p25 of all turns' active lengths — the CPU-offload-candidate-heavy
+    sessions), plus n_rand random others (seeded, deterministic)."""
+    import random
+    seg_lens = [e - s for sp in spans for s, e in sp["segments"]]
+    if not seg_lens:
+        return spans[:n_small + n_rand]
+    thr = _percentile(seg_lens, 25) or 0.0
+    scored = sorted(spans,
+                    key=lambda sp: -sum(1 for s, e in sp["segments"]
+                                        if (e - s) <= thr))
+    small = scored[:n_small]
+    small_ids = {sp["session_id"] for sp in small}
+    rest = [sp for sp in spans if sp["session_id"] not in small_ids]
+    rng = random.Random(seed)
+    rand = rng.sample(rest, min(n_rand, len(rest)))
+    picked = small + rand
+    picked.sort(key=lambda sp: sp["start"])
+    return picked
+
+
+def fig_session_lifecycle(e0, spans: list[dict], path: Path) -> None:
+    """fig10: lifecycle Gantt of the sampled sessions (see
+    pick_lifecycle_sessions). One row per session; each row splits the
+    wall span into (1) tool+scaffold (light grey base bar), (2) queue
+    wait (orange), (3) LLM active = prefill+decode (blue)."""
+    plt = e0._mpl()
+    n = len(spans)
+    fig, ax = plt.subplots(figsize=(16, max(3.0, 0.55 * n)))
+    if not spans:
+        ax.text(0.5, 0.5, "no sessions", transform=ax.transAxes,
+                ha="center", va="center", color="grey")
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return
+    t0 = min(sp["start"] for sp in spans)
+    bar_h = 0.6
+    for i, sp in enumerate(spans):
+        y = n - 1 - i
+        ax.broken_barh([(sp["start"] - t0, max(sp["end"] - sp["start"],
+                                               1e-9))],
+                       (y - bar_h / 2, bar_h), facecolors="0.85", zorder=1)
+        qsegs = [(s - t0, max(e - s, 1e-3))
+                 for s, e in sp.get("queue_segments", [])]
+        if qsegs:
+            ax.broken_barh(qsegs, (y - bar_h / 2, bar_h),
+                           facecolors="tab:orange", zorder=2)
+        segs = [(s - t0, max(e - s, 1e-3)) for s, e in sp["segments"]]
+        ax.broken_barh(segs, (y - bar_h / 2, bar_h),
+                       facecolors="tab:blue", zorder=3)
+    ax.set_ylim(-1, n)
+    ax.set_yticks([n - 1 - i for i in range(n)])
+    ax.set_yticklabels([sp["session_id"][-8:] for sp in spans], fontsize=8)
+    ax.set_xlim(left=0)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("session")
+    ax.set_title("Session lifecycle (sampled: 5 small-LLM-turn-heavy + "
+                 "5 random)")
+    ax.plot([], [], color="tab:blue", lw=6, label="LLM active")
+    ax.plot([], [], color="tab:orange", lw=6, label="queue wait")
+    ax.plot([], [], color="0.85", lw=6, label="tool+scaffold")
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.8)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def fig_eviction_vs_displacement(events: list[dict], path: Path, e0) -> None:
     """Scatter: eviction shortfall (tokens the session had to re-prefill,
     NON-compaction turns only) vs away_displaced_tokens (KV other sessions
@@ -1630,6 +1699,9 @@ def main(argv: list[str] | None = None) -> int:
                 fig_retrieve_ttft(e0, retrieves, frontend,
                                   out_dir / "fig9_retrieve_ttft.pdf",
                                   sched=sched)
+            fig_session_lifecycle(
+                e0, pick_lifecycle_sessions(spans),
+                out_dir / "fig10_session_lifecycle.pdf")
             if lmc:
                 prof_end = max((t.llm_end_ts for t in turns
                                 if t.llm_end_ts is not None), default=None)
