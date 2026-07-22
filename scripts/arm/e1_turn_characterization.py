@@ -1369,22 +1369,10 @@ def main(argv: list[str] | None = None) -> int:
     _ends = [t.llm_end_ts for t in turns if t.llm_end_ts is not None]
     if _starts and _ends:
         run_lo = min(_starts)
-        run_hi = max(_ends)
-        run_elapsed = run_hi - run_lo
+        run_elapsed = max(_ends) - run_lo
         print(f"total elapsed time: {run_elapsed:.1f}s "
               f"({run_elapsed/60:.1f} min) over {len(turns)} turns, "
               f"{len(main_ids)} sessions")
-        # p99 turn-end envelope: if the p99 span is far below the full
-        # span, one late outlier turn (timeout zombie / max-token dummy
-        # turn) is inflating total elapsed while the mass of activity
-        # ends much earlier (that earlier bound is what fig3 shows).
-        _ends_sorted = sorted(_ends)
-        p99_hi = _ends_sorted[min(len(_ends_sorted) - 1,
-                                  int(0.99 * len(_ends_sorted)))]
-        if run_hi - p99_hi > 0.05 * run_elapsed:
-            print(f"  NOTE: p99 turn end is {p99_hi - run_lo:.1f}s "
-                  f"(last {run_hi - p99_hi:.1f}s is a tail outlier — "
-                  f"timeout/dummy turn inflating the envelope)")
 
     ordered = e0.order_turns(turns)
     # per-turn ordinal figures (fig1) use SESSION-GROUPED order so each
@@ -1398,15 +1386,6 @@ def main(argv: list[str] | None = None) -> int:
     kv = e0.kv_usage_series(args.metrics) if have_metrics else []
     prefix_hit = prefix_hit_rate_series(args.metrics) if have_metrics else []
     queue_len = queue_len_series(args.metrics) if have_metrics else []
-    # scrape coverage vs profile window: fig3's KV/queue curves only span
-    # where the scrape has data, so if scrape started late / stopped early
-    # the panels look shorter than the run.
-    if kv and _starts and _ends:
-        kv_lo, kv_hi = kv[0][0], kv[-1][0]
-        print(f"scrape coverage: {kv_hi - kv_lo:.1f}s "
-              f"[{kv_lo - run_lo:+.1f}s .. {kv_hi - run_lo:+.1f}s vs run "
-              f"start]; run span {run_elapsed:.1f}s — fig3 KV/queue curves "
-              f"span only the scrape window")
     lmc = lmcache_series(args.metrics) if have_metrics else {}
     if lmc:
         # LMCache metric names drift across versions; when a panel is empty
