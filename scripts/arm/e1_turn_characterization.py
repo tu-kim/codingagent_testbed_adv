@@ -1188,9 +1188,9 @@ def fig_lmcache(e0, lmcache: dict[str, list[dict]], gpu_kv: list,
                if r.get("lookup_hit_rate") is not None]
         if not pts:
             continue
-        ax_hr.plot([x for x, _ in pts], [y for _, y in pts], color="tab:olive",
-                   lw=0.9, alpha=0.85, zorder=2,
-                   label=None if hr_labeled else "LMCache hit %")
+        ax_use.plot([x for x, _ in pts], [y for _, y in pts], color="tab:olive",
+                    lw=0.9, alpha=0.85, zorder=2,
+                    label=None if hr_labeled else "LMCache hit %")
         hr_labeled = True
     ax_hr.set_ylim(0, 105)
     ax_hr.set_ylabel("LMCache hit rate (%)")
