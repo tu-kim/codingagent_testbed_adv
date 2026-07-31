@@ -18,8 +18,10 @@ works for the log-based parts) this produces:
      kv_host_gib_mean        mean host-DRAM KV usage (LMCache metric,
                              auto-detected lmcache:* usage/size metric or
                              --host-kv-metric; assumed bytes)
-     ttft_ms mean/p50/p90    frontend.log ttft_ms
-     tpot_ms mean/p50/p90    (elapsed-ttft)/(output_tokens-1), out>1 only
+     ttft_ms_mean            frontend.log ttft_ms MINUS engine queue wait
+                             (SCHED_DELAY join by request_id; raw ttft
+                             for requests without a record)
+     tpot_ms_mean            (elapsed-ttft)/(output_tokens-1), out>1 only
      turns_per_session_mean  from profiles (main sessions only when
                              trace.jsonl exists)
 2. session_tokens.csv — per run: session START tokens (first turn
@@ -52,6 +54,16 @@ _ARM = Path(__file__).resolve().parent
 _AP_PATH = _ARM.parent / "analyze_profiles.py"
 _E4_PATH = _ARM / "e4_prefill_decode.py"
 _E0_PATH = _ARM / "e0_turn_characterization.py"
+_ATS_PATH = _ARM.parent / "analyze_turn_scheduling.py"
+
+_ATS_MOD = None
+
+
+def _load_ats():
+    global _ATS_MOD
+    if _ATS_MOD is None:
+        _ATS_MOD = _load("_e6_ats", _ATS_PATH)
+    return _ATS_MOD
 
 
 def _load(name: str, path: Path):
@@ -82,6 +94,8 @@ def resolve_run(entry: str) -> dict:
     vm = logs / "vllm_metrics.ndjson"
     if vm.is_file():
         out["metrics"] = vm
+    if any(logs.glob("vllm-*.log")):
+        out["sched_logs"] = logs        # SCHED_DELAY worker logs
     for cand in (root / "profiles", root / "profiles.jsonl"):
         if cand.exists():
             out["profiles"] = cand
@@ -117,6 +131,7 @@ def parse_frontend(e4, path: Path) -> list[dict]:
             inp = _INPUT_RE.search(line)
             tsm = e4._ISO_RE.match(line)
             by_rid[rid.group("v")] = {
+                "request_id": rid.group("v"),
                 "elapsed_ms": float(el.group("v")),
                 "ttft_ms": float(tt.group("v")),
                 "output_tokens": int(ot.group("v")),
@@ -336,8 +351,7 @@ SUMMARY_COLS = [
     "run", "avg_batch_size", "total_input_tokens",
     "input_tokens_per_req_mean", "input_tokens_per_batch_est",
     "kv_hbm_frac_mean", "kv_hbm_gib_mean", "kv_host_gib_mean",
-    "ttft_ms_mean", "ttft_ms_p50", "ttft_ms_p90",
-    "tpot_ms_mean", "tpot_ms_p50", "tpot_ms_p90",
+    "ttft_ms_mean", "tpot_ms_mean",
     "turns_per_session_mean",
 ]
 
@@ -395,14 +409,33 @@ def main(argv: list[str] | None = None) -> int:
                    if r.get("input_tokens") is not None]
             row["total_input_tokens"] = int(sum(inp)) if inp else None
             row["input_tokens_per_req_mean"] = _mean(inp)
-            ttft = [r["ttft_ms"] for r in fe_rows]
-            for k, v in _stats3(ttft).items():
-                row[f"ttft_ms_{k}"] = v
+            # TTFT with engine queue wait removed (ttft - SCHED_DELAY
+            # queue_ms, joined by request_id); requests without a
+            # SCHED_DELAY record fall back to raw ttft.
+            sched = {}
+            if "sched_logs" in run:
+                ats = _load_ats()
+                sched = ats.load_sched(run["sched_logs"])
+            ttft = []
+            n_net = 0
+            for r in fe_rows:
+                t = r["ttft_ms"]
+                rec = sched.get(r["request_id"])
+                if rec is not None:
+                    t = max(0.0, t - rec.total_queue_ms)
+                    n_net += 1
+                ttft.append(t)
+            row["ttft_ms_mean"] = _mean(ttft)
+            if sched:
+                print(f"  ttft: queue-removed for {n_net}/{len(fe_rows)} "
+                      f"requests (SCHED_DELAY join)")
+            else:
+                print("  ttft: raw (no SCHED_DELAY records — worker logs "
+                      "missing or unpatched)")
             tpot = [(r["elapsed_ms"] - r["ttft_ms"]) / (r["output_tokens"] - 1)
                     for r in fe_rows
                     if r.get("output_tokens") and r["output_tokens"] > 1]
-            for k, v in _stats3(tpot).items():
-                row[f"tpot_ms_{k}"] = v
+            row["tpot_ms_mean"] = _mean(tpot)
             print(f"  frontend: {len(fe_rows)} requests, "
                   f"total input tokens {row['total_input_tokens']}")
         else:
