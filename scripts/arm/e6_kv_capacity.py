@@ -14,8 +14,8 @@ works for the log-based parts) this produces:
      input_tokens_per_batch_est  mean ISL x avg_batch_size (estimated
                              input tokens resident per running batch)
      kv_hbm_frac_mean        mean vllm:kv_cache_usage_perc (0-1, worker mean)
-     kv_hbm_gib_mean         above x --hbm-kv-gib (blank without the flag)
-     kv_host_gib_mean        mean host-DRAM KV usage (LMCache metric,
+     kv_hbm_gib_mean/_max    above x --hbm-kv-gib (blank without the flag)
+     kv_host_gib_mean/_max   host-DRAM KV usage (LMCache metric,
                              auto-detected lmcache:* usage/size metric or
                              --host-kv-metric; assumed bytes)
      ttft_ms_mean            frontend.log ttft_ms MINUS engine queue wait
@@ -199,8 +199,9 @@ def detect_host_kv_metric(metrics_path: Path) -> str | None:
 def kv_series(metrics_path: Path, window,
               hbm_kv_gib: float | None,
               host_metric: str | None) -> tuple[list[tuple[float, float]], str]:
-    """[(ts, kv_gib_total)] per scrape tick + a unit tag ("GiB" or
-    "fraction"). Per tick: HBM = mean worker kv_cache_usage_perc x
+    """[(ts, total, hbm_component, host_component)] per scrape tick + a
+    unit tag ("GiB" or "fraction"); components are None when that tier
+    has no sample at the tick. Per tick: HBM = mean worker kv_cache_usage_perc x
     hbm_kv_gib; host = sum of host_metric across workers (bytes -> GiB).
     Ticks are bucketed to 1 s so multi-worker rows merge."""
     # ts_bucket -> {"hbm": [fracs], "host": [bytes]}
@@ -232,28 +233,27 @@ def kv_series(metrics_path: Path, window,
                     v = e.get("value")
                     if isinstance(v, (int, float)):
                         b["host"].append(float(v))
-    series: list[tuple[float, float]] = []
+    series: list[tuple[float, float, float | None, float | None]] = []
     have_host = any(b["host"] for b in buckets.values())
     unit = "GiB"
     if hbm_kv_gib is None and not have_host:
         unit = "fraction"           # nothing to convert; plot raw HBM fraction
     for ts in sorted(buckets):
         b = buckets[ts]
-        total = 0.0
-        got = False
+        hbm_val: float | None = None
+        host_val: float | None = None
         if b["hbm"]:
             frac = _mean(b["hbm"])
             if unit == "fraction":
-                total += frac
-                got = True
+                hbm_val = frac
             elif hbm_kv_gib is not None:
-                total += frac * hbm_kv_gib
-                got = True
+                hbm_val = frac * hbm_kv_gib
         if b["host"]:
-            total += sum(b["host"]) / (2 ** 30)
-            got = True
-        if got:
-            series.append((float(ts), total))
+            host_val = sum(b["host"]) / (2 ** 30)
+        if hbm_val is None and host_val is None:
+            continue
+        total = (hbm_val or 0.0) + (host_val or 0.0)
+        series.append((float(ts), total, hbm_val, host_val))
     return series, unit
 
 
@@ -314,15 +314,25 @@ def fig_kv(per_run: dict[str, tuple[list[tuple[float, float]], str]],
     ylab = "total KV size (GiB)" if units != {"fraction"} else \
         "HBM KV usage (fraction)"
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    ymax = max(v for _, s in runs for _, v in s)
+    ymax = max(r[1] for _, s in runs for r in s)
     ax_c = axes[-1]
     for i, (label, series) in enumerate(runs):
         ax_t = axes[i]
         color = colors[i % len(colors)]
         t0 = series[0][0]
-        xs = [ts - t0 for ts, _ in series]
-        ys = [v for _, v in series]
-        ax_t.plot(xs, ys, lw=1.0, color=color)
+        xs = [r[0] - t0 for r in series]
+        ys = [r[1] for r in series]
+        ax_t.plot(xs, ys, lw=1.2, color=color, label="total")
+        # per-tier components, dashed (only when both tiers exist —
+        # otherwise total == the single tier and dashes just overdraw)
+        hbm = [(r[0] - t0, r[2]) for r in series if r[2] is not None]
+        host = [(r[0] - t0, r[3]) for r in series if r[3] is not None]
+        if hbm and host:
+            ax_t.plot([x for x, _ in hbm], [v for _, v in hbm],
+                      lw=0.9, ls="--", color="gray", label="HBM")
+            ax_t.plot([x for x, _ in host], [v for _, v in host],
+                      lw=0.9, ls=":", color="black", label="host DRAM")
+            ax_t.legend(loc="center right", fontsize=7)
         ax_t.set_xlabel("time (s)")
         ax_t.set_ylabel(ylab)
         ax_t.set_ylim(0, ymax * 1.05)
@@ -350,7 +360,8 @@ def fig_kv(per_run: dict[str, tuple[list[tuple[float, float]], str]],
 SUMMARY_COLS = [
     "run", "avg_batch_size", "total_input_tokens",
     "input_tokens_per_req_mean", "input_tokens_per_batch_est",
-    "kv_hbm_frac_mean", "kv_hbm_gib_mean", "kv_host_gib_mean",
+    "kv_hbm_frac_mean", "kv_hbm_gib_mean", "kv_hbm_gib_max",
+    "kv_host_gib_mean", "kv_host_gib_max",
     "ttft_ms_mean", "tpot_ms_mean",
     "turns_per_session_mean",
 ]
@@ -458,12 +469,14 @@ def main(argv: list[str] | None = None) -> int:
             row["kv_hbm_frac_mean"] = _mean(hbm_fracs)
             if args.hbm_kv_gib is not None and hbm_fracs:
                 row["kv_hbm_gib_mean"] = _mean(hbm_fracs) * args.hbm_kv_gib
+                row["kv_hbm_gib_max"] = max(hbm_fracs) * args.hbm_kv_gib
             if host_metric:
                 host_vals = [v for vs in e4.load_batch_sizes(
                     run["metrics"], window, metric=host_metric).values()
                     for v in vs]
                 if host_vals:
                     row["kv_host_gib_mean"] = _mean(host_vals) / (2 ** 30)
+                    row["kv_host_gib_max"] = max(host_vals) / (2 ** 30)
             if args.hbm_kv_gib is None and host_metric:
                 print("  NOTE: --hbm-kv-gib not given — HBM tier excluded "
                       "from the GiB total (host tier only)")
