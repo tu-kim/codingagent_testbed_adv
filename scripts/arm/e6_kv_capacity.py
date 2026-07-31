@@ -287,33 +287,42 @@ def _mpl():
 
 def fig_kv(per_run: dict[str, tuple[list[tuple[float, float]], str]],
            path: Path) -> None:
-    """Left: total KV size vs time (t=0 at each run's first sample).
-    Right: CDF of the same per-tick samples."""
+    """One time-series subplot PER RUN (t=0 at each run's first sample),
+    plus a final combined CDF panel. Each CDF curve starts at (0, 0)."""
     plt = _mpl()
-    fig, (ax_t, ax_c) = plt.subplots(1, 2, figsize=(12, 4.2))
-    units = {u for _, u in per_run.values() if _}
+    runs = [(lbl, s) for lbl, (s, _u) in per_run.items() if s]
+    if not runs:
+        return
+    n = len(runs)
+    fig, axes = plt.subplots(1, n + 1, figsize=(4.5 * (n + 1), 4.2))
+    units = {u for s, u in per_run.values() if s}
     ylab = "total KV size (GiB)" if units != {"fraction"} else \
         "HBM KV usage (fraction)"
-    for label, (series, _unit) in per_run.items():
-        if not series:
-            continue
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    ymax = max(v for _, s in runs for _, v in s)
+    ax_c = axes[-1]
+    for i, (label, series) in enumerate(runs):
+        ax_t = axes[i]
+        color = colors[i % len(colors)]
         t0 = series[0][0]
         xs = [ts - t0 for ts, _ in series]
         ys = [v for _, v in series]
-        ax_t.plot(xs, ys, lw=1.0, label=label)
+        ax_t.plot(xs, ys, lw=1.0, color=color)
+        ax_t.set_xlabel("time (s)")
+        ax_t.set_ylabel(ylab)
+        ax_t.set_ylim(0, ymax * 1.05)
+        ax_t.set_title(label, fontsize=10)
         s = sorted(ys)
-        cdf = [(i + 1) / len(s) for i in range(len(s))]
-        ax_c.plot(s, cdf, lw=1.2, label=label)
-    ax_t.set_xlabel("time (s)")
-    ax_t.set_ylabel(ylab)
-    ax_t.set_title("KV cache size over time (host DRAM + HBM)")
-    ax_t.legend(loc="upper right", fontsize=8)
+        cdf = [(i2 + 1) / len(s) for i2 in range(len(s))]
+        ax_c.plot([0] + s, [0.0] + cdf, lw=1.2, color=color, label=label)
+    fig.suptitle("KV cache size over time (host DRAM + HBM)", fontsize=11)
     ax_c.set_xlabel(ylab)
     ax_c.set_ylabel("CDF")
+    ax_c.set_xlim(left=0)
     ax_c.set_ylim(0, 1)
     ax_c.set_title("KV cache size CDF")
     ax_c.legend(loc="lower right", fontsize=8)
-    for ax in (ax_t, ax_c):
+    for ax in axes:
         ax.grid(alpha=0.25)
     fig.tight_layout()
     fig.savefig(path)
