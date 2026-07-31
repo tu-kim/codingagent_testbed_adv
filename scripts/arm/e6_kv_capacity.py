@@ -10,6 +10,9 @@ works for the log-based parts) this produces:
                              (all roles pooled, clipped to the frontend
                              run window, same rules as e4)
      total_input_tokens      sum of frontend.log input_tokens
+     input_tokens_per_req_mean   mean ISL per request (frontend.log)
+     input_tokens_per_batch_est  mean ISL x avg_batch_size (estimated
+                             input tokens resident per running batch)
      kv_hbm_frac_mean        mean vllm:kv_cache_usage_perc (0-1, worker mean)
      kv_hbm_gib_mean         above x --hbm-kv-gib (blank without the flag)
      kv_host_gib_mean        mean host-DRAM KV usage (LMCache metric,
@@ -322,6 +325,7 @@ def fig_kv(per_run: dict[str, tuple[list[tuple[float, float]], str]],
 
 SUMMARY_COLS = [
     "run", "avg_batch_size", "total_input_tokens",
+    "input_tokens_per_req_mean", "input_tokens_per_batch_est",
     "kv_hbm_frac_mean", "kv_hbm_gib_mean", "kv_host_gib_mean",
     "ttft_ms_mean", "ttft_ms_p50", "ttft_ms_p90",
     "tpot_ms_mean", "tpot_ms_p50", "tpot_ms_p90",
@@ -381,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             inp = [r["input_tokens"] for r in fe_rows
                    if r.get("input_tokens") is not None]
             row["total_input_tokens"] = int(sum(inp)) if inp else None
+            row["input_tokens_per_req_mean"] = _mean(inp)
             ttft = [r["ttft_ms"] for r in fe_rows]
             for k, v in _stats3(ttft).items():
                 row[f"ttft_ms_{k}"] = v
@@ -447,6 +452,15 @@ def main(argv: list[str] | None = None) -> int:
                   f"p90 {st['end_tokens']['p90']:.0f}")
         else:
             print("  (no profiles — turn/session-token stats skipped)")
+
+        # per-batch input-token estimate: mean ISL x mean running batch
+        # (frontend.log has no batch field, so this is the product of the
+        # two measured means, not a direct per-batch sample)
+        pr = row.get("input_tokens_per_req_mean")
+        bs = row.get("avg_batch_size")
+        if pr is not None and bs is not None and \
+                not (math.isnan(pr) or math.isnan(bs)):
+            row["input_tokens_per_batch_est"] = pr * bs
 
         summary_rows.append(row)
 
