@@ -8,6 +8,10 @@
 #   scripts/apply_opencode_patches.sh           # apply all patches (idempotent)
 #   scripts/apply_opencode_patches.sh --check   # report which patches are pending
 #   scripts/apply_opencode_patches.sh --revert  # reverse-apply all patches
+#   scripts/apply_opencode_patches.sh --reset   # restore pristine submodule
+#                                               # sources (use when an OLD
+#                                               # patch version is applied and
+#                                               # --revert can't reverse it)
 
 set -Eeuo pipefail
 
@@ -25,9 +29,20 @@ mode="apply"
 case "${1-}" in
   --revert) mode="revert" ;;
   --check)  mode="check" ;;
+  --reset)  mode="reset" ;;
   "")       mode="apply" ;;
-  *) echo "usage: $(basename "$0") [--check|--revert]" >&2; exit 2 ;;
+  *) echo "usage: $(basename "$0") [--check|--revert|--reset]" >&2; exit 2 ;;
 esac
+
+if [[ "$mode" == "reset" ]]; then
+  # Discard ALL working-tree changes to the patched source area, tracked
+  # and untracked (profile/ is patch-created). Recovers from the "old
+  # patch version applied, new patch file can't reverse it" state.
+  git -C "$SUBMODULE" checkout -- packages/opencode/src
+  git -C "$SUBMODULE" clean -fd packages/opencode/src
+  echo "opencode submodule sources reset to pristine (packages/opencode/src)"
+  exit 0
+fi
 
 # Prefix-scoped: deploy/patches/ also holds dynamo-*.patch (applied to the
 # dynamo submodule by apply_dynamo_patches.sh). Only touch opencode-*.patch
@@ -74,6 +89,9 @@ for p in "${patches[@]}"; do
       fi
       if ! git -C "$SUBMODULE" apply --check --reverse "$p" >/dev/null 2>&1; then
         echo "$base: cannot reverse-apply" >&2
+        echo "  likely an OLDER version of this patch is applied (patch file" >&2
+        echo "  updated since). Recover with: $(basename "$0") --reset, then" >&2
+        echo "  re-run $(basename "$0") to apply the current version." >&2
         exit 1
       fi
       git -C "$SUBMODULE" apply --reverse "$p"
