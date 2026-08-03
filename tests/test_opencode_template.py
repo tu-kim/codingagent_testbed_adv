@@ -139,6 +139,26 @@ def test_rendered_template_opts_into_nvext_timing():
         )
 
 
+def test_rendered_template_model_options_cover_unknown_agents():
+    """seed + nvext must ALSO live on the provider MODEL options.
+    Agent-level options only cover the six agents named in the template;
+    task-tool SUBAGENT sessions (and any future agent name) run with an
+    agent whose options default to {}, so their requests would carry
+    neither seed nor the nvext timing opt-in — observed 2026-08-03 as
+    whole sessions with llm.end.dynamo null. llm.ts merges
+    input.model.options into EVERY request regardless of agent
+    (session/llm.ts:141; config model options land on Provider.Model via
+    provider.ts:1242), so the model block is the catch-all."""
+    cfg = _render(seed="42")
+    models = cfg["provider"]["dynamo"]["models"]
+    (model_cfg,) = models.values()
+    opts = model_cfg.get("options", {})
+    assert opts == {"seed": 42, "nvext": {"extra_fields": ["timing"]}}, (
+        f"model-level options must carry seed + nvext opt-in "
+        f"(subagent coverage), got {opts!r}"
+    )
+
+
 def test_rendered_template_seed_value_substitutes():
     cfg = _render(seed="7")
     assert cfg["agent"]["build"]["options"]["seed"] == 7
