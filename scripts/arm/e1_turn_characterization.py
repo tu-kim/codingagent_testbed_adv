@@ -1599,6 +1599,24 @@ def main(argv: list[str] | None = None) -> int:
         arw = _load_arw()
         frontend = arw.parse_frontend(args.frontend)
         print(f"frontend log: {len(frontend)} completed requests parsed")
+        # BACKFILL: legacy runs (pre nvext raw-chunk capture) have
+        # llm.end.dynamo == null, so TurnRec.elapsed_s is None and every
+        # llm-time consumer (fig2 CDF, fig10 spans, breakdown) falls back
+        # to the client bracket (~19% under at p50, huge tail — see e7).
+        # The frontend's elapsed_ms is the SAME server-side wall dynamo
+        # would have delivered in-band; restore it by request_id.
+        n_bf = 0
+        for t in turns:
+            if getattr(t, "elapsed_s", None) is not None:
+                continue
+            rid = getattr(t, "request_id", None)
+            fr = frontend.get(rid) if rid else None
+            if fr is not None and fr.total_ms is not None:
+                t.elapsed_s = fr.total_ms / 1000.0
+                n_bf += 1
+        if n_bf:
+            print(f"frontend backfill: elapsed_s restored for {n_bf} turns "
+                  "with null in-band dynamo timing (request_id join)")
     if args.logs is not None and args.logs.exists():
         sched = ats.load_sched(args.logs)
         queue_ms_by_rid = {rid: rec.total_queue_ms
