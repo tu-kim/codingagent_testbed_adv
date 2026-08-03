@@ -1,35 +1,44 @@
-From cb7ce1cee16eb3b9da8afe88148cff8b460147ae Mon Sep 17 00:00:00 2001
+From 6a555430be2d10a95757349dcf03663f8a816168 Mon Sep 17 00:00:00 2001
 From: tu-kim <taewoo89.kim@gmail.com>
-Date: Tue, 14 Jul 2026 21:22:10 +0900
+Date: Mon, 3 Aug 2026 10:21:59 +0900
 Subject: [PATCH] testbed: ENV-gated profile module with step-event
  decomposition
 
 Adds packages/opencode/src/profile/profile.ts plus hooks in
-session/prompt.ts (turn/query/tool brackets) and session/processor.ts
-(start-step / finish-step / text-end). All gated by OPENCODE_PROFILE=1;
+session/prompt.ts (turn/query/tool brackets), session/processor.ts
+(start-step / finish-step / text-end / finish / raw) and
+session/llm.ts (includeRawChunks). All gated by OPENCODE_PROFILE=1;
 no-op otherwise.
 
 llm.duration_s captures pure LLM streaming time using first tool.start
-or last text-end of the step. llm.step_duration_s separately captures
-the whole AI SDK step bracket. turn.end emits post_overhead_s for the
-non-LLM/non-tool slice.
+or last text-end of the step. stream_end_s captures the true stream
+wall via the AI SDK finish event. llm.step_duration_s separately
+captures the whole AI SDK step bracket. turn.end emits post_overhead_s
+for the non-LLM/non-tool slice.
 
-llm.end additionally records response_id and request_id (dynamo's
-chatcmpl-<uuid> chunk id with prefix stripped) so profile turns join
-exactly to frontend/SCHED_DELAY logs by request_id.
+llm.end records response_id and request_id (dynamo's chatcmpl-<uuid>
+chunk id with prefix stripped) for exact joins to frontend/SCHED_DELAY
+logs, and dynamo (in-band nvext.timing). The openai-compatible
+adapter's zod chunk schema STRIPS unknown top-level fields, so
+nvext.timing never reaches providerMetadata -- the timing is instead
+captured from raw SSE chunks: streamText(includeRawChunks: true) ->
+processor case "raw" -> Profile.llm.rawChunk stashes the last chunk's
+nvext.timing per step, preferred over providerMetadata in
+llm.stream-finish / llm.end.
 ---
- packages/opencode/src/profile/profile.ts   | 506 +++++++++++++++++++++
- packages/opencode/src/session/processor.ts |  14 +
- packages/opencode/src/session/prompt.ts    | 234 ++++++----
- 3 files changed, 667 insertions(+), 87 deletions(-)
+ packages/opencode/src/profile/profile.ts   | 524 +++++++++++++++++++++
+ packages/opencode/src/session/llm.ts       |   5 +
+ packages/opencode/src/session/processor.ts |  21 +
+ packages/opencode/src/session/prompt.ts    | 234 +++++----
+ 4 files changed, 697 insertions(+), 87 deletions(-)
  create mode 100644 packages/opencode/src/profile/profile.ts
 
 diff --git a/packages/opencode/src/profile/profile.ts b/packages/opencode/src/profile/profile.ts
 new file mode 100644
-index 000000000..ff3d1f94a
+index 000000000..8a129bf8f
 --- /dev/null
 +++ b/packages/opencode/src/profile/profile.ts
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,524 @@
 +// Lightweight, ENV-gated profiling for the agent loop.
 +//
 +// Turn it on with `OPENCODE_PROFILE=1`. When unset/0/false every Profile.*
@@ -114,6 +123,11 @@ index 000000000..ff3d1f94a
 +  turnStartByStep: Map<number, number>
 +  toolStart: Map<string, { ms: number; step: number; name: string }>
 +  toolWallByStep: Map<number, number>
++  // Last raw-chunk nvext.timing seen for the CURRENT step (includeRawChunks
++  // path). The adapter's zod chunk schema strips unknown fields before
++  // providerMetadata is assembled, so this is the only place dynamo's
++  // in-band timing survives; dynamo emits it on the final chunk only.
++  rawNvextTiming: Record<string, number> | null
 +}
 +
 +const sessions = new Map<string, SessionState>()
@@ -143,6 +157,7 @@ index 000000000..ff3d1f94a
 +      turnStartByStep: new Map(),
 +      toolStart: new Map(),
 +      toolWallByStep: new Map(),
++      rawNvextTiming: null,
 +    }
 +    sessions.set(sessionID, s)
 +  }
@@ -402,6 +417,17 @@ index 000000000..ff3d1f94a
 +    // (request_received_ms, total_time_ms) embedded by the dynamo
 +    // frontend right next to finish_reason — i.e. dynamo's elapsed_ms
 +    // arrives in-band rather than via log scraping.
++    // Raw SSE chunk (streamText includeRawChunks). The zod chunk schema
++    // strips `nvext` before providerMetadata is built, so this hook is
++    // the ONLY reader that sees dynamo's in-band timing. Last write wins
++    // (dynamo attaches timing to the final chunk only).
++    rawChunk(sessionID: string, raw: unknown): void {
++      if (!envEnabled) return
++      const s = sessions.get(sessionID)
++      if (!s) return
++      const timing = extractDynamoTiming(raw)
++      if (timing) s.rawNvextTiming = timing
++    },
 +    streamFinish(
 +      sessionID: string,
 +      info: { finish?: string; tokens?: unknown; providerMetadata?: unknown },
@@ -419,7 +445,7 @@ index 000000000..ff3d1f94a
 +        finish: info.finish,
 +        tokens: info.tokens,
 +        provider_metadata: info.providerMetadata,
-+        dynamo: extractDynamoTiming(info.providerMetadata),
++        dynamo: s.rawNvextTiming ?? extractDynamoTiming(info.providerMetadata),
 +      })
 +    },
 +    end(
@@ -473,8 +499,9 @@ index 000000000..ff3d1f94a
 +        request_id: info.responseId?.startsWith("chatcmpl-")
 +          ? info.responseId.slice("chatcmpl-".length)
 +          : null,
-+        dynamo: extractDynamoTiming(info.providerMetadata),
++        dynamo: s.rawNvextTiming ?? extractDynamoTiming(info.providerMetadata),
 +      })
++      s.rawNvextTiming = null    // consumed; don't leak into the next step
 +    },
 +  },
 +
@@ -536,8 +563,24 @@ index 000000000..ff3d1f94a
 +    },
 +  },
 +}
+diff --git a/packages/opencode/src/session/llm.ts b/packages/opencode/src/session/llm.ts
+index e76583f2d..37fd2195e 100644
+--- a/packages/opencode/src/session/llm.ts
++++ b/packages/opencode/src/session/llm.ts
+@@ -363,6 +363,11 @@ const live: Layer.Layer<
+         temperature: params.temperature,
+         topP: params.topP,
+         topK: params.topK,
++        // Surface raw SSE chunks: the openai-compatible adapter's zod
++        // chunk schema strips unknown top-level fields (dynamo's
++        // `nvext.timing` among them) before providerMetadata is built,
++        // so the only unstripped path is the `raw` stream part.
++        includeRawChunks: true,
+         providerOptions: ProviderTransform.providerOptions(input.model, params.options),
+         activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+         tools,
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index f22da9292..465f367c3 100644
+index f22da9292..d011ddccb 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
 @@ -24,6 +24,7 @@ import { EventV2 } from "@/v2/event"
@@ -577,9 +620,17 @@ index f22da9292..465f367c3 100644
              if (!ctx.currentText) return
              // oxlint-disable-next-line no-self-assign -- reactivity trigger
              ctx.currentText.text = ctx.currentText.text
-@@ -575,6 +584,11 @@ export const layer: Layer.Layer<
+@@ -574,7 +583,19 @@ export const layer: Layer.Layer<
+             ctx.currentText = undefined
              return
  
++          case "raw":
++            // Unstripped chunk JSON (includeRawChunks). Dynamo attaches
++            // nvext.timing to the final chunk only; the hook keeps the
++            // last one seen for this step.
++            Profile.llm.rawChunk(ctx.sessionID, (value as { rawValue?: unknown }).rawValue)
++            return
++
            case "finish":
 +            Profile.llm.streamFinish(ctx.sessionID, {
 +              finish: (value as { finishReason?: string }).finishReason,
