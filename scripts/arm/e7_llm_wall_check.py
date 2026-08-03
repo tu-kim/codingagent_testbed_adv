@@ -63,6 +63,8 @@ def load_llm_ends(profiles: Path) -> list[dict]:
     files = [profiles] if profiles.is_file() else \
         sorted(profiles.glob("*.jsonl"))
     out: list[dict] = []
+    # (session, step) -> tool names called in that turn, call order
+    tools: dict[tuple, list[str]] = {}
     for f in files:
         with f.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -73,7 +75,14 @@ def load_llm_ends(profiles: Path) -> list[dict]:
                     ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if ev.get("ev") != "llm.end":
+                et = ev.get("ev")
+                if et == "tool.end":
+                    key = (ev.get("sessionID"), ev.get("step"))
+                    name = ev.get("tool") or ev.get("name")
+                    if name:
+                        tools.setdefault(key, []).append(str(name))
+                    continue
+                if et != "llm.end":
                     continue
                 dyn = ev.get("dynamo") or {}
                 out.append({
@@ -85,6 +94,8 @@ def load_llm_ends(profiles: Path) -> list[dict]:
                     "dynamo_elapsed_s": (dyn.get("elapsed_s")
                                          if isinstance(dyn, dict) else None),
                 })
+    for e in out:
+        e["tools"] = "+".join(tools.get((e["session"], e["step"]), []))
     return out
 
 
@@ -112,7 +123,7 @@ def _stat_line(name: str, vals: list[float]) -> None:
           f"max={max(vals):8.3f} min={min(vals):8.3f}")
 
 
-CSV_COLS = ["session", "step", "request_id", "basis",
+CSV_COLS = ["session", "step", "request_id", "tools", "basis",
             "client_wall_s", "frontend_s", "dynamo_s",
             "delta_s", "delta_rel", "dynamo_vs_frontend_s"]
 
@@ -154,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         d_s = e["dynamo_elapsed_s"]
         rows.append({
             "session": e["session"], "step": e["step"], "request_id": rid,
+            "tools": e.get("tools", ""),
             "basis": basis,
             "client_wall_s": cw,
             "frontend_s": f_s,
@@ -198,9 +210,10 @@ def main(argv: list[str] | None = None) -> int:
     worst = sorted(rows, key=lambda r: abs(r["delta_s"]), reverse=True)[:10]
     print("\nworst 10 |delta|:")
     for r in worst:
+        tl = f" tools={r['tools']}" if r["tools"] else " tools=(none)"
         print(f"  {r['session']} step {r['step']} [{r['basis']}] "
               f"client {r['client_wall_s']:.3f}s vs frontend "
-              f"{r['frontend_s']:.3f}s (delta {r['delta_s']:+.3f}s)")
+              f"{r['frontend_s']:.3f}s (delta {r['delta_s']:+.3f}s){tl}")
 
     path = args.out / "wall_check.csv"
     with path.open("w", newline="", encoding="utf-8") as f:
