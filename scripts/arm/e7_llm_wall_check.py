@@ -5,10 +5,13 @@ Joins each profile `llm.end` event to its frontend.log `request completed`
 line by request_id (the dynamo Context UUID the profile patch extracts
 from the chunk id) and reports how far apart the two clocks are:
 
-  client_wall_s   profile stream wall: stream_end_s when present
-                  (true stream bracket), else duration_s (legacy
-                  approximation — flagged per row, known to collapse on
-                  buffered turns)
+  client_wall_s   profile stream wall. basis "stream_end" = anchored on
+                  the AI SDK finish event (either an explicit
+                  stream_end_s field, or duration_s on a step whose
+                  llm.stream-finish fired / post_stream_overhead_s is
+                  set — the current patch's encoding). basis "duration"
+                  = legacy first-tool/last-text approximation (known to
+                  collapse on buffered turns).
   frontend_s      frontend elapsed_ms / 1000 (server-side wall from HTTP
                   receipt to last chunk)
   dynamo_s        profile llm.end.dynamo.elapsed_s (the SAME dynamo wall
@@ -65,6 +68,10 @@ def load_llm_ends(profiles: Path) -> list[dict]:
     out: list[dict] = []
     # (session, step) -> tool names called in that turn, call order
     tools: dict[tuple, list[str]] = {}
+    # (session, step) that saw an llm.stream-finish event: on such steps
+    # llm.end's duration_s is anchored on the AI SDK finish event (true
+    # stream wall) rather than the first-tool/last-text approximation.
+    stream_finish: set[tuple] = set()
     for f in files:
         with f.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -82,6 +89,9 @@ def load_llm_ends(profiles: Path) -> list[dict]:
                     if name:
                         tools.setdefault(key, []).append(str(name))
                     continue
+                if et == "llm.stream-finish":
+                    stream_finish.add((ev.get("sessionID"), ev.get("step")))
+                    continue
                 if et != "llm.end":
                     continue
                 dyn = ev.get("dynamo") or {}
@@ -91,11 +101,15 @@ def load_llm_ends(profiles: Path) -> list[dict]:
                     "request_id": ev.get("request_id"),
                     "stream_end_s": ev.get("stream_end_s"),
                     "duration_s": ev.get("duration_s"),
+                    "post_stream_overhead_s": ev.get("post_stream_overhead_s"),
                     "dynamo_elapsed_s": (dyn.get("elapsed_s")
                                          if isinstance(dyn, dict) else None),
                 })
     for e in out:
-        e["tools"] = "+".join(tools.get((e["session"], e["step"]), []))
+        key = (e["session"], e["step"])
+        e["tools"] = "+".join(tools.get(key, []))
+        e["stream_anchored"] = key in stream_finish or \
+            e["post_stream_overhead_s"] is not None
     return out
 
 
@@ -156,9 +170,15 @@ def main(argv: list[str] | None = None) -> int:
             unmatched += 1
             continue
         if e["stream_end_s"] is not None:
+            # older patch naming: explicit stream_end_s field
             basis, cw = "stream_end", float(e["stream_end_s"])
         elif e["duration_s"] is not None:
-            basis, cw = "duration", float(e["duration_s"])
+            # current patch: duration_s is anchored on the AI SDK finish
+            # event when llm.stream-finish fired for this step (true
+            # stream wall) — only otherwise is it the legacy
+            # first-tool/last-text approximation
+            basis = "stream_end" if e["stream_anchored"] else "duration"
+            cw = float(e["duration_s"])
         else:
             continue
         f_s = fr["elapsed_ms"] / 1000.0
