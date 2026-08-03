@@ -1,44 +1,50 @@
-From 6a555430be2d10a95757349dcf03663f8a816168 Mon Sep 17 00:00:00 2001
+From 79488608c95846f8aaa540310b23a043492b4699 Mon Sep 17 00:00:00 2001
 From: tu-kim <taewoo89.kim@gmail.com>
-Date: Mon, 3 Aug 2026 10:21:59 +0900
-Subject: [PATCH] testbed: ENV-gated profile module with step-event
- decomposition
+Date: Mon, 3 Aug 2026 15:37:42 +0900
+Subject: [PATCH] testbed: ENV-gated profile module with step-event +
+ transport-layer decomposition
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Adds packages/opencode/src/profile/profile.ts plus hooks in
 session/prompt.ts (turn/query/tool brackets), session/processor.ts
-(start-step / finish-step / text-end / finish / raw) and
-session/llm.ts (includeRawChunks). All gated by OPENCODE_PROFILE=1;
-no-op otherwise.
+(start-step / finish-step / text-end / finish / raw),
+session/llm.ts (includeRawChunks) and provider/provider.ts (fetch
+response tee). All gated by OPENCODE_PROFILE=1; no-op otherwise.
 
-llm.duration_s captures pure LLM streaming time using first tool.start
-or last text-end of the step. stream_end_s captures the true stream
-wall via the AI SDK finish event. llm.step_duration_s separately
-captures the whole AI SDK step bracket. turn.end emits post_overhead_s
-for the non-LLM/non-tool slice.
+Event-loop hooks timestamp when the client PROCESSED an AI SDK event,
+which under load lags the wire (buffered turns collapse the client
+bracket to ~ms against multi-second server walls). The transport layer
+(Profile.net) is the client-side source of truth: the central provider
+fetch wrapper tees the SSE body before wrapSSE, an eager reader records
+wall-clock ttfb/last-byte at network pace keyed by the chunk id's
+request_id, and llm.end joins it as net.{wall_s, ttfb_s, drain_delay_s,
+fetch_start_unix_s} — drain_delay_s being the event-loop lag behind the
+wire (a first-class CPU-contention measurement, no longer silent bias).
+A standalone llm.net event (sessionID via x-session-affinity) covers
+aborted turns whose llm.end never fires.
 
-llm.end records response_id and request_id (dynamo's chatcmpl-<uuid>
-chunk id with prefix stripped) for exact joins to frontend/SCHED_DELAY
-logs, and dynamo (in-band nvext.timing). The openai-compatible
-adapter's zod chunk schema STRIPS unknown top-level fields, so
-nvext.timing never reaches providerMetadata -- the timing is instead
-captured from raw SSE chunks: streamText(includeRawChunks: true) ->
-processor case "raw" -> Profile.llm.rawChunk stashes the last chunk's
-nvext.timing per step, preferred over providerMetadata in
-llm.stream-finish / llm.end.
+llm.end also records dynamo (in-band nvext.timing captured from raw
+chunks — the openai-compatible zod schema strips unknown fields, so
+providerMetadata never carries it), response_id/request_id (exact join
+to frontend/SCHED_DELAY logs), duration_s (finish-event anchored when
+llm.stream-finish fired), step_duration_s and post_stream_overhead_s.
 ---
- packages/opencode/src/profile/profile.ts   | 524 +++++++++++++++++++++
+ packages/opencode/src/profile/profile.ts   | 667 +++++++++++++++++++++
+ packages/opencode/src/provider/provider.ts |  11 +-
  packages/opencode/src/session/llm.ts       |   5 +
  packages/opencode/src/session/processor.ts |  21 +
- packages/opencode/src/session/prompt.ts    | 234 +++++----
- 4 files changed, 697 insertions(+), 87 deletions(-)
+ packages/opencode/src/session/prompt.ts    | 234 +++++---
+ 5 files changed, 850 insertions(+), 88 deletions(-)
  create mode 100644 packages/opencode/src/profile/profile.ts
 
 diff --git a/packages/opencode/src/profile/profile.ts b/packages/opencode/src/profile/profile.ts
 new file mode 100644
-index 000000000..8a129bf8f
+index 000000000..a8e2bbe40
 --- /dev/null
 +++ b/packages/opencode/src/profile/profile.ts
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,667 @@
 +// Lightweight, ENV-gated profiling for the agent loop.
 +//
 +// Turn it on with `OPENCODE_PROFILE=1`. When unset/0/false every Profile.*
@@ -120,6 +126,9 @@ index 000000000..8a129bf8f
 +  // model's stream is fully consumed (finishReason + usage chunks received).
 +  // Strictly preferred over firstTool/lastText when available.
 +  streamFinishByStep: Map<number, number>
++  // Same instant on the wall clock (unix s) — needed to compare against
++  // the net-layer last-byte time (drain_delay_s = event lag behind wire).
++  streamFinishWallByStep: Map<number, number>
 +  turnStartByStep: Map<number, number>
 +  toolStart: Map<string, { ms: number; step: number; name: string }>
 +  toolWallByStep: Map<number, number>
@@ -154,6 +163,7 @@ index 000000000..8a129bf8f
 +      firstToolStartByStep: new Map(),
 +      lastTextEndByStep: new Map(),
 +      streamFinishByStep: new Map(),
++      streamFinishWallByStep: new Map(),
 +      turnStartByStep: new Map(),
 +      toolStart: new Map(),
 +      toolWallByStep: new Map(),
@@ -176,6 +186,90 @@ index 000000000..8a129bf8f
 +
 +function nowMs(): number {
 +  return performance.now()
++}
++
++// ---------------------------------------------------------------------------
++// Network-layer stream timing (transport truth for the LLM wall).
++//
++// The event-loop hooks above timestamp WHEN THE CLIENT PROCESSED an AI SDK
++// event, which under load lags far behind the wire (chunks pile up in
++// transport buffers while the loop is busy, then drain at once — observed
++// as client walls of ~3ms against 10s server walls). This layer instead
++// tees the raw fetch Response body and eagerly reads one branch at network
++// pace, recording wall-clock first/last-byte times that are immune to SDK
++// consumption lag. Keyed by the dynamo request_id parsed from the first
++// chunk's `"id":"chatcmpl-<uuid>"`; joined onto llm.end (fields
++// llm_net_wall_s / ttfb_net_s / drain_delay_s).
++type NetRec = {
++  fetch_start_unix_s: number
++  ttfb_unix_s: number | null
++  last_byte_unix_s: number | null
++  bytes: number
++}
++const netByRequestId = new Map<string, NetRec>()
++const NET_MAP_CAP = 4096
++const NET_ID_RE = /"id"\s*:\s*"chatcmpl-([^"]+)"/
++
++function netConsume(
++  branch: ReadableStream<Uint8Array>,
++  startUnixS: number,
++  sessionID: string | null,
++): void {
++  const rec: NetRec = {
++    fetch_start_unix_s: startUnixS,
++    ttfb_unix_s: null,
++    last_byte_unix_s: null,
++    bytes: 0,
++  }
++  let requestId: string | null = null
++  let head = ""
++  const reader = branch.getReader()
++  const decoder = new TextDecoder()
++  const pump = async (): Promise<void> => {
++    for (;;) {
++      const { done, value } = await reader.read()
++      const now = Date.now() / 1000
++      if (done) break
++      if (rec.ttfb_unix_s === null) rec.ttfb_unix_s = now
++      rec.last_byte_unix_s = now
++      rec.bytes += value?.byteLength ?? 0
++      if (requestId === null && head.length < 65536 && value) {
++        head += decoder.decode(value, { stream: true })
++        const m = NET_ID_RE.exec(head)
++        if (m) {
++          requestId = m[1]
++          head = ""
++        }
++      }
++    }
++    if (requestId !== null) {
++      if (netByRequestId.size >= NET_MAP_CAP) {
++        const oldest = netByRequestId.keys().next().value
++        if (oldest !== undefined) netByRequestId.delete(oldest)
++      }
++      netByRequestId.set(requestId, rec)
++    }
++    if (sessionID) {
++      emit(sessionID, {
++        ev: "llm.net",
++        ts: unixTs(),
++        sessionID,
++        request_id: requestId,
++        fetch_start_unix_s: rec.fetch_start_unix_s,
++        ttfb_net_s:
++          rec.ttfb_unix_s !== null ? roundSec((rec.ttfb_unix_s - rec.fetch_start_unix_s) * 1000) : null,
++        net_wall_s:
++          rec.last_byte_unix_s !== null
++            ? roundSec((rec.last_byte_unix_s - rec.fetch_start_unix_s) * 1000)
++            : null,
++        bytes: rec.bytes,
++      })
++    }
++  }
++  pump().catch(() => {
++    // network errors surface through the SDK branch; the observer must
++    // never throw into the agent loop.
++  })
 +}
 +
 +function unixTs(): number {
@@ -291,6 +385,32 @@ index 000000000..8a129bf8f
 +export const Profile = {
 +  enabled: envEnabled,
 +  dir: profileDir,
++
++  net: {
++    // Wrap a fetch Response: tee the SSE body, eagerly read one branch at
++    // network pace (transport-truth timestamps), hand the other branch to
++    // the SDK untouched. `startMs` is Date.now() taken immediately before
++    // the fetch was issued; `sessionID` comes from the x-session-affinity
++    // request header when available (enables the standalone llm.net event
++    // even for turns whose llm.end never fires, e.g. aborts).
++    observe(res: Response, meta: { startMs: number; sessionID?: string | null }): Response {
++      if (!envEnabled) return res
++      if (!res.body || !res.ok) return res
++      const ct = res.headers.get("content-type") ?? ""
++      if (!ct.includes("text/event-stream")) return res
++      try {
++        const [sdkBranch, netBranch] = res.body.tee()
++        netConsume(netBranch, meta.startMs / 1000, meta.sessionID ?? null)
++        return new Response(sdkBranch, {
++          status: res.status,
++          statusText: res.statusText,
++          headers: res.headers,
++        })
++      } catch {
++        return res
++      }
++    },
++  },
 +
 +  query: {
 +    start(sessionID: string, meta: { directory?: string } = {}): void {
@@ -437,6 +557,7 @@ index 000000000..8a129bf8f
 +      if (!s) return
 +      const now = nowMs()
 +      s.streamFinishByStep.set(s.step, now)
++      s.streamFinishWallByStep.set(s.step, Date.now() / 1000)
 +      emit(sessionID, {
 +        ev: "llm.stream-finish",
 +        ts: unixTs(),
@@ -479,6 +600,34 @@ index 000000000..8a129bf8f
 +      s.firstToolStartByStep.delete(s.step)
 +      s.lastTextEndByStep.delete(s.step)
 +      s.streamFinishByStep.delete(s.step)
++      const requestId = info.responseId?.startsWith("chatcmpl-")
++        ? info.responseId.slice("chatcmpl-".length)
++        : null
++      // Transport-layer join (Profile.net): the true client-side stream
++      // wall measured at network pace, plus drain_delay_s = how far the
++      // event-loop finish lagged behind the wire's last byte (the
++      // buffered-turn collapse, now a first-class measurement).
++      let netFields: Record<string, number | null> | null = null
++      const net = requestId !== null ? netByRequestId.get(requestId) : undefined
++      if (net) {
++        netByRequestId.delete(requestId!)
++        const sfWall = s.streamFinishWallByStep.get(s.step) ?? Date.now() / 1000
++        netFields = {
++          wall_s:
++            net.last_byte_unix_s !== null
++              ? roundSec((net.last_byte_unix_s - net.fetch_start_unix_s) * 1000)
++              : null,
++          ttfb_s:
++            net.ttfb_unix_s !== null
++              ? roundSec((net.ttfb_unix_s - net.fetch_start_unix_s) * 1000)
++              : null,
++          drain_delay_s:
++            net.last_byte_unix_s !== null
++              ? roundSec((sfWall - net.last_byte_unix_s) * 1000)
++              : null,
++          fetch_start_unix_s: net.fetch_start_unix_s,
++        }
++      }
 +      emit(sessionID, {
 +        ev: "llm.end",
 +        ts: unixTs(),
@@ -496,12 +645,12 @@ index 000000000..8a129bf8f
 +        // in frontend `request completed` and worker SCHED_DELAY lines —
 +        // the exact join key for per-turn scheduling-delay analysis.
 +        response_id: info.responseId ?? null,
-+        request_id: info.responseId?.startsWith("chatcmpl-")
-+          ? info.responseId.slice("chatcmpl-".length)
-+          : null,
++        request_id: requestId,
 +        dynamo: s.rawNvextTiming ?? extractDynamoTiming(info.providerMetadata),
++        net: netFields,
 +      })
 +      s.rawNvextTiming = null    // consumed; don't leak into the next step
++      s.streamFinishWallByStep.delete(s.step)
 +    },
 +  },
 +
@@ -563,6 +712,39 @@ index 000000000..8a129bf8f
 +    },
 +  },
 +}
+diff --git a/packages/opencode/src/provider/provider.ts b/packages/opencode/src/provider/provider.ts
+index 4013dcee3..2e667f69e 100644
+--- a/packages/opencode/src/provider/provider.ts
++++ b/packages/opencode/src/provider/provider.ts
+@@ -14,6 +14,7 @@ import { Env } from "../env"
+ import { InstallationVersion } from "@opencode-ai/core/installation/version"
+ import { Flag } from "@opencode-ai/core/flag/flag"
+ import { zod } from "@/util/effect-zod"
++import { Profile } from "@/profile/profile"
+ import { namedSchemaError } from "@/util/named-schema-error"
+ import { iife } from "@/util/iife"
+ import { Global } from "@opencode-ai/core/global"
+@@ -1501,11 +1502,19 @@ const layer: Layer.Layer<
+             }
+           }
+ 
+-          const res = await fetchFn(input, {
++          const netStart = Date.now()
++          let res = await fetchFn(input, {
+             ...opts,
+             // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
+             timeout: false,
+           })
++          // Transport-layer stream timing (OPENCODE_PROFILE; no-op
++          // otherwise). Tees the SSE body BEFORE wrapSSE so the eager
++          // reader sees network-pace arrival, not SDK consumption.
++          res = Profile.net.observe(res, {
++            startMs: netStart,
++            sessionID: new Headers(opts.headers as HeadersInit | undefined).get("x-session-affinity"),
++          })
+ 
+           if (!chunkAbortCtl) return res
+           return wrapSSE(res, chunkTimeout, chunkAbortCtl)
 diff --git a/packages/opencode/src/session/llm.ts b/packages/opencode/src/session/llm.ts
 index e76583f2d..37fd2195e 100644
 --- a/packages/opencode/src/session/llm.ts
