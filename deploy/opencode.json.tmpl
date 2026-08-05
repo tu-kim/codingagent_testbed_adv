@@ -12,6 +12,7 @@
       "models": {
         "{{MODEL_SERVED_NAME}}": {
           "name": "{{MODEL_NAME}}",
+          "limit": { "context": 262144 },
           "options": { "seed": {{SEED}}, "nvext": { "extra_fields": ["timing"] } }
         }
       }

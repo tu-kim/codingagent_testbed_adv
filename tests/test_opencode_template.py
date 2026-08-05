@@ -159,6 +159,24 @@ def test_rendered_template_model_options_cover_unknown_agents():
     )
 
 
+def test_rendered_template_model_limit_enables_compaction():
+    """The model block must carry limit.context > 0. Custom providers are
+    absent from models.dev, so without an explicit limit opencode resolves
+    model.limit.context to 0 (provider.ts:1244 default) and
+    session/overflow.ts:21 short-circuits isOverflow to false — auto
+    compaction then NEVER triggers and prompts grow until vLLM rejects
+    them at max_model_len. Default boundary: 256k context; the usable
+    threshold becomes 262144 - min(20_000, maxOutputTokens)."""
+    cfg = _render(seed="42")
+    models = cfg["provider"]["dynamo"]["models"]
+    (model_cfg,) = models.values()
+    limit = model_cfg.get("limit", {})
+    assert limit.get("context") == 262144, (
+        f"model-level limit.context must be 262144 (256k) so auto "
+        f"compaction has a token boundary, got {limit!r}"
+    )
+
+
 def test_rendered_template_seed_value_substitutes():
     cfg = _render(seed="7")
     assert cfg["agent"]["build"]["options"]["seed"] == 7
