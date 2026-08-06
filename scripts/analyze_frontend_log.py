@@ -23,7 +23,19 @@ We extract / derive these per request:
                        excludes first-chunk tokens and is noisy. This
                        value is the clean per-token decode wall mean.)
     input_tokens     ISL
-    output_tokens    OSL
+    output_tokens    OSL -- WARNING: TRUNCATED AT THE SOURCE. dynamo
+                     records this by writing ResponseMetricCollector's
+                     self.osl onto the enclosing span at drop time
+                     (metrics.rs:1571-1598); the cancel path breaks the
+                     stream loop early (disconnect.rs:272-286) and the
+                     guard emitting this line races that write with no
+                     guaranteed order. Observed 2026-08-06: all values
+                     1..32 while real OSL reached 32000. Everything
+                     derived from it here (itl_ms_per_token,
+                     isl_osl_ratio, the OSL histogram) is therefore
+                     unreliable -- use scripts/arm/e4_prefill_decode.py
+                     --profiles, which substitutes the profile
+                     usage-chunk value (llm.end.tokens.output).
     isl_osl_ratio    = input_tokens / output_tokens                   (derived)
 
 Outputs (under --output dir):

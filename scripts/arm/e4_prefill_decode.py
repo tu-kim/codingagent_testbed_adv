@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -115,6 +116,70 @@ def parse_frontend(path: Path) -> list[dict]:
                 "completed_unix_s": completed,
             }
     return list(by_rid.values())
+
+
+def profile_output_tokens(profiles: Path) -> dict[str, int]:
+    """{request_id: output_tokens} from profile `llm.end` events.
+
+    The TRUSTWORTHY per-request OSL source. The frontend log's
+    output_tokens is `ResponseMetricCollector::Drop` writing `self.osl`
+    onto the enclosing span (metrics.rs:1571-1598), which gets frozen at
+    a PARTIAL value when the cancel path breaks the stream loop early
+    (disconnect.rs:272-286) and races the InflightGuard that emits the
+    "request completed" line (no guaranteed drop order -- see the
+    vendor's own comment at disconnect.rs:275-276). Observed 2026-08-06:
+    every logged value was 1..32 while profiles carried up to 32000.
+    The profile value comes from the usage chunk
+    (usage.completion_tokens, delta.rs:252-258) -- an independent
+    accumulator immune to both failure modes.
+    """
+    files = [profiles] if profiles.is_file() else sorted(profiles.glob("*.jsonl"))
+    out: dict[str, int] = {}
+    for f in files:
+        with f.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or '"llm.end"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("ev") != "llm.end":
+                    continue
+                rid = ev.get("request_id")
+                tok = ev.get("tokens")
+                if not rid or not isinstance(tok, dict):
+                    continue
+                o = tok.get("output")
+                if isinstance(o, (int, float)) and o >= 0:
+                    out[rid] = int(o)
+    return out
+
+
+def apply_profile_tokens(rows: list[dict], by_rid: dict[str, int]) -> dict:
+    """Replace each row's frontend output_tokens with the profile value
+    and recompute itl_ms. Returns a report dict for stdout."""
+    n_fixed = n_grew = 0
+    growth: list[float] = []
+    for r in rows:
+        o = by_rid.get(r["request_id"])
+        if o is None:
+            continue
+        old = r["output_tokens"]
+        r["output_tokens_frontend"] = old
+        r["output_tokens"] = o
+        # e6's frontend rows carry no decode_ms (it derives tpot itself).
+        if "decode_ms" in r:
+            r["itl_ms"] = r["decode_ms"] / max(o - 1, 1)
+        n_fixed += 1
+        if o > old:
+            n_grew += 1
+            if old > 0:
+                growth.append(o / old)
+    return {"n_fixed": n_fixed, "n_grew": n_grew,
+            "median_growth": (sorted(growth)[len(growth) // 2]
+                              if growth else None)}
 
 
 def run_window(rows: list[dict]) -> tuple[float, float] | None:
@@ -390,6 +455,13 @@ def main(argv: list[str] | None = None) -> int:
                          "engine queue wait by request_id so prefill_net_ms "
                          "= ttft - queue_ms (queue-removed prefill) can be "
                          "computed")
+    ap.add_argument("--profiles", type=Path, default=None,
+                    help="profile NDJSON dir: overrides the frontend log's "
+                         "output_tokens with the usage-chunk value (the "
+                         "frontend field is truncated by a drop-order/"
+                         "cancel race -- see profile_output_tokens). "
+                         "STRONGLY RECOMMENDED: without it itl_ms is "
+                         "computed from a truncated denominator")
     ap.add_argument("--out", type=Path, default=Path("e4_prefill_decode"))
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
@@ -403,6 +475,22 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no 'request completed' lines with "
               "elapsed_ms/ttft_ms/output_tokens", file=sys.stderr)
         return 2
+
+    # OSL correction: the frontend's output_tokens is truncated (see
+    # profile_output_tokens) -- prefer the profile usage-chunk value.
+    if args.profiles is not None and args.profiles.exists():
+        rep = apply_profile_tokens(rows, profile_output_tokens(args.profiles))
+        g = rep["median_growth"]
+        print(f"OSL correction: {rep['n_fixed']}/{len(rows)} requests took "
+              f"the profile usage-chunk output_tokens "
+              f"({rep['n_grew']} were larger than the frontend value"
+              + (f", median x{g:.1f}" if g else "") + ")")
+    else:
+        print("WARNING: no --profiles given. itl_ms uses the frontend "
+              "output_tokens, which is TRUNCATED by a drop-order/cancel "
+              "race (observed: all values 1..32 while real OSL reached "
+              "32000) -- itl_ms will be inflated by orders of magnitude.",
+              file=sys.stderr)
 
     # SCHED_DELAY join: queue-removed prefill (prefill_net = ttft - queue).
     n_q = 0
@@ -427,7 +515,8 @@ def main(argv: list[str] | None = None) -> int:
         w = csv.DictWriter(f, fieldnames=[
             "request_id", "elapsed_ms", "prefill_ms", "queue_ms",
             "prefill_net_ms", "decode_ms", "itl_ms", "output_tokens",
-            "decode_share", "completed_unix_s"], extrasaction="ignore")
+            "output_tokens_frontend", "decode_share", "completed_unix_s"],
+            extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow({k: (f"{v:.4f}" if isinstance(v, float) else v)

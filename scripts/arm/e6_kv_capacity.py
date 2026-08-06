@@ -415,6 +415,19 @@ def main(argv: list[str] | None = None) -> int:
         window = None
         if "frontend" in run:
             fe_rows = parse_frontend(e4, run["frontend"])
+            # The frontend's output_tokens is truncated (drop-order/cancel
+            # race — see e4.profile_output_tokens), which would inflate
+            # tpot by orders of magnitude. Prefer the profile usage-chunk
+            # value whenever this run has profiles.
+            if "profiles" in run:
+                rep = e4.apply_profile_tokens(
+                    fe_rows, e4.profile_output_tokens(run["profiles"]))
+                print(f"  osl: profile usage-chunk value applied to "
+                      f"{rep['n_fixed']}/{len(fe_rows)} requests "
+                      f"({rep['n_grew']} larger than the frontend value)")
+            else:
+                print("  osl: WARNING frontend output_tokens used as-is "
+                      "(no profiles) — tpot_ms_mean is unreliable")
             window = e4.run_window(fe_rows)
             inp = [r["input_tokens"] for r in fe_rows
                    if r.get("input_tokens") is not None]
