@@ -165,14 +165,34 @@ def main(argv: list[str] | None = None) -> int:
               f"{args.metrics_total:.0f} (whole-process, immune) -- "
               "should be >= the profile sum for this run")
 
-    verdict = len(short) > len(joined) * 0.1
-    print("\nVERDICT: " + (
-        "TRUNCATION CONFIRMED -- do not use frontend output_tokens, "
-        "avg_itl_ms, or the output_sequence_length histogram; run e4 with "
-        "--profiles."
-        if verdict else
-        "no widespread truncation in this log -- frontend OSL looks "
-        "consistent with the profile usage chunks."))
+    # Judge by TOKEN share, not request share. The observed failure mode
+    # (2026-08-06) truncated only 34/3006 requests -- 1.1%, which a
+    # request-count threshold would wave through -- but those 34 were the
+    # longest generations, so 47% of all output tokens vanished from the
+    # log and every tail/aggregate statistic was wrong.
+    req_share = len(short) / len(joined)
+    tok_share = 1.0 - (fe_sum / pr_sum) if pr_sum else 0.0
+    if tok_share > 0.01 or req_share > 0.01:
+        print(f"\nVERDICT: TRUNCATION CONFIRMED -- {len(short)} requests "
+              f"({100.0 * req_share:.1f}%) short, but {100.0 * tok_share:.1f}% "
+              "of output tokens missing.")
+        if req_share < 0.05 <= tok_share:
+            print("  Shape: rare but concentrated on the LONGEST "
+                  "generations. Central statistics (median OSL/ITL) from "
+                  "the frontend log were roughly right; tails (p90/p99/"
+                  "max), totals, throughput and aggregate ITL were not.")
+        print("  Do not use frontend output_tokens, avg_itl_ms, or the "
+              "output_sequence_length histogram. Run e4 with --profiles.")
+    else:
+        print("\nVERDICT: no meaningful truncation in this log -- frontend "
+              "OSL is consistent with the profile usage chunks.")
+    if st and sum(v for k, v in st.items()
+                  if k.lower() not in ("success", "ok", "(absent)")) \
+            < 0.05 * max(total, 1) and short:
+        print("  Note: statuses are overwhelmingly success, so the cancel "
+              "path (disconnect.rs:272-286) does NOT explain these -- the "
+              "drop-order race on the span write is the remaining "
+              "mechanism.")
     return 0
 
 
