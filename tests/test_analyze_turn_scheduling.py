@@ -539,6 +539,144 @@ def test_main_missing_profiles_returns_2(mod, tmp_path, capsys):
     assert "not found" in capsys.readouterr().err
 
 
+# ---------- prefix_reuse_rows / write_prefix_reuse_csv / print_prefix_reuse ----------
+
+
+def test_prefix_reuse_rows_basic(mod, tmp_path):
+    _write_profile(tmp_path, "s", [
+        _llm_end(1, request_id="r1", inp=200, out=50, cache_read=800),
+    ])
+    (t,) = mod.load_turns(tmp_path)
+    t.cache_write = 123
+    rows = mod.prefix_reuse_rows([t])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["session_id"] == "s"
+    assert row["step"] == 1
+    assert row["request_id"] == "r1"
+    assert row["prefix_hit_tokens"] == 800
+    assert row["reprefill_tokens"] == 200
+    assert row["prompt_tokens"] == 1000
+    assert row["hit_ratio"] == pytest.approx(0.8)
+    assert row["cache_write_tokens"] == 123
+    assert row["output_tokens"] == 50
+
+
+def test_prefix_reuse_rows_skips_turns_without_usage(mod):
+    # no input_tokens at all -> effective_input is None/falsy -> skipped,
+    # not counted as a 0%-hit row (CLAUDE.md: skip rather than bias down).
+    no_usage = mod.TurnRec(session_id="s", step=1)
+    zero_isl = mod.TurnRec(session_id="s", step=2, input_tokens=0, cache_read=0)
+    has_usage = mod.TurnRec(session_id="s", step=3, input_tokens=10, cache_read=0)
+    rows = mod.prefix_reuse_rows([no_usage, zero_isl, has_usage])
+    assert len(rows) == 1
+    assert rows[0]["step"] == 3
+
+
+def test_prefix_reuse_rows_hit_ratio_math(mod):
+    t = mod.TurnRec(session_id="s", step=1, input_tokens=250, cache_read=750)
+    (row,) = mod.prefix_reuse_rows([t])
+    assert row["prompt_tokens"] == 1000
+    assert row["hit_ratio"] == pytest.approx(0.75)
+
+
+def test_prefix_reuse_rows_full_miss(mod):
+    t = mod.TurnRec(session_id="s", step=1, input_tokens=500, cache_read=0)
+    (row,) = mod.prefix_reuse_rows([t])
+    assert row["hit_ratio"] == 0.0
+    assert row["prefix_hit_tokens"] == 0
+
+
+def test_prefix_reuse_rows_optional_fields_default_to_empty_string(mod):
+    # no request_id, no away_s / away_displaced_tokens / llm_start_ts on a
+    # bare TurnRec -> row uses "" placeholders, not None (CSV-safe).
+    t = mod.TurnRec(session_id="s", step=1, input_tokens=100, cache_read=0)
+    (row,) = mod.prefix_reuse_rows([t])
+    assert row["request_id"] == ""
+    assert row["away_s"] == ""
+    assert row["away_displaced_tokens"] == ""
+    assert row["llm_start_ts"] == ""
+    assert row["output_tokens"] == ""
+    assert row["prev_tools"] == "(none)"
+
+
+def test_prefix_reuse_rows_cache_write_capture(mod, tmp_path):
+    ev = _llm_end(1, request_id="r1", inp=100, cache_read=0)
+    ev["tokens"]["cache"]["write"] = 999
+    _write_profile(tmp_path, "s", [ev])
+    (t,) = mod.load_turns(tmp_path)
+    assert t.cache_write == 999
+    (row,) = mod.prefix_reuse_rows([t])
+    assert row["cache_write_tokens"] == 999
+
+
+def test_write_prefix_reuse_csv_header_and_column_order(mod, tmp_path):
+    t = mod.TurnRec(session_id="ses1", step=2, input_tokens=100, cache_read=400,
+                     cache_write=10, output_tokens=30, away_s=1.5,
+                     away_displaced_tokens=7, llm_start_ts=12345.0)
+    rows = mod.prefix_reuse_rows([t])
+    out = tmp_path / "prefix_reuse.csv"
+    mod.write_prefix_reuse_csv(out, rows)
+    with out.open(newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+    assert header == [
+        "session_id", "step", "request_id", "prev_tools",
+        "prefix_hit_tokens", "reprefill_tokens", "prompt_tokens",
+        "hit_ratio", "cache_write_tokens", "output_tokens",
+        "away_s", "away_displaced_tokens", "llm_start_ts",
+    ]
+
+
+def test_write_prefix_reuse_csv_roundtrip(mod, tmp_path):
+    t = mod.TurnRec(session_id="ses1", step=2, input_tokens=100, cache_read=400,
+                     cache_write=10, output_tokens=30, away_s=1.5,
+                     away_displaced_tokens=7, llm_start_ts=12345.0)
+    rows = mod.prefix_reuse_rows([t])
+    out = tmp_path / "prefix_reuse.csv"
+    mod.write_prefix_reuse_csv(out, rows)
+    (read_row,) = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert read_row["session_id"] == "ses1"
+    assert int(read_row["step"]) == 2
+    assert int(read_row["prefix_hit_tokens"]) == 400
+    assert int(read_row["reprefill_tokens"]) == 100
+    assert int(read_row["prompt_tokens"]) == 500
+    assert float(read_row["hit_ratio"]) == pytest.approx(0.8)
+    assert int(read_row["cache_write_tokens"]) == 10
+    assert int(read_row["output_tokens"]) == 30
+    assert float(read_row["away_s"]) == pytest.approx(1.5)
+    assert int(read_row["away_displaced_tokens"]) == 7
+    assert float(read_row["llm_start_ts"]) == pytest.approx(12345.0)
+
+
+def test_write_prefix_reuse_csv_empty_rows_writes_header_only(mod, tmp_path):
+    out = tmp_path / "prefix_reuse.csv"
+    mod.write_prefix_reuse_csv(out, [])
+    assert out.is_file()
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert rows == []
+    with out.open(newline="", encoding="utf-8") as fh:
+        header = next(csv.reader(fh))
+    assert header[0] == "session_id"
+
+
+def test_print_prefix_reuse_empty_rows(mod, capsys):
+    mod.print_prefix_reuse([], total_turns=5)
+    out = capsys.readouterr().out
+    assert "no requests with usage data" in out
+
+
+def test_print_prefix_reuse_nonempty_summary(mod, capsys):
+    t1 = mod.TurnRec(session_id="s", step=1, input_tokens=200, cache_read=800)
+    t2 = mod.TurnRec(session_id="s", step=2, input_tokens=1000, cache_read=0)
+    rows = mod.prefix_reuse_rows([t1, t2])
+    mod.print_prefix_reuse(rows, total_turns=3)
+    out = capsys.readouterr().out
+    assert "requests: 2 (of 3 turns; 1 lacked usage data)" in out
+    assert "token-weighted hit rate" in out
+    assert "full-miss requests (hit_ratio == 0): 1 (50.0%)" in out
+
+
 def test_main_no_turns_returns_2(mod, tmp_path, capsys):
     # profiles dir exists but has no parseable llm.start/llm.end/tool.end
     # events -> load_turns() is empty -> hard error (distinct from the

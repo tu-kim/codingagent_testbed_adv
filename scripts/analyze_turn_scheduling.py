@@ -39,13 +39,20 @@ Outputs (under --out):
   by_tool.csv        per preceding-tool aggregation (count, small-turn share,
                      p50/p90/p99 of output_tokens/llm_wall_s/queue metrics,
                      queue_share conditioned small vs large)
+  prefix_reuse.csv   one row PER REQUEST (PROFILE-ONLY: works without worker
+                     logs): prefix_hit_tokens (=tokens.cache.read, reused KV),
+                     reprefill_tokens (=tokens.input, recomputed), prompt_tokens
+                     (=hit+reprefill, the real ISL), hit_ratio, plus away_s /
+                     away_displaced_tokens for correlating with off-GPU time.
   away_cache.csv     away-time buckets -> prefix-cache hit ratio + re-prefilled
                      tokens (PROFILE-ONLY: works without worker logs). Measures
                      the KV-eviction cost of leaving the GPU between turns:
                      away_s = llm.start(N) - llm.end(N-1); cache_hit_ratio =
                      tokens.cache.read / (tokens.input + tokens.cache.read).
-  stdout             match-quality report + by-tool table + away/cache table
-                     with pearson r(away_s, cache_hit_ratio)
+  stdout             match-quality report + by-tool table + prefix-reuse
+                     summary (token-weighted hit rate, per-request hit_ratio
+                     percentiles, full-miss share) + away/cache table with
+                     pearson r(away_s, cache_hit_ratio)
 """
 
 from __future__ import annotations
@@ -87,6 +94,8 @@ class TurnRec:
                                        # reasoning from the next prompt, so it
                                        # is not reusable KV downstream)
     cache_read: int = 0
+    cache_write: int = 0               # tokens written INTO the prefix cache
+                                       # this turn (not all providers report it)
     llm_wall_s: float | None = None    # llm.end duration_s (stream wall)
     # turn.end llm_wall_true_s: wall-clock-anchored LLM wall
     # (llm.end - turn.start - tool_wall). Correct even for BUFFERED
@@ -206,6 +215,7 @@ def load_turns(profiles_dir: Path) -> list[TurnRec]:
                 t.output_tokens = out
                 t.reasoning_tokens = (tokens.get("reasoning") or 0)
                 t.cache_read = (cache.get("read") if isinstance(cache, dict) else 0) or 0
+                t.cache_write = (cache.get("write") if isinstance(cache, dict) else 0) or 0
             elif ev_type == "turn.end":
                 t = turns.setdefault(key, TurnRec(session_id=sid, step=int(step)))
                 if ev.get("llm_wall_true_s") is not None:
@@ -509,6 +519,88 @@ def away_cache_rows(turns: list[TurnRec]) -> list[dict]:
     return rows
 
 
+def prefix_reuse_rows(turns: list[TurnRec]) -> list[dict]:
+    """One row per LLM request: how many prompt tokens were served from
+    the prefix cache vs re-prefilled.
+
+    Definitions (profile `llm.end.tokens`; CLAUDE.md: ISL = input +
+    cache.read, i.e. `input` ALREADY has the cached tokens subtracted):
+      prefix_hit_tokens  = tokens.cache.read      -- reused KV, no compute
+      reprefill_tokens   = tokens.input           -- recomputed prefill
+      prompt_tokens      = hit + reprefill        -- the real ISL
+      hit_ratio          = hit / prompt_tokens
+    Turns whose usage block never arrived (no input tokens) are skipped
+    rather than counted as 0% hits, which would bias every statistic down.
+    """
+    rows = []
+    for t in turns:
+        eff = t.effective_input
+        if not eff:
+            continue
+        rows.append({
+            "session_id": t.session_id,
+            "step": t.step,
+            "request_id": t.request_id or "",
+            "prev_tools": t.prev_key,
+            "prefix_hit_tokens": t.cache_read,
+            "reprefill_tokens": t.input_tokens,
+            "prompt_tokens": eff,
+            "hit_ratio": t.cache_read / eff,
+            "cache_write_tokens": t.cache_write,
+            "output_tokens": t.output_tokens if t.output_tokens is not None else "",
+            "away_s": t.away_s if t.away_s is not None else "",
+            "away_displaced_tokens": (t.away_displaced_tokens
+                                      if t.away_displaced_tokens is not None else ""),
+            "llm_start_ts": t.llm_start_ts if t.llm_start_ts is not None else "",
+        })
+    return rows
+
+
+def write_prefix_reuse_csv(path: Path, rows: list[dict]) -> None:
+    cols = ["session_id", "step", "request_id", "prev_tools",
+            "prefix_hit_tokens", "reprefill_tokens", "prompt_tokens",
+            "hit_ratio", "cache_write_tokens", "output_tokens",
+            "away_s", "away_displaced_tokens", "llm_start_ts"]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def print_prefix_reuse(rows: list[dict], total_turns: int) -> None:
+    print("\nPrefix-cache reuse per request "
+          "(hit = tokens.cache.read, reprefill = tokens.input):")
+    if not rows:
+        print("  no requests with usage data — profiles carry no token "
+              "accounting for this run")
+        return
+    hit = [float(r["prefix_hit_tokens"]) for r in rows]
+    rep = [float(r["reprefill_tokens"]) for r in rows]
+    prm = [float(r["prompt_tokens"]) for r in rows]
+    ratios = [float(r["hit_ratio"]) for r in rows]
+    n = len(rows)
+    sum_hit, sum_rep, sum_prm = sum(hit), sum(rep), sum(prm)
+    print(f"  requests: {n} (of {total_turns} turns; "
+          f"{total_turns - n} lacked usage data)")
+    # Token-weighted rate is the one that matters for prefill COST; the
+    # per-request mean over-weights tiny prompts.
+    print(f"  totals: prompt={sum_prm:.0f}  hit={sum_hit:.0f}  "
+          f"reprefill={sum_rep:.0f}")
+    if sum_prm:
+        print(f"  token-weighted hit rate: {100.0 * sum_hit / sum_prm:.1f}%  "
+              "(= saved prefill compute)")
+    print(f"  per-request hit_ratio: p10={_pct(ratios, 0.10):.3f} "
+          f"p50={_pct(ratios, 0.50):.3f} p90={_pct(ratios, 0.90):.3f} "
+          f"mean={sum(ratios) / n:.3f}")
+    print(f"  prefix_hit_tokens:  p50={_pct(hit, 0.50):.0f} "
+          f"p90={_pct(hit, 0.90):.0f} max={max(hit):.0f}")
+    print(f"  reprefill_tokens:   p50={_pct(rep, 0.50):.0f} "
+          f"p90={_pct(rep, 0.90):.0f} max={max(rep):.0f}")
+    zero = sum(1 for r in ratios if r == 0.0)
+    print(f"  full-miss requests (hit_ratio == 0): {zero} "
+          f"({100.0 * zero / n:.1f}%)")
+
+
 def _pearson(pairs: list[tuple[float, float]]) -> tuple[float, int]:
     n = len(pairs)
     if n < 2:
@@ -721,14 +813,18 @@ def main(argv: list[str] | None = None) -> int:
     r, n_ac = away_cache_correlation(turns)
     rd, n_d = displaced_cache_correlation(turns)
     write_away_cache_csv(out_dir / "away_cache.csv", ac_rows)
+    pr_rows = prefix_reuse_rows(turns)
+    write_prefix_reuse_csv(out_dir / "prefix_reuse.csv", pr_rows)
 
     if not sched:
         print("warning: no SCHED_DELAY records parsed from logs — skipping "
-              "queue-wait join, reporting away/cache analysis only",
+              "queue-wait join, reporting profile-only analyses",
               file=sys.stderr)
+        print_prefix_reuse(pr_rows, len(turns))
         print_away_cache(ac_rows, r, n_ac)
         print_displaced(rd, n_d)
-        print(f"\nwrote {out_dir / 'away_cache.csv'}")
+        print(f"\nwrote {out_dir / 'prefix_reuse.csv'}")
+        print(f"wrote {out_dir / 'away_cache.csv'}")
         return 0
 
     have_ids = sum(1 for t in turns if t.request_id)
@@ -746,10 +842,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote session map: {args.emit_session_map}")
 
     print_report(match, len(turns), rows, args.small_tokens)
+    print_prefix_reuse(pr_rows, len(turns))
     print_away_cache(ac_rows, r, n_ac)
     print_displaced(rd, n_d)
     print(f"\nwrote {out_dir / 'turn_sched.csv'}")
     print(f"wrote {out_dir / 'by_tool.csv'}")
+    print(f"wrote {out_dir / 'prefix_reuse.csv'}")
     print(f"wrote {out_dir / 'away_cache.csv'}")
     return 0
 
