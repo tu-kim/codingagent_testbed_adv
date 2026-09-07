@@ -6,10 +6,17 @@ the tables and figures. Measurement is expensive and happens once on the
 GPU host; this side is pure CPU, so the same sweep can be re-analysed
 against any SLA, anywhere, as often as needed.
 
-Several --sweep files can be given and are MERGED on (batch,
+Several --sweep paths can be given and are MERGED on (batch,
 prompt_tokens), later files winning. That is how a coarse full-range run
 and a targeted long-context tail run (which needs its own, larger
 --max-model-len) end up as one curve per batch size.
+
+A --sweep argument may be a DIRECTORY. Runs organised one folder per
+batch size -- b1/, b2/, b4/, ... each holding a sweep.csv -- are the
+common case: point --sweep at the parent (or list the folders) and each
+file's batch size is taken from ITS FOLDER NAME, overriding the CSV
+column. A folder whose name does not parse as a batch size leaves the
+column in charge.
 
 SLA lines: --ttft-sla-ms / --tpot-sla-ms draw a horizontal threshold on
 the matching figure and, per batch-size curve, mark the longest prompt
@@ -23,7 +30,8 @@ A curve that never crosses is reported at the top of its grid with
 crossed=False, so it is not mistaken for a real ceiling.
 
 Inputs:
-  --sweep <csv> [...]   one or more sweep.csv files
+  --sweep <path> [...]  sweep.csv files, or directories holding them
+                        (incl. a parent of b1/, b2/, b4/, ... folders)
   --ttft-sla-ms <ms>    optional TTFT threshold
   --tpot-sla-ms <ms>    optional TPOT threshold
 
@@ -43,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 from pathlib import Path
 
@@ -52,15 +61,77 @@ def read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
-def merge_sweeps(paths: list[Path]) -> list[dict]:
-    """Later files win on a repeated (batch, prompt_tokens) cell -- a
-    re-run of a cell is assumed to supersede the earlier attempt (e.g. an
-    OOM cell re-measured with a smaller batch or more memory)."""
-    cells: dict[tuple[int, int], dict] = {}
+_BATCH_DIR_RE = re.compile(r"^b(?:atch)?[-_]?(\d+)$", re.IGNORECASE)
+
+
+def batch_from_dir(path: Path) -> int | None:
+    """Batch size encoded in a directory name: b8, batch8, b_8, B-8 -> 8.
+
+    Returns None for any other name, which leaves the CSV's own `batch`
+    column in charge.
+    """
+    m = _BATCH_DIR_RE.match(path.name)
+    return int(m.group(1)) if m else None
+
+
+def expand_sweep_paths(paths: list[Path]) -> list[tuple[Path, int | None]]:
+    """Resolve each --sweep argument to (csv, batch_from_folder) pairs.
+
+    A file is taken as-is. A DIRECTORY is expanded, which is how a run
+    laid out one-folder-per-batch-size collapses into a single plot:
+      <dir>/sweep.csv          -> that file, batch from <dir>'s name
+      <dir>/b1/sweep.csv, ...  -> each file, batch from ITS OWN folder
+    A directory holding neither is searched for *.csv as a last resort.
+    The folder's batch (when it parses) overrides the CSV column, since
+    that is the layout the runs were organised by.
+    """
+    out: list[tuple[Path, int | None]] = []
     for p in paths:
-        for r in read_csv(p):
-            cells[(int(r["batch"]), int(r["prompt_tokens"]))] = r
-    return [cells[k] for k in sorted(cells)]
+        if p.is_file():
+            out.append((p, batch_from_dir(p.parent)))
+            continue
+        direct = p / "sweep.csv"
+        if direct.is_file():
+            out.append((direct, batch_from_dir(p)))
+        subs = sorted(d for d in p.iterdir()
+                      if d.is_dir() and batch_from_dir(d) is not None)
+        for d in subs:
+            f = d / "sweep.csv"
+            if f.is_file():
+                out.append((f, batch_from_dir(d)))
+            else:
+                out.extend((c, batch_from_dir(d)) for c in sorted(d.glob("*.csv")))
+        if not direct.is_file() and not subs:
+            out.extend((c, batch_from_dir(p)) for c in sorted(p.glob("*.csv")))
+    return out
+
+
+def merge_sweeps(paths: list[Path]) -> tuple[list[dict], dict]:
+    """Merge every resolved CSV into one cell table.
+
+    Later files win on a repeated (batch, prompt_tokens) cell -- a re-run
+    is assumed to supersede the earlier attempt (an OOM cell re-measured
+    with more memory, say). Returns (rows, report); the report carries
+    the resolved file list and how many rows had their `batch` column
+    rewritten by the folder name, so a mislabelled folder shows up in the
+    output instead of silently relabelling the data.
+    """
+    cells: dict[tuple[int, int], dict] = {}
+    resolved = expand_sweep_paths(paths)
+    report = {"files": [str(f) for f, _b in resolved], "overridden": 0,
+              "mismatched": 0}
+    for f, folder_batch in resolved:
+        for r in read_csv(f):
+            batch = folder_batch
+            if batch is None:
+                batch = int(r["batch"])
+            else:
+                report["overridden"] += 1
+                if r.get("batch") not in ("", None) and int(r["batch"]) != batch:
+                    report["mismatched"] += 1
+                r = dict(r, batch=batch)
+            cells[(batch, int(r["prompt_tokens"]))] = r
+    return [cells[k] for k in sorted(cells)], report
 
 
 def write_csv(path: Path, rows: list[dict], cols: list[str]) -> None:
@@ -238,7 +309,11 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", required=True, nargs="+", type=Path,
-                    help="sweep.csv file(s) from e9_offline_ttft_tpot_sweep.py")
+                    help="sweep.csv file(s) OR directories. A directory is "
+                         "expanded to its own sweep.csv and to every b<N>/ "
+                         "(batch-size) subfolder's, with the folder name "
+                         "setting that data's batch size -- so a per-batch "
+                         "run layout plots as one figure")
     ap.add_argument("--ttft-sla-ms", type=float, default=None)
     ap.add_argument("--tpot-sla-ms", type=float, default=None)
     ap.add_argument("--out", type=Path, default=Path("e9_report"))
@@ -250,15 +325,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: not found: {', '.join(str(p) for p in missing)}",
               file=sys.stderr)
         return 2
-    rows = merge_sweeps(args.sweep)
+    rows, rep = merge_sweeps(args.sweep)
     if not rows:
         print("error: no rows in the given sweep file(s)", file=sys.stderr)
         return 2
     args.out.mkdir(parents=True, exist_ok=True)
 
     n_err = sum(1 for r in rows if r.get("error"))
-    print(f"cells: {len(rows)} from {len(args.sweep)} file(s)"
+    print(f"cells: {len(rows)} from {len(rep['files'])} file(s)"
           + (f"; {n_err} failed (shown as 'x')" if n_err else ""))
+    for f in rep["files"]:
+        print(f"  {f}")
+    if rep["mismatched"]:
+        print(f"  note: {rep['mismatched']} rows had a batch column "
+              "disagreeing with their folder name; the FOLDER won")
     print_sweep(rows, "ttft_ms", "TTFT (ms)")
     print_sweep(rows, "tpot_ms", "TPOT (ms/token)")
 

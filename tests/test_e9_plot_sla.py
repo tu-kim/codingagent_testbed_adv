@@ -20,6 +20,12 @@ unbanded rows in one call (what merge_sweeps hands plot_metric when a
 --repeat run and an older run are merged), and repeat=1 (columns present
 but every hi==lo, so the "any hi > lo" guard must suppress the band without
 raising).
+
+Per-batch-folder input (`batch_from_dir`, `expand_sweep_paths`, and
+`merge_sweeps`'s folder-overrides-column behaviour) is covered under
+TestBatchFromDir / TestExpandSweepPaths and the override/mismatch cases in
+TestMergeSweeps. NOTE: `merge_sweeps` now returns `(rows, report)`, not
+just `rows` -- every call site below unpacks the tuple.
 """
 import csv
 import importlib.util
@@ -120,6 +126,98 @@ def _write_sweep_csv_with_repeat(path: Path, rows: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# batch_from_dir
+# ---------------------------------------------------------------------------
+
+class TestBatchFromDir:
+    @pytest.mark.parametrize("name, expected", [
+        ("b8", 8), ("batch8", 8), ("B-8", 8), ("b_8", 8),
+        ("BATCH-8", 8), ("Batch_8", 8), ("b-8", 8),
+        ("b100", 100), ("batch_100", 100),
+    ])
+    def test_accepted_spellings(self, e9p, name, expected):
+        assert e9p.batch_from_dir(Path(name)) == expected
+
+    @pytest.mark.parametrize("name", [
+        "b",        # no digits at all
+        "x8",       # doesn't start with b/batch
+        "8b",       # digits before the b
+        "batch",    # "atch" with no digits
+        "bx8",      # stray char between b and the digits
+        "b-",       # separator with no digits
+        "",         # empty name
+    ])
+    def test_rejected_spellings(self, e9p, name):
+        assert e9p.batch_from_dir(Path(name)) is None
+
+
+# ---------------------------------------------------------------------------
+# expand_sweep_paths
+# ---------------------------------------------------------------------------
+
+class TestExpandSweepPaths:
+    def test_file_passes_through_with_batch_from_parent(self, e9p, tmp_path):
+        f = tmp_path / "b3" / "data.csv"
+        _write_sweep_csv(f, [_sweep_row(3, 1000, 10.0, 1.0)])
+
+        out = e9p.expand_sweep_paths([f])
+
+        assert out == [(f, 3)]
+
+    def test_file_passes_through_with_none_when_parent_does_not_parse(
+            self, e9p, tmp_path):
+        f = tmp_path / "randomparent" / "data.csv"
+        _write_sweep_csv(f, [_sweep_row(1, 1000, 10.0, 1.0)])
+
+        out = e9p.expand_sweep_paths([f])
+
+        assert out == [(f, None)]
+
+    def test_dir_yields_own_sweep_csv_plus_batch_subfolders(
+            self, e9p, tmp_path):
+        root = tmp_path / "root"
+        own = root / "sweep.csv"
+        b1 = root / "b1" / "sweep.csv"
+        b2 = root / "b2" / "sweep.csv"
+        _write_sweep_csv(own, [_sweep_row(9, 500, 1.0, 1.0)])
+        _write_sweep_csv(b1, [_sweep_row(1, 1000, 2.0, 1.0)])
+        _write_sweep_csv(b2, [_sweep_row(2, 2000, 3.0, 1.0)])
+
+        out = e9p.expand_sweep_paths([root])
+
+        # own file first (batch_from_dir("root") -> None, column stays in
+        # charge), then each batch subfolder in name-sorted order.
+        assert out == [(own, None), (b1, 1), (b2, 2)]
+
+    def test_batch_subfolder_without_sweep_csv_falls_back_to_its_own_glob(
+            self, e9p, tmp_path):
+        root = tmp_path / "root2"
+        a = root / "b5" / "result_a.csv"
+        b = root / "b5" / "result_b.csv"
+        _write_sweep_csv(a, [_sweep_row(5, 100, 1.0, 1.0)])
+        _write_sweep_csv(b, [_sweep_row(5, 200, 2.0, 1.0)])
+
+        out = e9p.expand_sweep_paths([root])
+
+        assert out == [(a, 5), (b, 5)]
+
+    def test_dir_without_sweep_csv_or_batch_subdirs_falls_back_to_own_glob(
+            self, e9p, tmp_path):
+        root = tmp_path / "flat"
+        a = root / "a.csv"
+        b = root / "b.csv"
+        _write_sweep_csv(a, [_sweep_row(1, 100, 1.0, 1.0)])
+        _write_sweep_csv(b, [_sweep_row(1, 200, 2.0, 1.0)])
+        # A non-batch-named subfolder must not count as a batch subfolder
+        # and must not suppress the own-glob fallback.
+        (root / "notes").mkdir(parents=True, exist_ok=True)
+
+        out = e9p.expand_sweep_paths([root])
+
+        assert out == [(a, None), (b, None)]
+
+
+# ---------------------------------------------------------------------------
 # read_csv / merge_sweeps
 # ---------------------------------------------------------------------------
 
@@ -130,10 +228,12 @@ class TestMergeSweeps:
         _write_sweep_csv(f1, [_sweep_row(1, 1000, 50.0, 5.0)])
         _write_sweep_csv(f2, [_sweep_row(1, 1000, 999.0, 5.0)])
 
-        out = e9p.merge_sweeps([f1, f2])
+        out, rep = e9p.merge_sweeps([f1, f2])
 
         assert len(out) == 1
         assert float(out[0]["ttft_ms"]) == 999.0
+        assert rep == {"files": [str(f1), str(f2)], "overridden": 0,
+                       "mismatched": 0}
 
     def test_cells_are_sorted_by_batch_then_prompt_tokens(self, e9p, tmp_path):
         f1 = tmp_path / "a.csv"
@@ -143,7 +243,7 @@ class TestMergeSweeps:
             _sweep_row(1, 1000, 1.0, 1.0),
         ])
 
-        out = e9p.merge_sweeps([f1])
+        out, _rep = e9p.merge_sweeps([f1])
 
         assert [(int(r["batch"]), int(r["prompt_tokens"])) for r in out] == [
             (1, 1000), (1, 4000), (4, 2000),
@@ -155,12 +255,90 @@ class TestMergeSweeps:
         _write_sweep_csv(f1, [_sweep_row(1, 1000, 1.0, 1.0)])
         _write_sweep_csv(f2, [_sweep_row(1, 2000, 1.0, 1.0)])
 
-        out = e9p.merge_sweeps([f1, f2])
+        out, rep = e9p.merge_sweeps([f1, f2])
 
         assert len(out) == 2
         assert {(int(r["batch"]), int(r["prompt_tokens"])) for r in out} == {
             (1, 1000), (1, 2000),
         }
+        assert rep["files"] == [str(f1), str(f2)]
+
+    def test_folder_batch_overrides_column_and_counts_override(
+            self, e9p, tmp_path):
+        # Folder name parses and AGREES with the CSV's own batch column:
+        # still counted as "overridden" (the folder decided, not the
+        # column), but not as a mismatch.
+        f = tmp_path / "b3" / "sweep.csv"
+        _write_sweep_csv(f, [_sweep_row(3, 2000, 60.0, 5.0)])
+
+        out, rep = e9p.merge_sweeps([tmp_path])
+
+        assert out[0]["batch"] == 3
+        assert rep["overridden"] == 1
+        assert rep["mismatched"] == 0
+
+    def test_folder_batch_disagreeing_with_column_counts_mismatch(
+            self, e9p, tmp_path):
+        # CSV column says batch=1, folder name says batch=2 -- the folder
+        # wins on the output row, and the disagreement is counted.
+        f = tmp_path / "b2" / "sweep.csv"
+        _write_sweep_csv(f, [_sweep_row(1, 1000, 50.0, 5.0)])
+
+        out, rep = e9p.merge_sweeps([tmp_path])
+
+        assert len(out) == 1
+        assert out[0]["batch"] == 2
+        assert rep["overridden"] == 1
+        assert rep["mismatched"] == 1
+
+    def test_override_and_mismatch_counts_accumulate_across_files(
+            self, e9p, tmp_path):
+        _write_sweep_csv(tmp_path / "b2" / "sweep.csv",
+                         [_sweep_row(1, 1000, 50.0, 5.0)])  # mismatched
+        _write_sweep_csv(tmp_path / "b3" / "sweep.csv",
+                         [_sweep_row(3, 2000, 60.0, 5.0)])  # matched
+
+        out, rep = e9p.merge_sweeps([tmp_path])
+
+        assert {(r["batch"], int(r["prompt_tokens"])) for r in out} == {
+            (2, 1000), (3, 2000),
+        }
+        assert rep["overridden"] == 2
+        assert rep["mismatched"] == 1
+
+    def test_no_folder_batch_leaves_column_untouched(self, e9p, tmp_path):
+        # A folder name that doesn't parse (e.g. the bare tmp_path itself)
+        # must not increment overridden/mismatched at all -- the CSV
+        # column is the sole source of the batch, exactly as before this
+        # feature existed.
+        f = tmp_path / "sweep.csv"
+        _write_sweep_csv(f, [_sweep_row(1, 1000, 50.0, 5.0)])
+
+        out, rep = e9p.merge_sweeps([f])
+
+        assert out[0]["batch"] == "1"
+        assert rep["overridden"] == 0
+        assert rep["mismatched"] == 0
+
+    def test_later_file_wins_across_folders(self, e9p, tmp_path):
+        # The later-file-wins rule from test_later_file_wins_on_repeated_cell
+        # holds even when one contributor is a batch-folder expansion and
+        # the other is a plain file passed after it -- both resolve to the
+        # same (batch, prompt_tokens) cell and the later one in --sweep
+        # argument order wins.
+        _write_sweep_csv(tmp_path / "b1" / "sweep.csv",
+                         [_sweep_row(1, 500, 10.0, 1.0)])
+        override = tmp_path / "override.csv"
+        _write_sweep_csv(override, [_sweep_row(1, 500, 999.0, 1.0)])
+
+        out, rep = e9p.merge_sweeps([tmp_path / "b1", override])
+
+        assert len(out) == 1
+        assert float(out[0]["ttft_ms"]) == 999.0
+        # only the folder-expanded file counted as an override; the plain
+        # file's own "1" batch column stood unmodified.
+        assert rep["overridden"] == 1
+        assert rep["mismatched"] == 0
 
     def test_read_csv_round_trips_header_and_rows(self, e9p, tmp_path):
         f1 = tmp_path / "a.csv"
@@ -472,3 +650,37 @@ class TestMain:
         assert rc == 0
         assert (out_dir / "fig_ttft.pdf").exists()
         assert (out_dir / "fig_tpot.pdf").exists()
+
+    def test_batch_folder_tree_end_to_end_prints_three_curves_and_mismatch(
+            self, e9p, tmp_path, capsys):
+        # Per-batch-folder layout: b1/, b2/, b4/, each sweep.csv's OWN
+        # `batch` column left at 1 (as if copy-pasted from a template) --
+        # the folder name must win for b2 and b4, producing two mismatches,
+        # and the merged table must still show three distinct batch-size
+        # curves (1, 2, 4), one row of data per folder.
+        root = tmp_path / "root"
+        _write_sweep_csv(root / "b1" / "sweep.csv",
+                         [_sweep_row(1, 1000, 50.0, 5.0)])
+        _write_sweep_csv(root / "b2" / "sweep.csv",
+                         [_sweep_row(1, 1000, 60.0, 5.0)])
+        _write_sweep_csv(root / "b4" / "sweep.csv",
+                         [_sweep_row(1, 1000, 70.0, 5.0)])
+        out_dir = tmp_path / "out"
+
+        rc = e9p.main(["--sweep", str(root), "--out", str(out_dir),
+                      "--no-figures"])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cells: 3 from 3 file(s)" in out
+        assert ("note: 2 rows had a batch column disagreeing with their "
+                "folder name; the FOLDER won") in out
+        # three separate curves' worth of rows: one per folder, each
+        # carrying its own (folder-assigned) batch size and ttft value.
+        lines = [l for l in out.splitlines() if l.strip()]
+        row1 = next(l for l in lines if l.split()[:1] == ["1"])
+        row2 = next(l for l in lines if l.split()[:1] == ["2"])
+        row4 = next(l for l in lines if l.split()[:1] == ["4"])
+        assert row1.split()[1:] == ["50.0"]
+        assert row2.split()[1:] == ["60.0"]
+        assert row4.split()[1:] == ["70.0"]
