@@ -1103,6 +1103,178 @@ class TestPrintTpotGrid:
 
 
 # ---------------------------------------------------------------------------
+# main() -- --min-tpot-ms TPOT floor filter
+#
+# Fixtures below control tpot_ms precisely via elapsed/ttft (-> decode_ms)
+# and a profile llm.end `tokens.output` value (-> corrected output_tokens,
+# via e4.apply_profile_tokens): tpot_ms = decode_ms / max(output_tokens-1, 1).
+# Each request also gets a distinct `input_tok` so its prompt-token grid
+# bucket is unique and its presence/absence in tpot_by_prompt_grid.csv is
+# individually observable.
+# ---------------------------------------------------------------------------
+
+def _llm_end_out(rid, input_tok, output_tok, cache_read=0):
+    return {"ev": "llm.end", "request_id": rid,
+            "tokens": {"output": output_tok, "input": input_tok,
+                       "cache": {"read": cache_read}}}
+
+
+class TestMainMinTpotFilter:
+    def _setup(self, tmp_path, *, include_blank=False):
+        # r1: decode_ms=1.0,  output=11 -> tpot_ms=0.1  (below default 1.0)
+        # r2: decode_ms=80.0, output=5  -> tpot_ms=20.0 (kept at default;
+        #                                                  dropped at 25)
+        # r3 (optional): decode_ms=50.0, output=1 -> tpot_ms="" (blank --
+        #                                             output_tokens<=1)
+        frontend = tmp_path / "frontend.log"
+        front_rows = [
+            ("r1", 101.0, 100.0, 999),
+            ("r2", 180.0, 100.0, 999),
+        ]
+        prof_recs = [_llm_end_out("r1", input_tok=1000, output_tok=11),
+                     _llm_end_out("r2", input_tok=2000, output_tok=5)]
+        if include_blank:
+            front_rows.append(("r3", 150.0, 100.0, 999))
+            prof_recs.append(_llm_end_out("r3", input_tok=3000, output_tok=1))
+        _write_frontend(frontend, front_rows)
+        profdir = tmp_path / "profiles"
+        profdir.mkdir()
+        _write_jsonl(profdir / "p.jsonl", prof_recs)
+        return frontend, profdir
+
+    def test_default_threshold_drops_from_grid_kept_in_detail_csv(
+            self, e8, tmp_path, capsys):
+        frontend, profdir = self._setup(tmp_path)
+        out = tmp_path / "out"
+        rc = e8.main([
+            "--frontend", str(frontend), "--profiles", str(profdir),
+            "--out", str(out), "--no-figures",
+        ])
+        assert rc == 0
+        stdout = capsys.readouterr().out
+        assert ("excluded 1 requests from TPOT: tpot_ms < 1 ms/token"
+                in stdout)
+
+        # dropped rows stay in ttft_tpot.csv with their real tpot_ms
+        with (out / "ttft_tpot.csv").open() as f:
+            rows = {r["request_id"]: r for r in csv.DictReader(f)}
+        assert rows["r1"]["tpot_ms"] == "0.1"
+        assert rows["r2"]["tpot_ms"] == "20.0"
+
+        # ... but r1's prompt-token band (1000) is absent from the TPOT
+        # grid, while r2's (2000) survives.
+        with (out / "tpot_by_prompt_grid.csv").open() as f:
+            tokens = {r["tokens"] for r in csv.DictReader(f)}
+        assert tokens == {"2000"}
+
+    def test_min_tpot_ms_zero_disables_filter(self, e8, tmp_path, capsys):
+        frontend, profdir = self._setup(tmp_path)
+        out = tmp_path / "out_zero"
+        rc = e8.main([
+            "--frontend", str(frontend), "--profiles", str(profdir),
+            "--out", str(out), "--no-figures", "--min-tpot-ms", "0",
+        ])
+        assert rc == 0
+        stdout = capsys.readouterr().out
+        assert "tpot_ms <" not in stdout  # filter message never printed
+
+        with (out / "tpot_by_prompt_grid.csv").open() as f:
+            tokens = {r["tokens"] for r in csv.DictReader(f)}
+        assert tokens == {"1000", "2000"}
+
+    def test_custom_threshold_drops_more(self, e8, tmp_path, capsys):
+        frontend, profdir = self._setup(tmp_path)
+        out = tmp_path / "out_25"
+        rc = e8.main([
+            "--frontend", str(frontend), "--profiles", str(profdir),
+            "--out", str(out), "--no-figures", "--min-tpot-ms", "25",
+        ])
+        assert rc == 0
+        stdout = capsys.readouterr().out
+        assert ("excluded 2 requests from TPOT: tpot_ms < 25 ms/token"
+                in stdout)
+
+        # both r1 (0.1) and r2 (20.0) are now below 25 -> grid is empty
+        with (out / "tpot_by_prompt_grid.csv").open() as f:
+            assert list(csv.DictReader(f)) == []
+
+    def test_blank_tpot_row_not_counted_and_not_treated_as_filtered(
+            self, e8, tmp_path, capsys):
+        # r3's tpot_ms is blank (output_tokens=1 -> no inter-token interval
+        # to measure). The filter must skip it entirely: not counted in
+        # n_fast (else the message would say "excluded 2", not "excluded
+        # 1"), and not dropped from tpot_rows by the list-comprehension
+        # guard (`r["tpot_ms"] == "" or float(...) >= threshold`) -- a
+        # naive `float(r["tpot_ms"])` on the blank string would also raise
+        # ValueError, so this doubles as a crash regression check.
+        frontend, profdir = self._setup(tmp_path, include_blank=True)
+        out = tmp_path / "out_blank"
+        rc = e8.main([
+            "--frontend", str(frontend), "--profiles", str(profdir),
+            "--out", str(out), "--no-figures",
+        ])
+        assert rc == 0
+        stdout = capsys.readouterr().out
+        assert ("excluded 1 requests from TPOT: tpot_ms < 1 ms/token"
+                in stdout)
+
+        with (out / "ttft_tpot.csv").open() as f:
+            rows = {r["request_id"]: r for r in csv.DictReader(f)}
+        assert len(rows) == 3
+        assert rows["r3"]["tpot_ms"] == ""
+        assert rows["r3"]["osl_source"] == "profile"
+
+
+# ---------------------------------------------------------------------------
+# fig_tpot -- plots against prompt_tokens (not output_tokens)
+# ---------------------------------------------------------------------------
+
+class TestFigTpot:
+    def test_reads_prompt_tokens_not_output_tokens(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        rows = [
+            {"prompt_tokens": 100.0, "tpot_ms": 5.0},
+            {"prompt_tokens": 200.0, "tpot_ms": 10.0},
+        ]
+        out = tmp_path / "fig2.pdf"
+        # Rows deliberately carry no "output_tokens" key -- if fig_tpot
+        # still keyed its x-axis off output_tokens internally this would
+        # raise KeyError instead of writing the file.
+        e8.fig_tpot(rows, [], out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_output_tokens_only_rows_raise(self, e8, tmp_path):
+        # Companion negative check: rows with ONLY output_tokens (no
+        # prompt_tokens) must fail, proving the function is not tolerant
+        # of the old axis as a fallback.
+        pytest.importorskip("matplotlib")
+        rows = [{"output_tokens": 100.0, "tpot_ms": 5.0}]
+        with pytest.raises(KeyError):
+            e8.fig_tpot(rows, [], tmp_path / "fig2_bad.pdf")
+
+
+class TestMainFigureFilenames:
+    def test_fig2_filename_is_prompt_tokens(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        frontend = tmp_path / "frontend.log"
+        _write_frontend(frontend, [("r1", 100.0, 20.0, 10)])
+        profdir = tmp_path / "profiles"
+        profdir.mkdir()
+        _write_jsonl(profdir / "p.jsonl",
+                     [_llm_end("r1", input_tok=100, cache_read=0)])
+        out = tmp_path / "out_figs"
+        rc = e8.main([
+            "--frontend", str(frontend),
+            "--profiles", str(profdir),
+            "--out", str(out),
+        ])
+        assert rc == 0
+        assert (out / "fig2_tpot_vs_prompt_tokens.pdf").exists()
+        assert not (out / "fig2_tpot_vs_output_tokens.pdf").exists()
+
+
+# ---------------------------------------------------------------------------
 # fig_ttft_plane (matplotlib-dependent)
 # ---------------------------------------------------------------------------
 

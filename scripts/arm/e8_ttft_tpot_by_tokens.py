@@ -27,7 +27,10 @@ inflate TPOT by orders of magnitude (this is the source of the absurd
 Requests the profile has no OSL for keep the truncated count and are
 therefore EXCLUDED from every TPOT aggregate and from the figure --
 they stay in ttft_tpot.csv tagged `osl_source=frontend` so the drop is
-auditable.  Running without --profiles is allowed but warns, and leaves
+auditable. Requests whose tpot_ms lands below --min-tpot-ms (default
+1.0 ms/token, i.e. faster than 1000 tok/s for a SINGLE request) are
+dropped the same way: that is a mis-joined elapsed_ms, not a decode
+rate.  Running without --profiles is allowed but warns, and leaves
 the TPOT table empty for that reason.
 
 Token axes.  TTFT is bucketed on TWO different counts, because with
@@ -646,6 +649,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="band width for the TPOT table only (default: "
                          "--grid-step). Also over prompt tokens, but kept "
                          "separate so the two tables can differ in resolution")
+    ap.add_argument("--min-tpot-ms", type=float, default=1.0,
+                    help="drop requests whose tpot_ms falls below this from "
+                         "every TPOT aggregate and figure (default 1.0 -- "
+                         "faster than that is a broken join, not a decode "
+                         "rate). 0 disables the filter")
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
 
@@ -704,6 +712,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  excluded {rep['osl_frontend']} requests from TPOT: no "
               "profile OSL, so output_tokens is the TRUNCATED frontend value "
               "(they remain in ttft_tpot.csv, tagged osl_source=frontend)")
+    # Sub-millisecond TPOT is not a decode rate this model can produce
+    # (>1000 tok/s for ONE request); it is the join going wrong -- an
+    # elapsed_ms that ended before the generation did, divided by a
+    # profile OSL that counted all of it. Averaging those in drags every
+    # bucket down, so they are dropped, counted, and left in the CSV.
+    if args.min_tpot_ms > 0:
+        # Only rows that HAVE a tpot value can be too fast; a blank one
+        # (single-token generation, no inter-token interval to measure)
+        # is skipped by the aggregators anyway and is not a data problem.
+        n_fast = sum(1 for r in tpot_rows if r["tpot_ms"] != ""
+                     and float(r["tpot_ms"]) < args.min_tpot_ms)
+        if n_fast:
+            tpot_rows = [r for r in tpot_rows if r["tpot_ms"] == ""
+                         or float(r["tpot_ms"]) >= args.min_tpot_ms]
+            print(f"  excluded {n_fast} requests from TPOT: tpot_ms < "
+                  f"{args.min_tpot_ms:g} ms/token, physically impossible for "
+                  "one request (kept in ttft_tpot.csv)")
     b_tpot = bucket_rows(tpot_rows, "output_tokens", "tpot_ms", OUTPUT_BINS,
                          False)
 
