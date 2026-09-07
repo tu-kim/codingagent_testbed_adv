@@ -54,13 +54,15 @@ Outputs (under --out):
   ttft_by_prompt_tokens.csv  bucketed: n, mean/p50/p90 ttft_net_ms, per-token us
   ttft_by_reprefill.csv      same, bucketed on re-prefilled tokens
   tpot_by_output_tokens.csv  bucketed: n, mean/p50/p90 tpot_ms
-  ttft_by_prompt_grid.csv    THE prefill table: one row per --grid-step band
-                             of total prompt tokens (1k, 2k, 3k, ...) with
+  ttft_by_prompt_grid.csv    THE prefill table: one row per --ttft-grid-step
+                             band of total prompt tokens, labelled by the
+                             range it covers (0-1000, 1001-2000, ...), with
                              mean_reuse_tokens, mean_reprefill_tokens and
                              mean_ttft_ms -- "at ~Nk of prompt, M tokens were
                              reused, K recomputed, and it cost T ms"
-  tpot_by_output_grid.csv    mean_tpot_ms on the same uniform grid of output
-                             tokens
+  tpot_by_output_grid.csv    mean_tpot_ms per --tpot-grid-step band of output
+                             tokens (separate from the TTFT step: output
+                             lengths run much shorter than prompts)
   prefill_by_reprefill_grid.csv / _cached_ / prefill_grid_2d.csv
                              the same prefill time resolved on each half of
                              the prompt separately, and on the two crossed
@@ -294,8 +296,8 @@ def grid_rows(rows: list[dict], token_col: str, value_col: str,
         vals = [v for _t, v in pairs]
         per = [1000.0 * v / t for t, v in pairs if t > 0]
         out.append({
+            "token_range": _range_label(k, step),
             "tokens": k * step,
-            "label": _ktok(k * step),
             "n": len(vals),
             f"{token_col}_p50": round(_pct([t for t, _v in pairs], 0.50), 1),
             "mean_ms": round(sum(vals) / len(vals), 3),
@@ -308,6 +310,18 @@ def grid_rows(rows: list[dict], token_col: str, value_col: str,
 
 def _ktok(n: int) -> str:
     return f"{n // 1000}k" if n >= 1000 and n % 1000 == 0 else str(n)
+
+
+def _range_label(k: int, step: int) -> str:
+    """The token range bucket k actually covers, as an inclusive span.
+
+    Bucket k is ((k-1)*step, k*step], so its lowest MEMBER is
+    (k-1)*step + 1 -- except bucket 1, which also absorbs 0-token rows.
+    Labelling by the span rather than the upper edge stops the row being
+    misread as a representative or mean token count.
+    """
+    lo = 0 if k == 1 else (k - 1) * step + 1
+    return f"{lo}-{k * step}"
 
 
 def grid2d_rows(rows: list[dict], step: int) -> list[dict]:
@@ -366,8 +380,8 @@ def prompt_grid_rows(rows: list[dict], step: int) -> list[dict]:
     for k in sorted(groups):
         g = groups[k]
         out.append({
+            "token_range": _range_label(k, step),
             "tokens": k * step,
-            "label": _ktok(k * step),
             "n": len(g),
             "mean_reuse_tokens": round(_mean([float(r["cached_tokens"])
                                               for r in g]), 1),
@@ -390,8 +404,8 @@ def tpot_grid_rows(rows: list[dict], step: int) -> list[dict]:
         k = max(1, math.ceil(t / step)) if t > 0 else 1
         groups.setdefault(k, []).append(float(v))
     return [{
+        "token_range": _range_label(k, step),
         "tokens": k * step,
-        "label": _ktok(k * step),
         "n": len(groups[k]),
         "mean_tpot_ms": round(_mean(groups[k]), 4),
     } for k in sorted(groups)]
@@ -402,10 +416,11 @@ def print_prompt_grid(rows: list[dict], step: int) -> None:
     if not rows:
         print("  (no data)")
         return
-    print(f"  {'tokens':>8} {'n':>6} {'mean_reuse':>12} "
+    print(f"  {'tokens':>14} {'n':>6} {'mean_reuse':>12} "
           f"{'mean_reprefill':>16} {'mean_ttft_ms':>14}")
     for r in rows:
-        print(f"  {r['label']:>8} {r['n']:>6} {r['mean_reuse_tokens']:>12.1f} "
+        print(f"  {r['token_range']:>14} {r['n']:>6} "
+              f"{r['mean_reuse_tokens']:>12.1f} "
               f"{r['mean_reprefill_tokens']:>16.1f} "
               f"{r['mean_ttft_ms']:>14.1f}")
 
@@ -415,9 +430,10 @@ def print_tpot_grid(rows: list[dict], step: int) -> None:
     if not rows:
         print("  (no data)")
         return
-    print(f"  {'tokens':>8} {'n':>6} {'mean_tpot_ms':>14}")
+    print(f"  {'tokens':>14} {'n':>6} {'mean_tpot_ms':>14}")
     for r in rows:
-        print(f"  {r['label']:>8} {r['n']:>6} {r['mean_tpot_ms']:>14.3f}")
+        print(f"  {r['token_range']:>14} {r['n']:>6} "
+              f"{r['mean_tpot_ms']:>14.3f}")
 
 
 def print_grid(title: str, rows: list[dict], token_col: str) -> None:
@@ -425,11 +441,12 @@ def print_grid(title: str, rows: list[dict], token_col: str) -> None:
     if not rows:
         print("  (no data)")
         return
-    print(f"  {'tokens':>8} {'n':>6} {'tok_p50':>9} {'mean_ms':>10} "
+    print(f"  {'tokens':>14} {'n':>6} {'tok_p50':>9} {'mean_ms':>10} "
           f"{'p50_ms':>10} {'p90_ms':>10} {'us/tok_p50':>11}")
     for r in rows:
         per = r["us_per_token_p50"]
-        print(f"  {r['label']:>8} {r['n']:>6} {r[token_col + '_p50']:>9.0f} "
+        print(f"  {r['token_range']:>14} {r['n']:>6} "
+              f"{r[token_col + '_p50']:>9.0f} "
               f"{r['mean_ms']:>10.1f} {r['p50_ms']:>10.1f} {r['p90_ms']:>10.1f} "
               f"{(f'{per:.2f}' if per != '' else '-'):>11}")
 
@@ -590,8 +607,17 @@ def main(argv: list[str] | None = None) -> int:
                          "prompt/re-prefill token split")
     ap.add_argument("--out", type=Path, default=Path("e8_ttft_tpot"))
     ap.add_argument("--grid-step", type=int, default=1000,
-                    help="representative-token table step (default 1000 -> "
-                         "rows at 1k, 2k, 3k, ...)")
+                    help="token-band width for BOTH grid tables "
+                         "(default 1000 -> rows covering 0-1000, 1001-2000, "
+                         "...); override either axis below")
+    ap.add_argument("--ttft-grid-step", type=int, default=None,
+                    help="band width for the prompt-token/TTFT table only "
+                         "(default: --grid-step)")
+    ap.add_argument("--tpot-grid-step", type=int, default=None,
+                    help="band width for the output-token/TPOT table only "
+                         "(default: --grid-step). Output lengths are usually "
+                         "an order of magnitude smaller than prompts, so a "
+                         "smaller step here is normal")
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
 
@@ -664,30 +690,31 @@ def main(argv: list[str] | None = None) -> int:
                "p90_ms"])
 
 
-    step = args.grid_step
+    step = args.ttft_grid_step or args.grid_step
+    tpot_step = args.tpot_grid_step or args.grid_step
     g_prompt = prompt_grid_rows(rows, step)
-    g_tpot = tpot_grid_rows(tpot_rows, step)
+    g_tpot = tpot_grid_rows(tpot_rows, tpot_step)
     # kept as files (not printed): the same prefill time resolved on each
     # half of the prompt separately, and on the two crossed.
     g_repre = grid_rows(rows, "reprefill_tokens", "ttft_net_ms", step)
     g_cached = grid_rows(rows, "cached_tokens", "ttft_net_ms", step)
     g2d = grid2d_rows(rows, step)
     write_csv(args.out / "ttft_by_prompt_grid.csv", g_prompt,
-              ["tokens", "label", "n", "mean_reuse_tokens",
+              ["token_range", "tokens", "n", "mean_reuse_tokens",
                "mean_reprefill_tokens", "mean_ttft_ms"])
     write_csv(args.out / "tpot_by_output_grid.csv", g_tpot,
-              ["tokens", "label", "n", "mean_tpot_ms"])
+              ["token_range", "tokens", "n", "mean_tpot_ms"])
     write_csv(args.out / "prefill_by_reprefill_grid.csv", g_repre,
-              ["tokens", "label", "n", "reprefill_tokens_p50", "mean_ms",
-               "p50_ms", "p90_ms", "us_per_token_p50"])
+              ["token_range", "tokens", "n", "reprefill_tokens_p50",
+               "mean_ms", "p50_ms", "p90_ms", "us_per_token_p50"])
     write_csv(args.out / "prefill_by_cached_grid.csv", g_cached,
-              ["tokens", "label", "n", "cached_tokens_p50", "mean_ms",
+              ["token_range", "tokens", "n", "cached_tokens_p50", "mean_ms",
                "p50_ms", "p90_ms", "us_per_token_p50"])
     write_csv(args.out / "prefill_grid_2d.csv", g2d,
               ["reprefill_tokens", "cached_tokens", "n", "mean_ms",
                "p50_ms", "p90_ms"])
     print_prompt_grid(g_prompt, step)
-    print_tpot_grid(g_tpot, step)
+    print_tpot_grid(g_tpot, tpot_step)
 
     if not args.no_figures:
         try:

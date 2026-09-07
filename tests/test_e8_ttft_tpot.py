@@ -565,6 +565,26 @@ class TestKtok:
 
 
 # ---------------------------------------------------------------------------
+# _range_label
+# ---------------------------------------------------------------------------
+
+class TestRangeLabel:
+    def test_bucket_one_starts_at_zero_not_one(self, e8):
+        # Bucket 1 covers (0, step] but also absorbs 0-token rows, so its
+        # label starts at 0 rather than 1.
+        assert e8._range_label(1, 1000) == "0-1000"
+
+    def test_later_bucket_is_exclusive_lower_inclusive_upper(self, e8):
+        assert e8._range_label(2, 1000) == "1001-2000"
+        assert e8._range_label(3, 1000) == "2001-3000"
+
+    def test_non_1000_step(self, e8):
+        assert e8._range_label(1, 500) == "0-500"
+        assert e8._range_label(2, 500) == "501-1000"
+        assert e8._range_label(5, 500) == "2001-2500"
+
+
+# ---------------------------------------------------------------------------
 # grid_rows
 # ---------------------------------------------------------------------------
 
@@ -574,21 +594,21 @@ class TestGridRows:
         out = e8.grid_rows(rows, "tok", "val", 1000)
         assert len(out) == 1
         assert out[0]["tokens"] == 2000
-        assert out[0]["label"] == "2k"
+        assert out[0]["token_range"] == "1001-2000"
 
     def test_value_just_above_edge_moves_up_a_bucket(self, e8):
         rows = [{"tok": 2001.0, "val": 5.0}]
         out = e8.grid_rows(rows, "tok", "val", 1000)
         assert len(out) == 1
         assert out[0]["tokens"] == 3000
-        assert out[0]["label"] == "3k"
+        assert out[0]["token_range"] == "2001-3000"
 
     def test_zero_token_lands_in_bucket_one(self, e8):
         rows = [{"tok": 0.0, "val": 5.0}]
         out = e8.grid_rows(rows, "tok", "val", 1000)
         assert len(out) == 1
         assert out[0]["tokens"] == 1000
-        assert out[0]["label"] == "1k"
+        assert out[0]["token_range"] == "0-1000"
 
     def test_blank_token_or_value_skipped(self, e8):
         rows = [
@@ -710,8 +730,8 @@ class TestPrintGrid:
         out = capsys.readouterr().out
         assert "Grid Title" in out
         assert "tokens" in out
-        assert "1k" in out
-        assert "3k" in out
+        assert "0-1000" in out
+        assert "2001-3000" in out
 
 
 class TestPrintGrid2d:
@@ -778,11 +798,11 @@ class TestMainGrid:
 
         expected = {
             "prefill_by_reprefill_grid.csv": [
-                "tokens", "label", "n", "reprefill_tokens_p50", "mean_ms",
-                "p50_ms", "p90_ms", "us_per_token_p50",
+                "token_range", "tokens", "n", "reprefill_tokens_p50",
+                "mean_ms", "p50_ms", "p90_ms", "us_per_token_p50",
             ],
             "prefill_by_cached_grid.csv": [
-                "tokens", "label", "n", "cached_tokens_p50", "mean_ms",
+                "token_range", "tokens", "n", "cached_tokens_p50", "mean_ms",
                 "p50_ms", "p90_ms", "us_per_token_p50",
             ],
             "prefill_grid_2d.csv": [
@@ -790,11 +810,11 @@ class TestMainGrid:
                 "p50_ms", "p90_ms",
             ],
             "ttft_by_prompt_grid.csv": [
-                "tokens", "label", "n", "mean_reuse_tokens",
+                "token_range", "tokens", "n", "mean_reuse_tokens",
                 "mean_reprefill_tokens", "mean_ttft_ms",
             ],
             "tpot_by_output_grid.csv": [
-                "tokens", "label", "n", "mean_tpot_ms",
+                "token_range", "tokens", "n", "mean_tpot_ms",
             ],
         }
         for name, cols in expected.items():
@@ -825,17 +845,66 @@ class TestMainGrid:
         ])
 
         with (out_default / "prefill_by_reprefill_grid.csv").open() as f:
-            default_labels = [r["label"] for r in csv.DictReader(f)]
+            default_labels = [r["token_range"] for r in csv.DictReader(f)]
         with (out_500 / "prefill_by_reprefill_grid.csv").open() as f:
-            step500_labels = [r["label"] for r in csv.DictReader(f)]
+            step500_labels = [r["token_range"] for r in csv.DictReader(f)]
 
-        # r1 (1000 tokens) is on the 1000 edge in both grids -> "1k" either
-        # way; r2 (2001 tokens) is "3k" on the 1000-step grid but "2500" on
-        # the 500-step grid (2001 -> ceil(2001/500)=5 -> 5*500=2500, not a
-        # round thousand so _ktok leaves it as a plain number).
-        assert default_labels == ["1k", "3k"]
-        assert step500_labels == ["1k", "2500"]
+        # r1 (1000 tokens) sits exactly on the 1000 edge -> bucket 1 -> "0-1000"
+        # on the 1000-step grid, but bucket 2 -> "501-1000" on the 500-step
+        # grid; r2 (2001 tokens) is "2001-3000" on the 1000-step grid but
+        # "2001-2500" on the 500-step grid (ceil(2001/500)=5 -> 5*500=2500).
+        assert default_labels == ["0-1000", "2001-3000"]
+        assert step500_labels == ["501-1000", "2001-2500"]
         assert default_labels != step500_labels
+
+    def test_grid_step_alone_drives_both_ttft_and_tpot_csvs(self, e8, tmp_path):
+        # With only --grid-step set (no --ttft-grid-step / --tpot-grid-step),
+        # both the prompt-token TTFT grid and the output-token TPOT grid must
+        # use it as their band width.
+        frontend, logdir, profdir = self._setup_fixtures_vllm(tmp_path)
+        out = tmp_path / "out_gridstep_only"
+        e8.main([
+            "--frontend", str(frontend), "--logs", str(logdir),
+            "--profiles", str(profdir), "--out", str(out),
+            "--no-figures", "--grid-step", "500",
+        ])
+        with (out / "ttft_by_prompt_grid.csv").open() as f:
+            ttft_ranges = [r["token_range"] for r in csv.DictReader(f)]
+        with (out / "tpot_by_output_grid.csv").open() as f:
+            tpot_ranges = [r["token_range"] for r in csv.DictReader(f)]
+        # every band width in both tables must be a multiple of 500
+        for label in ttft_ranges + tpot_ranges:
+            hi = int(label.split("-")[-1])
+            assert hi % 500 == 0
+
+    def test_ttft_and_tpot_grid_step_independently_override_grid_step(
+            self, e8, tmp_path):
+        frontend, logdir, profdir = self._setup_fixtures_vllm(tmp_path)
+        out = tmp_path / "out_split_steps"
+        e8.main([
+            "--frontend", str(frontend), "--logs", str(logdir),
+            "--profiles", str(profdir), "--out", str(out),
+            "--no-figures",
+            "--grid-step", "1000",
+            "--ttft-grid-step", "2000",
+            "--tpot-grid-step", "3",
+        ])
+        with (out / "ttft_by_prompt_grid.csv").open() as f:
+            ttft_rows = list(csv.DictReader(f))
+        with (out / "tpot_by_output_grid.csv").open() as f:
+            tpot_rows = list(csv.DictReader(f))
+
+        # TTFT bands are on the 2000-wide grid, not the 1000-wide --grid-step
+        # default: every upper edge is a multiple of 2000.
+        for r in ttft_rows:
+            assert int(r["tokens"]) % 2000 == 0
+        # TPOT bands are on the 3-wide grid: r1/r2 both have output_tokens=10
+        # (from _llm_end's fixed tokens.output), so ceil(10/3)=4 -> upper
+        # edge 12, distinct from both --grid-step(1000) and
+        # --ttft-grid-step(2000).
+        for r in tpot_rows:
+            assert int(r["tokens"]) % 3 == 0
+        assert {int(r["tokens"]) for r in tpot_rows} == {12}
 
 
 # ---------------------------------------------------------------------------
@@ -857,13 +926,13 @@ class TestPromptGridRows:
         out = e8.prompt_grid_rows(rows, 1000)
         assert len(out) == 1
         assert out[0]["tokens"] == 2000
-        assert out[0]["label"] == "2k"
+        assert out[0]["token_range"] == "1001-2000"
 
     def test_value_just_above_edge_moves_up_a_bucket(self, e8):
         rows = [_prompt_row(2001.0, 500.0, 1501.0, 30.0)]
         out = e8.prompt_grid_rows(rows, 1000)
         assert out[0]["tokens"] == 3000
-        assert out[0]["label"] == "3k"
+        assert out[0]["token_range"] == "2001-3000"
 
     def test_mean_arithmetic(self, e8):
         rows = [
@@ -922,13 +991,13 @@ class TestTpotGridRows:
         out = e8.tpot_grid_rows(rows, 1000)
         assert len(out) == 1
         assert out[0]["tokens"] == 1000
-        assert out[0]["label"] == "1k"
+        assert out[0]["token_range"] == "0-1000"
 
     def test_value_just_above_edge_moves_up_a_bucket(self, e8):
         rows = [_tpot_row(1001.0, 5.0)]
         out = e8.tpot_grid_rows(rows, 1000)
         assert out[0]["tokens"] == 2000
-        assert out[0]["label"] == "2k"
+        assert out[0]["token_range"] == "1001-2000"
 
     def test_mean_arithmetic(self, e8):
         rows = [_tpot_row(500.0, 10.0), _tpot_row(600.0, 30.0)]
@@ -979,7 +1048,7 @@ class TestPrintPromptGrid:
         e8.print_prompt_grid(rows, 1000)
         out = capsys.readouterr().out
         assert "mean_ttft_ms" in out
-        assert "1k" in out
+        assert "0-1000" in out
 
 
 class TestPrintTpotGrid:
@@ -994,7 +1063,7 @@ class TestPrintTpotGrid:
         e8.print_tpot_grid(rows, 1000)
         out = capsys.readouterr().out
         assert "mean_tpot_ms" in out
-        assert "1k" in out
+        assert "0-1000" in out
 
 
 # ---------------------------------------------------------------------------
