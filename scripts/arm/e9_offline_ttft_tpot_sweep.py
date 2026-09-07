@@ -9,6 +9,11 @@ the queueing a live server adds. Every cell of the
   pass 1: max_tokens=1   -> wall == TTFT (prefill + first decode step)
   pass 2: max_tokens=G   -> TPOT = (wall - TTFT) / (G - 1)
 
+--repeat N runs that pair N times per cell and reports the MEDIAN, with
+min/max kept alongside so the spread is visible; at the default N=1 the
+cell carries no variance information. One warmup cell precedes the whole
+sweep regardless.
+
 The two-pass split is what vLLM's own benchmark_latency.py does; it needs
 no per-request engine metrics, which have moved around across versions.
 Because the whole batch is submitted at once and waited on, the reported
@@ -42,10 +47,12 @@ Inputs:
   --batch-sizes 1,4,16  batch sizes to sweep
   --prompt-lens ...     prompt token counts (default: powers of two)
   --gen-tokens 128      generated tokens for the TPOT pass
+  --repeat 1            repetitions per cell (median reported)
 
 Output:
   <out>/sweep.csv       one row per cell: batch, prompt_tokens, gen_tokens,
-                        ttft_ms, tpot_ms, decode_ms, total_ms, error
+                        repeat, ttft_ms (+_min/_max), tpot_ms (+_min/_max),
+                        decode_ms, total_ms, error
                         (failed cells keep their error text and are kept)
 
 Usage:
@@ -60,6 +67,7 @@ import argparse
 import csv
 import json
 import random
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -192,54 +200,99 @@ def engine_limits(llm) -> tuple[int, int]:
     return int(max_len or 32768), int(vocab_size or 32000)
 
 
-def measure_cell(llm, batch: int, length: int, gen_tokens: int,
-                 vocab_size: int, rng: random.Random) -> dict:
-    """One (batch, length) cell: a max_tokens=1 pass for TTFT and a
-    max_tokens=gen_tokens pass for TPOT, on FRESH random prompts each
-    time so neither pass warms the other."""
+def _one_pass(llm, batch: int, length: int, gen_tokens: int,
+              vocab_size: int, rng: random.Random) -> tuple[float, float]:
+    """(ttft_ms, total_ms) for one repetition, on FRESH random prompts for
+    each of the two passes so neither warms the other."""
     from vllm import SamplingParams
+    greedy = dict(temperature=0.0, ignore_eos=True)
+    p1 = [_tokens_prompt(ids)
+          for ids in random_prompts(batch, length, vocab_size, rng)]
+    t0 = time.perf_counter()
+    llm.generate(p1, SamplingParams(max_tokens=1, **greedy), use_tqdm=False)
+    ttft_ms = (time.perf_counter() - t0) * 1000.0
+
+    p2 = [_tokens_prompt(ids)
+          for ids in random_prompts(batch, length, vocab_size, rng)]
+    t0 = time.perf_counter()
+    llm.generate(p2, SamplingParams(max_tokens=gen_tokens, **greedy),
+                 use_tqdm=False)
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    return ttft_ms, total_ms
+
+
+def measure_cell(llm, batch: int, length: int, gen_tokens: int,
+                 vocab_size: int, rng: random.Random,
+                 repeat: int = 1) -> dict:
+    """One (batch, length) cell, measured `repeat` times.
+
+    The reported value is the MEDIAN, not the mean: a repetition that
+    collides with a background process or a memory-pool growth is a
+    one-sided outlier, and the median ignores it instead of splitting the
+    difference. min/max ride along so the spread stays visible -- with
+    repeat=1 they equal the single value and the cell carries no variance
+    information at all, which is what the columns then say.
+
+    A repetition that raises aborts the remaining ones: the failure at
+    these sizes is KV OOM, which will not pass on the next attempt.
+    """
     row = {"batch": batch, "prompt_tokens": length, "gen_tokens": gen_tokens,
-           "ttft_ms": "", "tpot_ms": "", "decode_ms": "", "total_ms": "",
-           "error": ""}
+           "repeat": repeat, "ttft_ms": "", "ttft_ms_min": "",
+           "ttft_ms_max": "", "tpot_ms": "", "tpot_ms_min": "",
+           "tpot_ms_max": "", "decode_ms": "", "total_ms": "", "error": ""}
+    ttfts: list[float] = []
+    tpots: list[float] = []
+    decodes: list[float] = []
+    totals: list[float] = []
     try:
-        greedy = dict(temperature=0.0, ignore_eos=True)
-        p1 = [_tokens_prompt(ids)
-              for ids in random_prompts(batch, length, vocab_size, rng)]
-        t0 = time.perf_counter()
-        llm.generate(p1, SamplingParams(max_tokens=1, **greedy), use_tqdm=False)
-        ttft_ms = (time.perf_counter() - t0) * 1000.0
-
-        p2 = [_tokens_prompt(ids)
-              for ids in random_prompts(batch, length, vocab_size, rng)]
-        t0 = time.perf_counter()
-        llm.generate(p2, SamplingParams(max_tokens=gen_tokens, **greedy),
-                     use_tqdm=False)
-        total_ms = (time.perf_counter() - t0) * 1000.0
-
-        decode_ms = total_ms - ttft_ms
-        row["ttft_ms"] = round(ttft_ms, 3)
-        row["total_ms"] = round(total_ms, 3)
-        row["decode_ms"] = round(decode_ms, 3)
-        row["tpot_ms"] = round(decode_ms / max(gen_tokens - 1, 1), 4)
+        for _ in range(max(repeat, 1)):
+            ttft_ms, total_ms = _one_pass(llm, batch, length, gen_tokens,
+                                          vocab_size, rng)
+            decode_ms = total_ms - ttft_ms
+            ttfts.append(ttft_ms)
+            totals.append(total_ms)
+            decodes.append(decode_ms)
+            tpots.append(decode_ms / max(gen_tokens - 1, 1))
     except Exception as exc:                      # KV OOM at the big cells
         row["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        # COMPLETED, not requested: a cell that died on repetition 2 of 3
+        # should not claim three measurements it never took.
+        row["repeat"] = len(ttfts)
+        return row
+    row["repeat"] = len(ttfts)
+    row["ttft_ms"] = round(statistics.median(ttfts), 3)
+    row["ttft_ms_min"] = round(min(ttfts), 3)
+    row["ttft_ms_max"] = round(max(ttfts), 3)
+    row["tpot_ms"] = round(statistics.median(tpots), 4)
+    row["tpot_ms_min"] = round(min(tpots), 4)
+    row["tpot_ms_max"] = round(max(tpots), 4)
+    row["decode_ms"] = round(statistics.median(decodes), 3)
+    row["total_ms"] = round(statistics.median(totals), 3)
     return row
 
 
 def run_sweep(llm, batches: list[int], lengths: list[int], gen_tokens: int,
-              vocab_size: int, seed: int, warmup: bool = True) -> list[dict]:
+              vocab_size: int, seed: int, warmup: bool = True,
+              repeat: int = 1) -> list[dict]:
     rng = random.Random(seed)
     if warmup:
-        # Absorbs CUDA graph capture, kernel autotune and allocator growth,
-        # which would otherwise all be charged to the first real cell.
+        # ONE warmup cell for the whole sweep, not per cell: it absorbs
+        # CUDA graph capture, kernel autotune and allocator growth, which
+        # are one-time costs that would otherwise be charged entirely to
+        # the first measured cell.
         measure_cell(llm, 1, min(lengths), min(gen_tokens, 8), vocab_size, rng)
     rows = []
     for batch in batches:
         for length in lengths:
-            row = measure_cell(llm, batch, length, gen_tokens, vocab_size, rng)
+            row = measure_cell(llm, batch, length, gen_tokens, vocab_size,
+                               rng, repeat=repeat)
             rows.append(row)
-            status = row["error"] or (f"ttft {row['ttft_ms']:.0f} ms  "
-                                      f"tpot {row['tpot_ms']:.2f} ms")
+            if row["error"]:
+                status = row["error"]
+            else:
+                status = (f"ttft {row['ttft_ms']:.0f} ms "
+                          f"[{row['ttft_ms_min']:.0f}-{row['ttft_ms_max']:.0f}]"
+                          f"  tpot {row['tpot_ms']:.2f} ms")
             print(f"  batch={batch:<4} prompt={length:<7} {status}", flush=True)
     return rows
 
@@ -280,7 +333,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--extra-engine-kwargs", default=None,
                     help="JSON dict merged into the LLM(...) constructor")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--no-warmup", action="store_true")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="repetitions per cell; the reported value is their "
+                         "MEDIAN, with min/max kept as columns (default 1 = "
+                         "no variance information). Cost scales linearly, so "
+                         "raise it for short prompts and leave it at 1 for a "
+                         "long-context tail run")
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip the single warmup cell that precedes the sweep")
     ap.add_argument("--out", type=Path, default=Path("e9_offline_sweep"))
     args = ap.parse_args(argv)
 
@@ -314,13 +374,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"model={args.model} max_model_len={max_len} vocab={vocab_size}")
     print(f"batches={args.batch_sizes} lengths={lengths} "
-          f"gen_tokens={args.gen_tokens} chunked_prefill={bool(cp)}")
+          f"gen_tokens={args.gen_tokens} repeat={max(args.repeat, 1)} "
+          f"chunked_prefill={bool(cp)}")
     rows = run_sweep(llm, args.batch_sizes, lengths, args.gen_tokens,
-                     vocab_size, args.seed, warmup=not args.no_warmup)
+                     vocab_size, args.seed, warmup=not args.no_warmup,
+                     repeat=max(args.repeat, 1))
     out_csv = args.out / "sweep.csv"
     write_csv(out_csv, rows,
-              ["batch", "prompt_tokens", "gen_tokens", "ttft_ms",
-               "tpot_ms", "decode_ms", "total_ms", "error"])
+              ["batch", "prompt_tokens", "gen_tokens", "repeat", "ttft_ms",
+               "ttft_ms_min", "ttft_ms_max", "tpot_ms", "tpot_ms_min",
+               "tpot_ms_max", "decode_ms", "total_ms", "error"])
 
     n_err = sum(1 for r in rows if r.get("error"))
     if n_err:

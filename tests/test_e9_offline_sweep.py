@@ -14,6 +14,21 @@ build_engine/chunked_prefill_enabled/engine_limits/run_sweep to fakes, so
 no real vLLM install or GPU is touched even for the end-to-end main()
 tests.
 
+The per-repetition body (two generate() calls: max_tokens=1 for TTFT,
+max_tokens=gen_tokens for the decode pass) lives in `_one_pass`, tested
+directly under TestOnePass. `measure_cell(..., repeat=N)` calls `_one_pass`
+N times and reports the MEDIAN of each quantity (statistics.median, which
+averages the two middle values for an even N -- covered explicitly below)
+plus `ttft_ms_min/max` and `tpot_ms_min/max` columns; at repeat=1 min==max
+==the single value. An exception during any repetition aborts the
+remaining ones immediately (proven by asserting the generate() call
+count, not just the returned row) and leaves every numeric field blank,
+while `row["repeat"]` reports the number of repetitions actually
+COMPLETED (0 when the first one died) -- verified
+against the real module with a manual perf_counter/exception trace before
+writing these assertions (see the pytest-mock-author memory note on
+verifying via python3, not pytest).
+
 Everything below main() is still exercised against `_FakeLLM` (a
 `generate()` that records every call and returns a dummy per-prompt list;
 nested attribute stubs are hung off an instance per-test for the
@@ -25,6 +40,7 @@ import argparse
 import csv
 import importlib.util
 import random
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -292,11 +308,12 @@ class TestEngineLimits:
 
 
 # ---------------------------------------------------------------------------
-# measure_cell
+# _one_pass -- the per-repetition body (two generate() calls: TTFT pass then
+# decode pass), called `repeat` times by measure_cell.
 # ---------------------------------------------------------------------------
 
-class TestMeasureCell:
-    def test_deterministic_timings_and_tpot_formula(self, e9, monkeypatch):
+class TestOnePass:
+    def test_deterministic_ttft_and_total_ms(self, e9, monkeypatch):
         _install_fake_vllm(monkeypatch)
         llm = _FakeLLM()
         # Exactly 4 perf_counter() reads happen, in this order:
@@ -305,14 +322,11 @@ class TestMeasureCell:
         ticks = iter([0.0, 0.5, 10.0, 12.0])
         monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
 
-        row = e9.measure_cell(llm, batch=2, length=8, gen_tokens=4,
-                              vocab_size=100, rng=random.Random(0))
+        ttft_ms, total_ms = e9._one_pass(llm, batch=2, length=8, gen_tokens=4,
+                                         vocab_size=100, rng=random.Random(0))
 
-        assert row["error"] == ""
-        assert row["ttft_ms"] == 500.0
-        assert row["total_ms"] == 2000.0
-        assert row["decode_ms"] == 1500.0
-        assert row["tpot_ms"] == row["decode_ms"] / (4 - 1)
+        assert ttft_ms == 500.0
+        assert total_ms == 2000.0
 
     def test_two_generate_calls_with_max_tokens_one_then_gen_tokens(
             self, e9, monkeypatch):
@@ -321,8 +335,8 @@ class TestMeasureCell:
         ticks = iter([0.0, 0.1, 1.0, 1.4])
         monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
 
-        e9.measure_cell(llm, batch=3, length=16, gen_tokens=7,
-                        vocab_size=200, rng=random.Random(1))
+        e9._one_pass(llm, batch=3, length=16, gen_tokens=7,
+                    vocab_size=200, rng=random.Random(1))
 
         assert len(llm.calls) == 2
         first, second = llm.calls
@@ -333,28 +347,6 @@ class TestMeasureCell:
         assert len(first["prompts"]) == 3
         assert len(second["prompts"]) == 3
 
-    def test_generate_exception_captured_other_fields_left_blank(
-            self, e9, monkeypatch):
-        _install_fake_vllm(monkeypatch)
-
-        class _RaisingLLM:
-            def generate(self, *a, **k):
-                raise RuntimeError("boom-OOM")
-
-        monkeypatch.setattr(time, "perf_counter", lambda: 0.0)
-
-        row = e9.measure_cell(_RaisingLLM(), batch=1, length=4, gen_tokens=2,
-                              vocab_size=50, rng=random.Random(2))
-
-        assert row["error"] == "RuntimeError: boom-OOM"
-        assert row["ttft_ms"] == ""
-        assert row["tpot_ms"] == ""
-        assert row["decode_ms"] == ""
-        assert row["total_ms"] == ""
-        assert row["batch"] == 1
-        assert row["prompt_tokens"] == 4
-        assert row["gen_tokens"] == 2
-
     def test_fallback_prompt_shape_when_tokens_prompt_unavailable(
             self, e9, monkeypatch):
         _install_fake_vllm(monkeypatch, with_tokens_prompt=False)
@@ -362,8 +354,8 @@ class TestMeasureCell:
         ticks = iter([0.0, 0.1, 1.0, 1.1])
         monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
 
-        e9.measure_cell(llm, batch=1, length=4, gen_tokens=2,
-                        vocab_size=50, rng=random.Random(3))
+        e9._one_pass(llm, batch=1, length=4, gen_tokens=2,
+                    vocab_size=50, rng=random.Random(3))
 
         prompt = llm.calls[0]["prompts"][0]
         assert isinstance(prompt, dict)
@@ -377,12 +369,166 @@ class TestMeasureCell:
         ticks = iter([0.0, 0.1, 1.0, 1.1])
         monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
 
-        e9.measure_cell(llm, batch=1, length=4, gen_tokens=2,
-                        vocab_size=50, rng=random.Random(4))
+        e9._one_pass(llm, batch=1, length=4, gen_tokens=2,
+                    vocab_size=50, rng=random.Random(4))
 
         prompt = llm.calls[0]["prompts"][0]
         assert not isinstance(prompt, dict)
         assert len(prompt.kwargs["prompt_token_ids"]) == 4
+
+
+# ---------------------------------------------------------------------------
+# measure_cell -- loops _one_pass `repeat` times, reports the median (+ min/
+# max) of each quantity. Ticks/expectations below were verified against the
+# real module with a standalone perf_counter/exception trace (not pytest)
+# before being encoded as assertions.
+# ---------------------------------------------------------------------------
+
+class _RaisingAfterNCallsLLM(_FakeLLM):
+    """Succeeds for the first `n` generate() calls (recorded normally), then
+    raises on every call after that -- WITHOUT recording the failing call.
+    Lets a test prove exactly how many repetitions completed before an
+    abort by reading len(llm.calls)."""
+
+    def __init__(self, n: int):
+        super().__init__()
+        self.n = n
+
+    def generate(self, prompts, sampling_params, use_tqdm=None):
+        if len(self.calls) >= self.n:
+            raise RuntimeError("boom-OOM")
+        return super().generate(prompts, sampling_params, use_tqdm)
+
+
+class TestMeasureCell:
+    def test_repeat_one_min_equals_max_equals_the_single_value(
+            self, e9, monkeypatch):
+        _install_fake_vllm(monkeypatch)
+        llm = _FakeLLM()
+        ticks = iter([0.0, 0.5, 10.0, 12.0])
+        monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+
+        row = e9.measure_cell(llm, batch=2, length=8, gen_tokens=5,
+                              vocab_size=100, rng=random.Random(0))
+
+        assert row["error"] == ""
+        assert row["repeat"] == 1
+        assert len(llm.calls) == 2  # one repetition = 2 generate() calls
+        assert row["ttft_ms"] == 500.0
+        assert row["ttft_ms_min"] == row["ttft_ms_max"] == row["ttft_ms"]
+        assert row["total_ms"] == 2000.0
+        assert row["decode_ms"] == 1500.0
+        assert row["tpot_ms"] == row["decode_ms"] / (5 - 1)
+        assert row["tpot_ms_min"] == row["tpot_ms_max"] == row["tpot_ms"]
+
+    def test_odd_repeat_count_reports_true_median_and_min_max(
+            self, e9, monkeypatch):
+        # 3 repetitions, ttft_ms = [500, 100, 300] and total_ms = [2000,
+        # 1000, 1500] in the order they occur -> statistics.median picks
+        # the middle SORTED value (300 / 1500) directly, no averaging.
+        _install_fake_vllm(monkeypatch)
+        llm = _FakeLLM()
+        ticks = iter([
+            0.0, 0.5, 10.0, 12.0,      # rep1: ttft=500ms  total=2000ms
+            20.0, 20.1, 30.0, 31.0,    # rep2: ttft=100ms  total=1000ms
+            40.0, 40.3, 50.0, 51.5,    # rep3: ttft=300ms  total=1500ms
+        ])
+        monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+
+        row = e9.measure_cell(llm, batch=2, length=8, gen_tokens=5,
+                              vocab_size=100, rng=random.Random(0), repeat=3)
+
+        assert row["error"] == ""
+        assert row["repeat"] == 3
+        assert len(llm.calls) == 6  # 3 repetitions * 2 generate() calls
+        assert row["ttft_ms"] == statistics.median([500.0, 100.0, 300.0])
+        assert row["ttft_ms"] == 300.0
+        assert row["ttft_ms_min"] == 100.0
+        assert row["ttft_ms_max"] == 500.0
+        assert row["total_ms"] == 1500.0
+        assert row["decode_ms"] == 1200.0
+        assert row["tpot_ms"] == 300.0  # median([375, 225, 300])
+        assert row["tpot_ms_min"] == 225.0
+        assert row["tpot_ms_max"] == 375.0
+
+    def test_even_repeat_count_averages_the_two_middle_values(
+            self, e9, monkeypatch):
+        # 4 repetitions -- statistics.median has no single middle element
+        # and must average the two central (sorted) values instead. Chosen
+        # so every one of those two middles differs from the endpoints,
+        # which would silently pass a buggy "pick one middle" impl.
+        _install_fake_vllm(monkeypatch)
+        llm = _FakeLLM()
+        ticks = iter([
+            0.0, 0.1, 10.0, 11.0,      # rep1: ttft=100ms  total=1000ms
+            20.0, 20.4, 30.0, 34.0,    # rep2: ttft=400ms  total=4000ms
+            40.0, 40.2, 50.0, 52.0,    # rep3: ttft=200ms  total=2000ms
+            60.0, 60.3, 70.0, 73.0,    # rep4: ttft=300ms  total=3000ms
+        ])
+        monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+
+        row = e9.measure_cell(llm, batch=2, length=8, gen_tokens=5,
+                              vocab_size=100, rng=random.Random(0), repeat=4)
+
+        assert row["error"] == ""
+        assert row["repeat"] == 4
+        assert len(llm.calls) == 8  # 4 repetitions * 2 generate() calls
+        ttfts = [100.0, 400.0, 200.0, 300.0]
+        assert row["ttft_ms"] == statistics.median(ttfts) == 250.0  # (200+300)/2
+        assert row["ttft_ms_min"] == 100.0
+        assert row["ttft_ms_max"] == 400.0
+        assert row["total_ms"] == 2500.0  # median([1000,4000,2000,3000])
+        assert row["decode_ms"] == 2250.0
+        assert row["tpot_ms"] == 562.5  # median([225,900,450,675])
+        assert row["tpot_ms_min"] == 225.0
+        assert row["tpot_ms_max"] == 900.0
+
+    def test_generate_exception_on_very_first_call_blanks_all_numeric_fields(
+            self, e9, monkeypatch):
+        _install_fake_vllm(monkeypatch)
+
+        class _RaisingLLM:
+            def generate(self, *a, **k):
+                raise RuntimeError("boom-OOM")
+
+        monkeypatch.setattr(time, "perf_counter", lambda: 0.0)
+
+        row = e9.measure_cell(_RaisingLLM(), batch=1, length=4, gen_tokens=2,
+                              vocab_size=50, rng=random.Random(2), repeat=3)
+
+        assert row["error"] == "RuntimeError: boom-OOM"
+        for field in ("ttft_ms", "ttft_ms_min", "ttft_ms_max",
+                     "tpot_ms", "tpot_ms_min", "tpot_ms_max",
+                     "decode_ms", "total_ms"):
+            assert row[field] == ""
+        # "repeat" reports COMPLETED repetitions, so a cell that died
+        # before finishing even one shows 0 rather than the requested 3.
+        assert row["repeat"] == 0
+        assert row["batch"] == 1
+        assert row["prompt_tokens"] == 4
+        assert row["gen_tokens"] == 2
+
+    def test_exception_after_one_completed_repeat_aborts_remaining_ones(
+            self, e9, monkeypatch):
+        # repeat=3 requested; the LLM allows exactly 2 generate() calls
+        # (= one full repetition) before raising on the 3rd. Proves the
+        # remaining 2 repetitions (4 more generate() calls) are never
+        # attempted -- the call count is the direct evidence, not just the
+        # returned row shape.
+        _install_fake_vllm(monkeypatch)
+        llm = _RaisingAfterNCallsLLM(n=2)
+        monkeypatch.setattr(time, "perf_counter", lambda: 0.0)
+
+        row = e9.measure_cell(llm, batch=2, length=8, gen_tokens=5,
+                              vocab_size=100, rng=random.Random(0), repeat=3)
+
+        assert row["error"] == "RuntimeError: boom-OOM"
+        assert len(llm.calls) == 2  # only the first repetition completed
+        for field in ("ttft_ms", "ttft_ms_min", "ttft_ms_max",
+                     "tpot_ms", "tpot_ms_min", "tpot_ms_max",
+                     "decode_ms", "total_ms"):
+            assert row[field] == ""
+        assert row["repeat"] == 1  # one repetition completed before the raise
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +575,31 @@ class TestRunSweep:
                     vocab_size=1000, seed=42, warmup=False)
         assert len(llm.calls) == 2  # exactly one cell, no warmup cell
 
+    def test_repeat_forwarded_to_every_grid_cell(self, e9, monkeypatch):
+        _install_fake_vllm(monkeypatch)
+        llm = _FakeLLM()
+        rows = e9.run_sweep(llm, batches=[1, 4], lengths=[100, 200],
+                            gen_tokens=8, vocab_size=1000, seed=42,
+                            warmup=False, repeat=2)
+        # 4 cells (2 batches x 2 lengths), repeat=2 each -> 2 generate()
+        # calls per repetition = 4 * 2 * 2 = 16.
+        assert len(llm.calls) == 16
+        assert all(r["repeat"] == 2 for r in rows)
+
+    def test_warmup_cell_always_measured_at_repeat_one(self, e9, monkeypatch):
+        # The warmup call site does not pass `repeat` through, so it stays
+        # at measure_cell's own default (1) even when the grid is run at a
+        # higher repeat -- warmup absorbs one-time costs, it is not itself
+        # part of the reported statistics.
+        _install_fake_vllm(monkeypatch)
+        llm = _FakeLLM()
+        rows = e9.run_sweep(llm, batches=[1], lengths=[100], gen_tokens=8,
+                            vocab_size=1000, seed=42, warmup=True, repeat=3)
+        # warmup: 1 repetition * 2 calls = 2. grid: 1 cell * 3 repeats * 2
+        # calls = 6. Total = 8, not 12 (which a repeat=3 warmup would give).
+        assert len(llm.calls) == 8
+        assert all(r["repeat"] == 3 for r in rows)
+
 
 # ---------------------------------------------------------------------------
 # main() -- always builds an engine now (no --from-csv path); everything
@@ -436,15 +607,18 @@ class TestRunSweep:
 # module level.
 # ---------------------------------------------------------------------------
 
-_SWEEP_COLS = ["batch", "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms",
-              "decode_ms", "total_ms", "error"]
+_SWEEP_COLS = ["batch", "prompt_tokens", "gen_tokens", "repeat", "ttft_ms",
+              "ttft_ms_min", "ttft_ms_max", "tpot_ms", "tpot_ms_min",
+              "tpot_ms_max", "decode_ms", "total_ms", "error"]
 
 
 def _fake_row(batch=1, prompt_tokens=1000, gen_tokens=8, ttft_ms=10.0,
-             tpot_ms=1.0):
+             tpot_ms=1.0, repeat=1):
     decode_ms = tpot_ms * (gen_tokens - 1)
     return {"batch": batch, "prompt_tokens": prompt_tokens,
-            "gen_tokens": gen_tokens, "ttft_ms": ttft_ms, "tpot_ms": tpot_ms,
+            "gen_tokens": gen_tokens, "repeat": repeat,
+            "ttft_ms": ttft_ms, "ttft_ms_min": ttft_ms, "ttft_ms_max": ttft_ms,
+            "tpot_ms": tpot_ms, "tpot_ms_min": tpot_ms, "tpot_ms_max": tpot_ms,
             "decode_ms": decode_ms, "total_ms": ttft_ms + decode_ms,
             "error": ""}
 
@@ -462,12 +636,12 @@ def _patch_engine(monkeypatch, e9, *, chunked_prefill=False,
                         lambda llm: (max_model_len, vocab_size))
 
     def fake_run_sweep(llm, batches, lengths, gen_tokens, vocab_size, seed,
-                       warmup=True):
+                       warmup=True, repeat=1):
         if record_run_sweep_args is not None:
             record_run_sweep_args.append({
                 "llm": llm, "batches": batches, "lengths": lengths,
                 "gen_tokens": gen_tokens, "vocab_size": vocab_size,
-                "seed": seed, "warmup": warmup,
+                "seed": seed, "warmup": warmup, "repeat": repeat,
             })
         return rows if rows is not None else [_fake_row()]
 
@@ -559,3 +733,53 @@ class TestMain:
         assert "999999" in err
         assert "dropping" in err.lower()
         assert (out_dir / "sweep.csv").exists()
+
+    def test_default_repeat_is_one(self, e9, monkeypatch, tmp_path):
+        calls = []
+        _patch_engine(monkeypatch, e9, record_run_sweep_args=calls)
+        out_dir = tmp_path / "out"
+
+        rc = e9.main(["--out", str(out_dir)])
+
+        assert rc == 0
+        assert calls[0]["repeat"] == 1
+
+    def test_repeat_flag_forwarded_to_run_sweep(self, e9, monkeypatch, tmp_path):
+        calls = []
+        _patch_engine(monkeypatch, e9, record_run_sweep_args=calls)
+        out_dir = tmp_path / "out"
+
+        rc = e9.main(["--repeat", "5", "--out", str(out_dir)])
+
+        assert rc == 0
+        assert calls[0]["repeat"] == 5
+
+    def test_repeat_zero_is_clamped_up_to_one(self, e9, monkeypatch, tmp_path):
+        calls = []
+        _patch_engine(monkeypatch, e9, record_run_sweep_args=calls)
+        out_dir = tmp_path / "out"
+
+        rc = e9.main(["--repeat", "0", "--out", str(out_dir)])
+
+        assert rc == 0
+        assert calls[0]["repeat"] == 1
+
+    def test_repeat_negative_is_clamped_up_to_one(self, e9, monkeypatch, tmp_path):
+        calls = []
+        _patch_engine(monkeypatch, e9, record_run_sweep_args=calls)
+        out_dir = tmp_path / "out"
+
+        rc = e9.main(["--repeat", "-3", "--out", str(out_dir)])
+
+        assert rc == 0
+        assert calls[0]["repeat"] == 1
+
+    def test_repeat_value_printed_to_stdout(self, e9, monkeypatch, tmp_path, capsys):
+        _patch_engine(monkeypatch, e9)
+        out_dir = tmp_path / "out"
+
+        rc = e9.main(["--repeat", "7", "--out", str(out_dir)])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "repeat=7" in out

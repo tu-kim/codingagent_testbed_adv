@@ -6,6 +6,20 @@ the measurement half). It only ever reads CSV files written by that
 script's `write_csv`/columns and never touches vLLM, so no fake `vllm`
 module is needed here -- loaded via importlib (script, not a package
 module) the same way as the sibling test file.
+
+Two sweep.csv shapes are exercised: the pre-`--repeat` shape (`_SWEEP_COLS`
+/ `_sweep_row` / `_write_sweep_csv`, no ttft_ms_min/max or tpot_ms_min/max
+columns) and the current `--repeat`-aware shape (`_SWEEP_COLS_WITH_REPEAT`
+/ `_sweep_row_with_repeat` / `_write_sweep_csv_with_repeat`). merge_sweeps /
+sla_limits / print_sweep / print_sla only ever read batch/prompt_tokens/
+<metric>/error and are indifferent to which shape they're given -- the
+`_min`/`_max` columns exist solely for `plot_metric`'s shaded band, tested
+under TestPlotMetric with matplotlib-guarded (`pytest.importorskip`) cases
+for: band columns present, absent, blank-but-present, a mix of banded and
+unbanded rows in one call (what merge_sweeps hands plot_metric when a
+--repeat run and an older run are merged), and repeat=1 (columns present
+but every hi==lo, so the "any hi > lo" guard must suppress the band without
+raising).
 """
 import csv
 import importlib.util
@@ -42,9 +56,18 @@ _SWEEP_COLS = ["batch", "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms",
 
 def _rw(batch, prompt_tokens, ttft_ms="", error=""):
     """Minimal row for sla_limits/print_sweep/plot_metric -- those only
-    ever read batch/prompt_tokens/<metric>/error."""
+    ever read batch/prompt_tokens/<metric>/error. No <metric>_min/_max keys
+    at all -- this is the shape of an older sweep.csv written before
+    --repeat existed, or any row plot_metric must render sans band."""
     return {"batch": batch, "prompt_tokens": prompt_tokens,
             "ttft_ms": ttft_ms, "error": error}
+
+
+def _rw_band(batch, prompt_tokens, ttft_ms, ttft_ms_min, ttft_ms_max, error=""):
+    """Row carrying the repeat>1 band columns plot_metric shades between."""
+    return {"batch": batch, "prompt_tokens": prompt_tokens,
+            "ttft_ms": ttft_ms, "ttft_ms_min": ttft_ms_min,
+            "ttft_ms_max": ttft_ms_max, "error": error}
 
 
 def _sweep_row(batch, prompt_tokens, ttft_ms, tpot_ms, gen_tokens=8):
@@ -60,6 +83,38 @@ def _sweep_row(batch, prompt_tokens, ttft_ms, tpot_ms, gen_tokens=8):
 def _write_sweep_csv(path: Path, rows: list) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=_SWEEP_COLS)
+        w.writeheader()
+        w.writerows(rows)
+
+
+# Current sweep.csv shape (--repeat > 1 recorded): adds repeat plus the
+# ttft_ms/tpot_ms _min/_max band columns. Kept SEPARATE from _SWEEP_COLS /
+# _sweep_row / _write_sweep_csv above, which stay as the pre-repeat shape on
+# purpose -- this script must keep reading both (merge_sweeps/sla_limits/
+# print_sweep never touch the new columns; only plot_metric's band logic
+# cares whether they're present).
+_SWEEP_COLS_WITH_REPEAT = ["batch", "prompt_tokens", "gen_tokens", "repeat",
+                          "ttft_ms", "ttft_ms_min", "ttft_ms_max",
+                          "tpot_ms", "tpot_ms_min", "tpot_ms_max",
+                          "decode_ms", "total_ms", "error"]
+
+
+def _sweep_row_with_repeat(batch, prompt_tokens, ttft_ms, ttft_ms_min,
+                           ttft_ms_max, tpot_ms, tpot_ms_min, tpot_ms_max,
+                           gen_tokens=8, repeat=3):
+    decode_ms = tpot_ms * (gen_tokens - 1)
+    return {"batch": batch, "prompt_tokens": prompt_tokens,
+            "gen_tokens": gen_tokens, "repeat": repeat,
+            "ttft_ms": ttft_ms, "ttft_ms_min": ttft_ms_min,
+            "ttft_ms_max": ttft_ms_max, "tpot_ms": tpot_ms,
+            "tpot_ms_min": tpot_ms_min, "tpot_ms_max": tpot_ms_max,
+            "decode_ms": decode_ms, "total_ms": ttft_ms + decode_ms,
+            "error": ""}
+
+
+def _write_sweep_csv_with_repeat(path: Path, rows: list) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=_SWEEP_COLS_WITH_REPEAT)
         w.writeheader()
         w.writerows(rows)
 
@@ -239,6 +294,70 @@ class TestPlotMetric:
         assert out.exists()
         assert out.stat().st_size > 0
 
+    def test_band_columns_present_written_without_raising(self, e9p, tmp_path):
+        # repeat>1 sweep: every row carries ttft_ms_min/_max with hi > lo,
+        # so the shaded min-max band path is exercised.
+        pytest.importorskip("matplotlib")
+        rows = [_rw_band(1, 1000, 50.0, 40.0, 60.0),
+                _rw_band(1, 2000, 150.0, 130.0, 170.0)]
+        out = tmp_path / "fig_band.pdf"
+        e9p.plot_metric(rows, "ttft_ms", "TTFT (ms)", "title", None, [], out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_band_columns_absent_still_written(self, e9p, tmp_path):
+        # Older sweep.csv (pre --repeat): no ttft_ms_min/_max keys at all.
+        # plot_metric must render the curve with no band and not raise.
+        pytest.importorskip("matplotlib")
+        rows = [_rw(1, 1000, 50.0), _rw(1, 2000, 150.0)]
+        out = tmp_path / "fig_noband.pdf"
+        e9p.plot_metric(rows, "ttft_ms", "TTFT (ms)", "title", None, [], out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_mix_of_banded_and_unbanded_rows_written_without_raising(
+            self, e9p, tmp_path):
+        # batch 1 came from a repeat>1 run (has band columns), batch 4 from
+        # an older repeat=1-shaped file merged alongside it (no columns at
+        # all) -- exactly what merge_sweeps() can hand plot_metric.
+        pytest.importorskip("matplotlib")
+        rows = [
+            _rw_band(1, 1000, 50.0, 40.0, 60.0),
+            _rw_band(1, 2000, 150.0, 130.0, 170.0),
+            _rw(4, 1000, 80.0),
+            _rw(4, 2000, 220.0),
+        ]
+        out = tmp_path / "fig_mixed.pdf"
+        e9p.plot_metric(rows, "ttft_ms", "TTFT (ms)", "title", None, [], out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_blank_band_values_are_skipped_without_raising(self, e9p, tmp_path):
+        # Column present (e.g. merge_sweeps unioned it in from a sibling
+        # file's header) but blank on THIS row -- must be treated the same
+        # as "absent", not crash trying to float("").
+        pytest.importorskip("matplotlib")
+        rows = [_rw_band(1, 1000, 50.0, "", ""),
+                _rw_band(1, 2000, 150.0, 130.0, 170.0)]
+        out = tmp_path / "fig_blankband.pdf"
+        e9p.plot_metric(rows, "ttft_ms", "TTFT (ms)", "title", None, [], out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_repeat_one_min_equals_max_produces_no_band_but_no_raise(
+            self, e9p, tmp_path):
+        # repeat=1: columns are present but every hi == lo, so the "any hi
+        # > lo" guard must suppress the (zero-width, useless) band without
+        # raising -- this is the "no variance information" case the
+        # measurement script's docstring calls out explicitly.
+        pytest.importorskip("matplotlib")
+        rows = [_rw_band(1, 1000, 50.0, 50.0, 50.0),
+                _rw_band(1, 2000, 150.0, 150.0, 150.0)]
+        out = tmp_path / "fig_flatband.pdf"
+        e9p.plot_metric(rows, "ttft_ms", "TTFT (ms)", "title", None, [], out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
 
 # ---------------------------------------------------------------------------
 # main()
@@ -333,3 +452,23 @@ class TestMain:
                       "--no-figures"])
 
         assert rc == 2
+
+    def test_end_to_end_with_repeat_columns_produces_banded_figures(
+            self, e9p, tmp_path):
+        # Forward-compat check: a --repeat sweep.csv (extra repeat/_min/_max
+        # columns) flows through merge_sweeps/sla_limits/print_sweep (which
+        # ignore the extra columns) and plot_metric (which uses them) with
+        # no special main()-side handling.
+        pytest.importorskip("matplotlib")
+        csv_path = tmp_path / "sweep.csv"
+        _write_sweep_csv_with_repeat(csv_path, [
+            _sweep_row_with_repeat(1, 1000, 50.0, 40.0, 60.0, 5.0, 4.0, 6.0),
+            _sweep_row_with_repeat(1, 2000, 150.0, 130.0, 170.0, 6.0, 5.0, 7.0),
+        ])
+        out_dir = tmp_path / "out"
+
+        rc = e9p.main(["--sweep", str(csv_path), "--out", str(out_dir)])
+
+        assert rc == 0
+        assert (out_dir / "fig_ttft.pdf").exists()
+        assert (out_dir / "fig_tpot.pdf").exists()

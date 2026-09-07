@@ -161,15 +161,27 @@ def _mpl():
 def plot_metric(rows: list[dict], metric: str, ylabel: str, title: str,
                 sla: float | None, limits: list[dict], path: Path) -> None:
     """One line per batch size, plus the SLA line and its per-batch
-    crossing markers."""
+    crossing markers.
+
+    When the sweep carried repetitions, `<metric>_min`/`_max` columns are
+    present and each curve gets a shaded min-max band -- a wide band says
+    the point is not reproducible enough to read a limit off. Sweeps run
+    at repeat=1 (or written before the columns existed) simply have no
+    band.
+    """
     plt = _mpl()
     fig, ax = plt.subplots(figsize=(9, 5.5))
     by_batch: dict[int, list[tuple[int, float]]] = {}
+    bands: dict[int, list[tuple[int, float, float]]] = {}
     for r in rows:
         if r.get("error") or r.get(metric) in ("", None):
             continue
-        by_batch.setdefault(int(r["batch"]), []).append(
-            (int(r["prompt_tokens"]), float(r[metric])))
+        x, y = int(r["prompt_tokens"]), float(r[metric])
+        by_batch.setdefault(int(r["batch"]), []).append((x, y))
+        lo, hi = r.get(f"{metric}_min"), r.get(f"{metric}_max")
+        if lo not in ("", None) and hi not in ("", None):
+            bands.setdefault(int(r["batch"]), []).append(
+                (x, float(lo), float(hi)))
     if not by_batch:
         ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
                 ha="center", va="center", color="grey")
@@ -183,6 +195,12 @@ def plot_metric(rows: list[dict], metric: str, ylabel: str, title: str,
         colour = cmap(i / max(len(batches) - 1, 1) * 0.85)
         ax.plot([x for x, _y in pts], [y for _x, y in pts], "o-",
                 color=colour, lw=1.8, ms=4, label=f"batch {b}")
+        band = sorted(bands.get(b, []))
+        if band and any(hi > lo for _x, lo, hi in band):
+            ax.fill_between([x for x, _lo, _hi in band],
+                            [lo for _x, lo, _hi in band],
+                            [hi for _x, _lo, hi in band],
+                            color=colour, alpha=0.15, linewidth=0)
     if sla is not None:
         ax.axhline(sla, color="tab:red", ls="--", lw=1.4,
                    label=f"SLA {sla:g}")
