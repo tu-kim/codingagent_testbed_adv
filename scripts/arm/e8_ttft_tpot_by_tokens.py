@@ -69,7 +69,9 @@ Outputs (under --out):
                              the prompt separately, and on the two crossed
                              (written but not printed)
   fig1_ttft_vs_prompt_tokens.pdf   TTFT distribution vs prompt tokens
-  fig2_tpot_vs_output_tokens.pdf   TPOT distribution vs output tokens
+  fig2_tpot_vs_prompt_tokens.pdf   TPOT distribution vs total prompt tokens
+                             (the context drives per-token decode cost; the
+                             output count only says how many steps ran)
   fig3_ttft_reuse_reprefill.pdf    TTFT over the (reuse, reprefill) plane;
                              the colour scale is LOGARITHMIC and clipped to
                              p2..p98 -- TTFT is right-skewed enough that a
@@ -606,10 +608,17 @@ def fig_ttft_plane(rows, path: Path) -> None:
 
 
 def fig_tpot(rows, buckets, path: Path) -> None:
+    """TPOT against TOTAL PROMPT tokens.
+
+    Same reasoning as the TPOT table: per-token decode cost is set by the
+    context each attention step reads, which the prompt dominates. The
+    output count says how many steps ran, not what one cost, so plotting
+    against it shows no trend worth reading.
+    """
     plt = _mpl()
     fig, ax = plt.subplots(figsize=(8, 5))
-    _panel(ax, rows, "output_tokens", "tpot_ms", buckets,
-           "output tokens", "TPOT (ms/token)", "TPOT vs output tokens")
+    _panel(ax, rows, "prompt_tokens", "tpot_ms", buckets,
+           "prompt tokens", "TPOT (ms/token)", "TPOT vs prompt tokens")
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -741,8 +750,10 @@ def main(argv: list[str] | None = None) -> int:
             fig_ttft(rows, b_prompt,
                      args.out / "fig1_ttft_vs_prompt_tokens.pdf")
             fig_ttft_plane(rows, args.out / "fig3_ttft_reuse_reprefill.pdf")
-            fig_tpot(tpot_rows, b_tpot,
-                     args.out / "fig2_tpot_vs_output_tokens.pdf")
+            fig_tpot(tpot_rows,
+                     bucket_rows(tpot_rows, "prompt_tokens", "tpot_ms",
+                                 PROMPT_BINS, False),
+                     args.out / "fig2_tpot_vs_prompt_tokens.pdf")
         except ImportError:
             print("matplotlib unavailable -- figures skipped", file=sys.stderr)
     print(f"\noutputs in {args.out}")
