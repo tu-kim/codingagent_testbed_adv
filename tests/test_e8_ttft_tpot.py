@@ -781,10 +781,6 @@ class TestMainGrid:
                 "tokens", "label", "n", "reprefill_tokens_p50", "mean_ms",
                 "p50_ms", "p90_ms", "us_per_token_p50",
             ],
-            "prefill_by_prompt_grid.csv": [
-                "tokens", "label", "n", "prompt_tokens_p50", "mean_ms",
-                "p50_ms", "p90_ms", "us_per_token_p50",
-            ],
             "prefill_by_cached_grid.csv": [
                 "tokens", "label", "n", "cached_tokens_p50", "mean_ms",
                 "p50_ms", "p90_ms", "us_per_token_p50",
@@ -792,6 +788,13 @@ class TestMainGrid:
             "prefill_grid_2d.csv": [
                 "reprefill_tokens", "cached_tokens", "n", "mean_ms",
                 "p50_ms", "p90_ms",
+            ],
+            "ttft_by_prompt_grid.csv": [
+                "tokens", "label", "n", "mean_reuse_tokens",
+                "mean_reprefill_tokens", "mean_ttft_ms",
+            ],
+            "tpot_by_output_grid.csv": [
+                "tokens", "label", "n", "mean_tpot_ms",
             ],
         }
         for name, cols in expected.items():
@@ -801,6 +804,9 @@ class TestMainGrid:
                 reader = csv.DictReader(f)
                 assert reader.fieldnames == cols
                 assert len(list(reader)) >= 1
+
+        # the old pre-rename file must not reappear
+        assert not (out / "prefill_by_prompt_grid.csv").exists()
 
     def test_grid_step_changes_row_labels(self, e8, tmp_path):
         frontend, logdir, profdir = self._setup_fixtures_vllm(tmp_path)
@@ -830,3 +836,200 @@ class TestMainGrid:
         assert default_labels == ["1k", "3k"]
         assert step500_labels == ["1k", "2500"]
         assert default_labels != step500_labels
+
+
+# ---------------------------------------------------------------------------
+# prompt_grid_rows
+# ---------------------------------------------------------------------------
+
+def _prompt_row(prompt_tokens, cached_tokens, reprefill_tokens, ttft_net_ms):
+    return {
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "reprefill_tokens": reprefill_tokens,
+        "ttft_net_ms": ttft_net_ms,
+    }
+
+
+class TestPromptGridRows:
+    def test_value_on_step_edge_stays_in_that_bucket(self, e8):
+        rows = [_prompt_row(2000.0, 500.0, 1500.0, 30.0)]
+        out = e8.prompt_grid_rows(rows, 1000)
+        assert len(out) == 1
+        assert out[0]["tokens"] == 2000
+        assert out[0]["label"] == "2k"
+
+    def test_value_just_above_edge_moves_up_a_bucket(self, e8):
+        rows = [_prompt_row(2001.0, 500.0, 1501.0, 30.0)]
+        out = e8.prompt_grid_rows(rows, 1000)
+        assert out[0]["tokens"] == 3000
+        assert out[0]["label"] == "3k"
+
+    def test_mean_arithmetic(self, e8):
+        rows = [
+            _prompt_row(1000.0, 400.0, 600.0, 10.0),
+            _prompt_row(1000.0, 600.0, 400.0, 30.0),
+        ]
+        out = e8.prompt_grid_rows(rows, 1000)
+        assert len(out) == 1
+        row = out[0]
+        assert row["n"] == 2
+        assert row["mean_reuse_tokens"] == 500.0
+        assert row["mean_reprefill_tokens"] == 500.0
+        assert row["mean_ttft_ms"] == 20.0
+
+    def test_skips_rows_with_any_blank_field(self, e8):
+        rows = [
+            _prompt_row("", 400.0, 600.0, 10.0),
+            _prompt_row(1000.0, "", 600.0, 10.0),
+            _prompt_row(1000.0, 400.0, "", 10.0),
+            _prompt_row(1000.0, 400.0, 600.0, ""),
+            _prompt_row(1000.0, 400.0, 600.0, 10.0),
+        ]
+        out = e8.prompt_grid_rows(rows, 1000)
+        assert len(out) == 1
+        assert out[0]["n"] == 1
+
+    def test_ascending_order(self, e8):
+        rows = [
+            _prompt_row(3000.0, 0.0, 3000.0, 1.0),
+            _prompt_row(1000.0, 0.0, 1000.0, 1.0),
+            _prompt_row(2000.0, 0.0, 2000.0, 1.0),
+        ]
+        out = e8.prompt_grid_rows(rows, 1000)
+        assert [r["tokens"] for r in out] == [1000, 2000, 3000]
+
+    def test_zero_prompt_tokens_lands_in_bucket_one(self, e8):
+        rows = [_prompt_row(0.0, 0.0, 0.0, 5.0)]
+        out = e8.prompt_grid_rows(rows, 1000)
+        assert out[0]["tokens"] == 1000
+
+    def test_empty_input_returns_empty(self, e8):
+        assert e8.prompt_grid_rows([], 1000) == []
+
+
+# ---------------------------------------------------------------------------
+# tpot_grid_rows
+# ---------------------------------------------------------------------------
+
+def _tpot_row(output_tokens, tpot_ms):
+    return {"output_tokens": output_tokens, "tpot_ms": tpot_ms}
+
+
+class TestTpotGridRows:
+    def test_value_on_step_edge_stays_in_that_bucket(self, e8):
+        rows = [_tpot_row(1000.0, 5.0)]
+        out = e8.tpot_grid_rows(rows, 1000)
+        assert len(out) == 1
+        assert out[0]["tokens"] == 1000
+        assert out[0]["label"] == "1k"
+
+    def test_value_just_above_edge_moves_up_a_bucket(self, e8):
+        rows = [_tpot_row(1001.0, 5.0)]
+        out = e8.tpot_grid_rows(rows, 1000)
+        assert out[0]["tokens"] == 2000
+        assert out[0]["label"] == "2k"
+
+    def test_mean_arithmetic(self, e8):
+        rows = [_tpot_row(500.0, 10.0), _tpot_row(600.0, 30.0)]
+        out = e8.tpot_grid_rows(rows, 1000)
+        assert len(out) == 1
+        assert out[0]["n"] == 2
+        assert out[0]["mean_tpot_ms"] == 20.0
+
+    def test_blank_token_or_value_skipped(self, e8):
+        rows = [
+            {"output_tokens": "", "tpot_ms": 5.0},
+            {"output_tokens": 100.0, "tpot_ms": ""},
+            _tpot_row(100.0, 5.0),
+        ]
+        out = e8.tpot_grid_rows(rows, 1000)
+        assert len(out) == 1
+        assert out[0]["n"] == 1
+
+    def test_ascending_order(self, e8):
+        rows = [_tpot_row(3000.0, 1.0), _tpot_row(1000.0, 1.0),
+                _tpot_row(2000.0, 1.0)]
+        out = e8.tpot_grid_rows(rows, 1000)
+        assert [r["tokens"] for r in out] == [1000, 2000, 3000]
+
+    def test_zero_output_tokens_lands_in_bucket_one(self, e8):
+        rows = [_tpot_row(0.0, 5.0)]
+        out = e8.tpot_grid_rows(rows, 1000)
+        assert out[0]["tokens"] == 1000
+
+    def test_empty_input_returns_empty(self, e8):
+        assert e8.tpot_grid_rows([], 1000) == []
+
+
+# ---------------------------------------------------------------------------
+# print_prompt_grid / print_tpot_grid
+# ---------------------------------------------------------------------------
+
+class TestPrintPromptGrid:
+    def test_empty_rows_prints_no_data(self, e8, capsys):
+        e8.print_prompt_grid([], 1000)
+        out = capsys.readouterr().out
+        assert "TTFT by total prompt tokens" in out
+        assert "(no data)" in out
+
+    def test_header_and_row_present(self, e8, capsys):
+        rows = e8.prompt_grid_rows(
+            [_prompt_row(1000.0, 400.0, 600.0, 12.5)], 1000)
+        e8.print_prompt_grid(rows, 1000)
+        out = capsys.readouterr().out
+        assert "mean_ttft_ms" in out
+        assert "1k" in out
+
+
+class TestPrintTpotGrid:
+    def test_empty_rows_prints_no_data(self, e8, capsys):
+        e8.print_tpot_grid([], 1000)
+        out = capsys.readouterr().out
+        assert "TPOT by output tokens" in out
+        assert "(no data)" in out
+
+    def test_header_and_row_present(self, e8, capsys):
+        rows = e8.tpot_grid_rows([_tpot_row(1000.0, 12.5)], 1000)
+        e8.print_tpot_grid(rows, 1000)
+        out = capsys.readouterr().out
+        assert "mean_tpot_ms" in out
+        assert "1k" in out
+
+
+# ---------------------------------------------------------------------------
+# fig_ttft_plane (matplotlib-dependent)
+# ---------------------------------------------------------------------------
+
+class TestFigTtftPlane:
+    def test_writes_file_with_data(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        rows = [
+            {"cached_tokens": 100.0, "reprefill_tokens": 200.0,
+             "ttft_net_ms": 15.0},
+            {"cached_tokens": 300.0, "reprefill_tokens": 400.0,
+             "ttft_net_ms": 45.0},
+        ]
+        out = tmp_path / "fig3.pdf"
+        e8.fig_ttft_plane(rows, out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_all_blank_or_non_positive_still_writes_file(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        rows = [
+            {"cached_tokens": "", "reprefill_tokens": 200.0,
+             "ttft_net_ms": 15.0},
+            {"cached_tokens": 100.0, "reprefill_tokens": "",
+             "ttft_net_ms": 15.0},
+            {"cached_tokens": 100.0, "reprefill_tokens": 200.0,
+             "ttft_net_ms": ""},
+            {"cached_tokens": 100.0, "reprefill_tokens": 200.0,
+             "ttft_net_ms": 0.0},
+            {"cached_tokens": 100.0, "reprefill_tokens": 200.0,
+             "ttft_net_ms": -5.0},
+        ]
+        out = tmp_path / "fig3_empty.pdf"
+        e8.fig_ttft_plane(rows, out)
+        assert out.exists()
+        assert out.stat().st_size > 0

@@ -54,15 +54,24 @@ Outputs (under --out):
   ttft_by_prompt_tokens.csv  bucketed: n, mean/p50/p90 ttft_net_ms, per-token us
   ttft_by_reprefill.csv      same, bucketed on re-prefilled tokens
   tpot_by_output_tokens.csv  bucketed: n, mean/p50/p90 tpot_ms
-  prefill_by_reprefill_grid.csv / _prompt_ / _cached_
-                             prefill time at REPRESENTATIVE token counts --
-                             a uniform --grid-step grid (1k, 2k, 3k, ...)
-                             rather than log buckets, so rows compare directly
-  prefill_grid_2d.csv        prefill p50 over the (computed, reused) token
-                             plane on the same grid
-  fig1_ttft_vs_tokens.pdf    scatter + bucket-p50 line (prompt | reprefill)
-  fig2_tpot_vs_tokens.pdf    scatter + bucket-p50 line (output tokens)
-  stdout                     the same three tables
+  ttft_by_prompt_grid.csv    THE prefill table: one row per --grid-step band
+                             of total prompt tokens (1k, 2k, 3k, ...) with
+                             mean_reuse_tokens, mean_reprefill_tokens and
+                             mean_ttft_ms -- "at ~Nk of prompt, M tokens were
+                             reused, K recomputed, and it cost T ms"
+  tpot_by_output_grid.csv    mean_tpot_ms on the same uniform grid of output
+                             tokens
+  prefill_by_reprefill_grid.csv / _cached_ / prefill_grid_2d.csv
+                             the same prefill time resolved on each half of
+                             the prompt separately, and on the two crossed
+                             (written but not printed)
+  fig1_ttft_vs_prompt_tokens.pdf   TTFT distribution vs prompt tokens
+  fig2_tpot_vs_output_tokens.pdf   TPOT distribution vs output tokens
+  fig3_ttft_reuse_reprefill.pdf    TTFT over the (reuse, reprefill) plane;
+                             the colour scale is LOGARITHMIC and clipped to
+                             p2..p98 -- TTFT is right-skewed enough that a
+                             linear scale renders the whole bulk one shade
+  stdout                     the prompt-token and output-token grid tables
 
 Usage:
   scripts/arm/e8_ttft_tpot_by_tokens.py --frontend logs/frontend.log \
@@ -332,6 +341,85 @@ def grid2d_rows(rows: list[dict], step: int) -> list[dict]:
     return out
 
 
+def _mean(vals: list[float]) -> float:
+    return sum(vals) / len(vals) if vals else math.nan
+
+
+def prompt_grid_rows(rows: list[dict], step: int) -> list[dict]:
+    """Prefill time on a uniform grid of TOTAL prompt tokens.
+
+    Each row reports, for that prompt-size band, the average split of the
+    prompt (reused vs re-prefilled) alongside the average TTFT -- so the
+    table reads as "at ~Nk of prompt, M tokens were reused, K recomputed,
+    and it cost T ms".
+    """
+    groups: dict[int, list[dict]] = {}
+    for r in rows:
+        t, v = r["prompt_tokens"], r["ttft_net_ms"]
+        if t == "" or v == "" or r["cached_tokens"] == "" \
+                or r["reprefill_tokens"] == "":
+            continue
+        t = float(t)
+        k = max(1, math.ceil(t / step)) if t > 0 else 1
+        groups.setdefault(k, []).append(r)
+    out = []
+    for k in sorted(groups):
+        g = groups[k]
+        out.append({
+            "tokens": k * step,
+            "label": _ktok(k * step),
+            "n": len(g),
+            "mean_reuse_tokens": round(_mean([float(r["cached_tokens"])
+                                              for r in g]), 1),
+            "mean_reprefill_tokens": round(_mean([float(r["reprefill_tokens"])
+                                                  for r in g]), 1),
+            "mean_ttft_ms": round(_mean([float(r["ttft_net_ms"])
+                                         for r in g]), 3),
+        })
+    return out
+
+
+def tpot_grid_rows(rows: list[dict], step: int) -> list[dict]:
+    """Mean TPOT on a uniform grid of output tokens."""
+    groups: dict[int, list[float]] = {}
+    for r in rows:
+        t, v = r["output_tokens"], r["tpot_ms"]
+        if t == "" or v == "":
+            continue
+        t = float(t)
+        k = max(1, math.ceil(t / step)) if t > 0 else 1
+        groups.setdefault(k, []).append(float(v))
+    return [{
+        "tokens": k * step,
+        "label": _ktok(k * step),
+        "n": len(groups[k]),
+        "mean_tpot_ms": round(_mean(groups[k]), 4),
+    } for k in sorted(groups)]
+
+
+def print_prompt_grid(rows: list[dict], step: int) -> None:
+    print(f"\nTTFT by total prompt tokens ({_ktok(step)} grid):")
+    if not rows:
+        print("  (no data)")
+        return
+    print(f"  {'tokens':>8} {'n':>6} {'mean_reuse':>12} "
+          f"{'mean_reprefill':>16} {'mean_ttft_ms':>14}")
+    for r in rows:
+        print(f"  {r['label']:>8} {r['n']:>6} {r['mean_reuse_tokens']:>12.1f} "
+              f"{r['mean_reprefill_tokens']:>16.1f} "
+              f"{r['mean_ttft_ms']:>14.1f}")
+
+
+def print_tpot_grid(rows: list[dict], step: int) -> None:
+    print(f"\nTPOT by output tokens ({_ktok(step)} grid):")
+    if not rows:
+        print("  (no data)")
+        return
+    print(f"  {'tokens':>8} {'n':>6} {'mean_tpot_ms':>14}")
+    for r in rows:
+        print(f"  {r['label']:>8} {r['n']:>6} {r['mean_tpot_ms']:>14.3f}")
+
+
 def print_grid(title: str, rows: list[dict], token_col: str) -> None:
     print(f"\n{title}")
     if not rows:
@@ -424,62 +512,57 @@ def _panel(ax, rows, token_col, value_col, buckets, xlabel, ylabel, title):
     ax.legend(fontsize=8, framealpha=0.7)
 
 
-def fig_ttft(rows, b_prompt, b_repre, path: Path) -> None:
+def fig_ttft(rows, buckets, path: Path) -> None:
+    """TTFT distribution against prompt size."""
     plt = _mpl()
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(14, 5))
-    _panel(axL, rows, "prompt_tokens", "ttft_net_ms", b_prompt,
-           "prompt tokens (ISL = input + cache.read)", "TTFT - queue (ms)",
-           "TTFT (queue-removed) vs prompt tokens")
-    _panel(axR, rows, "reprefill_tokens", "ttft_net_ms", b_repre,
-           "re-prefilled tokens (tokens.input)", "TTFT - queue (ms)",
-           "TTFT (queue-removed) vs re-prefilled tokens")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _panel(ax, rows, "prompt_tokens", "ttft_net_ms", buckets,
+           "prompt tokens", "TTFT (ms)", "TTFT vs prompt tokens")
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def fig_prefill_plane(rows, grid_rp, path: Path) -> None:
-    """Left: prefill time vs re-prefilled tokens, points COLOURED by how
-    many tokens were reused -- a colour-blind cloud means reuse does not
-    change prefill cost. Right: the (computed, reused) plane itself,
-    colour = prefill p50 ms."""
+def fig_ttft_plane(rows, path: Path) -> None:
+    """TTFT over the (reused, re-prefilled) token plane.
+
+    TTFT is heavily right-skewed -- a handful of large prefills span two
+    orders of magnitude more than the bulk, so a LINEAR colour scale
+    spends almost its whole range on those few points and renders every
+    small value as the same dark colour. Two fixes are applied together:
+    the norm is LOGARITHMIC, and its limits are clipped to the p2..p98
+    range (outliers keep the end colours via `extend` rather than
+    stretching the scale). The result spreads colour across the bulk of
+    the distribution, which is where the structure is.
+    """
     plt = _mpl()
-    pts = [(float(r["reprefill_tokens"]), float(r["cached_tokens"]),
+    from matplotlib.colors import LogNorm
+    pts = [(float(r["cached_tokens"]), float(r["reprefill_tokens"]),
             float(r["ttft_net_ms"]))
            for r in rows
-           if r["reprefill_tokens"] != "" and r["cached_tokens"] != ""
-           and r["ttft_net_ms"] != ""]
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(14, 5))
+           if r["cached_tokens"] != "" and r["reprefill_tokens"] != ""
+           and r["ttft_net_ms"] != "" and float(r["ttft_net_ms"]) > 0]
+    fig, ax = plt.subplots(figsize=(8.5, 6))
     if not pts:
-        for ax in (axL, axR):
-            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
-                    ha="center", va="center", color="grey")
+        ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                ha="center", va="center", color="grey")
         fig.savefig(path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return
-    rp = [a for a, _b, _c in pts]
-    ca = [b for _a, b, _c in pts]
+    ca = [a for a, _b, _c in pts]
+    rp = [b for _a, b, _c in pts]
     ms = [c for _a, _b, c in pts]
-
-    sc = axL.scatter(rp, ms, c=ca, s=10, alpha=0.6, cmap="viridis")
-    fig.colorbar(sc, ax=axL, label="reused (cached) tokens")
-    if grid_rp:
-        axL.plot([r["reprefill_tokens_p50"] for r in grid_rp],
-                 [r["p50_ms"] for r in grid_rp], "o-", color="tab:red",
-                 lw=1.8, ms=4, label="grid p50")
-        axL.legend(fontsize=8, framealpha=0.7)
-    axL.set_xlabel("re-prefilled (computed) tokens")
-    axL.set_ylabel("prefill time = TTFT - queue (ms)")
-    axL.set_title("Prefill time vs computed tokens, coloured by reuse")
-    axL.grid(alpha=0.3)
-
-    sc2 = axR.scatter(rp, ca, c=ms, s=14, alpha=0.8, cmap="magma")
-    fig.colorbar(sc2, ax=axR, label="prefill time (ms)")
-    axR.set_xlabel("re-prefilled (computed) tokens")
-    axR.set_ylabel("reused (cached) tokens")
-    axR.set_title("Prefill time over the (computed, reused) plane")
-    axR.grid(alpha=0.3)
-
+    lo = max(_pct(ms, 0.02), 1e-3)
+    hi = _pct(ms, 0.98)
+    if hi <= lo:
+        lo, hi = min(ms), max(max(ms), min(ms) * 1.01)
+    sc = ax.scatter(ca, rp, c=ms, s=18, alpha=0.85, cmap="viridis",
+                    norm=LogNorm(vmin=lo, vmax=hi))
+    fig.colorbar(sc, ax=ax, label="TTFT (ms)", extend="both")
+    ax.set_xlabel("reuse tokens")
+    ax.set_ylabel("reprefill tokens")
+    ax.set_title("TTFT by reuse and reprefill tokens")
+    ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -580,22 +663,22 @@ def main(argv: list[str] | None = None) -> int:
               ["bucket", "n", "output_tokens_p50", "mean_ms", "p50_ms",
                "p90_ms"])
 
-    print_table("TTFT (queue-removed) by prompt tokens [ISL = input + cache.read]:",
-                b_prompt, "prompt_tokens")
-    print_table("TTFT (queue-removed) by RE-PREFILLED tokens [tokens.input]:",
-                b_repre, "reprefill_tokens")
-    print_table("TPOT by output tokens:", b_tpot, "output_tokens")
 
     step = args.grid_step
+    g_prompt = prompt_grid_rows(rows, step)
+    g_tpot = tpot_grid_rows(tpot_rows, step)
+    # kept as files (not printed): the same prefill time resolved on each
+    # half of the prompt separately, and on the two crossed.
     g_repre = grid_rows(rows, "reprefill_tokens", "ttft_net_ms", step)
-    g_prompt = grid_rows(rows, "prompt_tokens", "ttft_net_ms", step)
     g_cached = grid_rows(rows, "cached_tokens", "ttft_net_ms", step)
     g2d = grid2d_rows(rows, step)
+    write_csv(args.out / "ttft_by_prompt_grid.csv", g_prompt,
+              ["tokens", "label", "n", "mean_reuse_tokens",
+               "mean_reprefill_tokens", "mean_ttft_ms"])
+    write_csv(args.out / "tpot_by_output_grid.csv", g_tpot,
+              ["tokens", "label", "n", "mean_tpot_ms"])
     write_csv(args.out / "prefill_by_reprefill_grid.csv", g_repre,
               ["tokens", "label", "n", "reprefill_tokens_p50", "mean_ms",
-               "p50_ms", "p90_ms", "us_per_token_p50"])
-    write_csv(args.out / "prefill_by_prompt_grid.csv", g_prompt,
-              ["tokens", "label", "n", "prompt_tokens_p50", "mean_ms",
                "p50_ms", "p90_ms", "us_per_token_p50"])
     write_csv(args.out / "prefill_by_cached_grid.csv", g_cached,
               ["tokens", "label", "n", "cached_tokens_p50", "mean_ms",
@@ -603,20 +686,16 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(args.out / "prefill_grid_2d.csv", g2d,
               ["reprefill_tokens", "cached_tokens", "n", "mean_ms",
                "p50_ms", "p90_ms"])
-    print_grid(f"Prefill time by RE-PREFILLED (computed) tokens, "
-               f"{_ktok(step)} grid:", g_repre, "reprefill_tokens")
-    print_grid(f"Prefill time by REUSED (cached) tokens, {_ktok(step)} grid:",
-               g_cached, "cached_tokens")
-    print_grid(f"Prefill time by TOTAL prompt tokens, {_ktok(step)} grid:",
-               g_prompt, "prompt_tokens")
-    print_grid2d(g2d, step)
+    print_prompt_grid(g_prompt, step)
+    print_tpot_grid(g_tpot, step)
 
     if not args.no_figures:
         try:
-            fig_ttft(rows, b_prompt, b_repre, args.out / "fig1_ttft_vs_tokens.pdf")
-            fig_prefill_plane(rows, g_repre,
-                              args.out / "fig3_prefill_plane.pdf")
-            fig_tpot(tpot_rows, b_tpot, args.out / "fig2_tpot_vs_tokens.pdf")
+            fig_ttft(rows, b_prompt,
+                     args.out / "fig1_ttft_vs_prompt_tokens.pdf")
+            fig_ttft_plane(rows, args.out / "fig3_ttft_reuse_reprefill.pdf")
+            fig_tpot(tpot_rows, b_tpot,
+                     args.out / "fig2_tpot_vs_output_tokens.pdf")
         except ImportError:
             print("matplotlib unavailable -- figures skipped", file=sys.stderr)
     print(f"\noutputs in {args.out}")
