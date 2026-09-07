@@ -60,9 +60,10 @@ Outputs (under --out):
                              mean_reuse_tokens, mean_reprefill_tokens and
                              mean_ttft_ms -- "at ~Nk of prompt, M tokens were
                              reused, K recomputed, and it cost T ms"
-  tpot_by_output_grid.csv    mean_tpot_ms per --tpot-grid-step band of output
-                             tokens (separate from the TTFT step: output
-                             lengths run much shorter than prompts)
+  tpot_by_prompt_grid.csv    mean_tpot_ms per --tpot-grid-step band of TOTAL
+                             PROMPT tokens -- per-token decode cost tracks the
+                             context the attention step reads, not how many
+                             steps ran -- plus mean_output_tokens per band
   prefill_by_reprefill_grid.csv / _cached_ / prefill_grid_2d.csv
                              the same prefill time resolved on each half of
                              the prompt separately, and on the two crossed
@@ -394,21 +395,38 @@ def prompt_grid_rows(rows: list[dict], step: int) -> list[dict]:
 
 
 def tpot_grid_rows(rows: list[dict], step: int) -> list[dict]:
-    """Mean TPOT on a uniform grid of output tokens."""
-    groups: dict[int, list[float]] = {}
+    """Mean TPOT on a uniform grid of TOTAL PROMPT tokens.
+
+    Bucketing on OUTPUT tokens does not isolate anything: per-token
+    decode cost is set by how much KV the attention step reads, i.e. the
+    CONTEXT length, and the context is dominated by the prompt -- the
+    output count only says how many such steps ran, not what each cost.
+    Grouping by prompt size therefore holds the actual driver roughly
+    fixed within a row. mean_output_tokens rides along so a row whose
+    generations were unusually short (where the one-off post-first-token
+    overheads are amortised over few steps) is visible rather than
+    silently inflating that row's mean.
+    """
+    groups: dict[int, list[dict]] = {}
     for r in rows:
-        t, v = r["output_tokens"], r["tpot_ms"]
-        if t == "" or v == "":
+        t, v = r["prompt_tokens"], r["tpot_ms"]
+        if t == "" or v == "" or r["output_tokens"] == "":
             continue
         t = float(t)
         k = max(1, math.ceil(t / step)) if t > 0 else 1
-        groups.setdefault(k, []).append(float(v))
-    return [{
-        "token_range": _range_label(k, step),
-        "tokens": k * step,
-        "n": len(groups[k]),
-        "mean_tpot_ms": round(_mean(groups[k]), 4),
-    } for k in sorted(groups)]
+        groups.setdefault(k, []).append(r)
+    out = []
+    for k in sorted(groups):
+        g = groups[k]
+        out.append({
+            "token_range": _range_label(k, step),
+            "tokens": k * step,
+            "n": len(g),
+            "mean_output_tokens": round(_mean([float(r["output_tokens"])
+                                               for r in g]), 1),
+            "mean_tpot_ms": round(_mean([float(r["tpot_ms"]) for r in g]), 4),
+        })
+    return out
 
 
 def print_prompt_grid(rows: list[dict], step: int) -> None:
@@ -426,13 +444,15 @@ def print_prompt_grid(rows: list[dict], step: int) -> None:
 
 
 def print_tpot_grid(rows: list[dict], step: int) -> None:
-    print(f"\nTPOT by output tokens ({_ktok(step)} grid):")
+    print(f"\nTPOT by total prompt tokens ({_ktok(step)} grid):")
     if not rows:
         print("  (no data)")
         return
-    print(f"  {'tokens':>14} {'n':>6} {'mean_tpot_ms':>14}")
+    print(f"  {'tokens':>14} {'n':>6} {'mean_output':>13} "
+          f"{'mean_tpot_ms':>14}")
     for r in rows:
         print(f"  {r['token_range']:>14} {r['n']:>6} "
+              f"{r['mean_output_tokens']:>13.1f} "
               f"{r['mean_tpot_ms']:>14.3f}")
 
 
@@ -614,10 +634,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="band width for the prompt-token/TTFT table only "
                          "(default: --grid-step)")
     ap.add_argument("--tpot-grid-step", type=int, default=None,
-                    help="band width for the output-token/TPOT table only "
-                         "(default: --grid-step). Output lengths are usually "
-                         "an order of magnitude smaller than prompts, so a "
-                         "smaller step here is normal")
+                    help="band width for the TPOT table only (default: "
+                         "--grid-step). Also over prompt tokens, but kept "
+                         "separate so the two tables can differ in resolution")
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
 
@@ -702,8 +721,9 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(args.out / "ttft_by_prompt_grid.csv", g_prompt,
               ["token_range", "tokens", "n", "mean_reuse_tokens",
                "mean_reprefill_tokens", "mean_ttft_ms"])
-    write_csv(args.out / "tpot_by_output_grid.csv", g_tpot,
-              ["token_range", "tokens", "n", "mean_tpot_ms"])
+    write_csv(args.out / "tpot_by_prompt_grid.csv", g_tpot,
+              ["token_range", "tokens", "n", "mean_output_tokens",
+               "mean_tpot_ms"])
     write_csv(args.out / "prefill_by_reprefill_grid.csv", g_repre,
               ["token_range", "tokens", "n", "reprefill_tokens_p50",
                "mean_ms", "p50_ms", "p90_ms", "us_per_token_p50"])

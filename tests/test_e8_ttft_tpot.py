@@ -813,8 +813,9 @@ class TestMainGrid:
                 "token_range", "tokens", "n", "mean_reuse_tokens",
                 "mean_reprefill_tokens", "mean_ttft_ms",
             ],
-            "tpot_by_output_grid.csv": [
-                "token_range", "tokens", "n", "mean_tpot_ms",
+            "tpot_by_prompt_grid.csv": [
+                "token_range", "tokens", "n", "mean_output_tokens",
+                "mean_tpot_ms",
             ],
         }
         for name, cols in expected.items():
@@ -825,8 +826,9 @@ class TestMainGrid:
                 assert reader.fieldnames == cols
                 assert len(list(reader)) >= 1
 
-        # the old pre-rename file must not reappear
+        # the old pre-rename files must not reappear
         assert not (out / "prefill_by_prompt_grid.csv").exists()
+        assert not (out / "tpot_by_output_grid.csv").exists()
 
     def test_grid_step_changes_row_labels(self, e8, tmp_path):
         frontend, logdir, profdir = self._setup_fixtures_vllm(tmp_path)
@@ -870,7 +872,7 @@ class TestMainGrid:
         ])
         with (out / "ttft_by_prompt_grid.csv").open() as f:
             ttft_ranges = [r["token_range"] for r in csv.DictReader(f)]
-        with (out / "tpot_by_output_grid.csv").open() as f:
+        with (out / "tpot_by_prompt_grid.csv").open() as f:
             tpot_ranges = [r["token_range"] for r in csv.DictReader(f)]
         # every band width in both tables must be a multiple of 500
         for label in ttft_ranges + tpot_ranges:
@@ -879,6 +881,11 @@ class TestMainGrid:
 
     def test_ttft_and_tpot_grid_step_independently_override_grid_step(
             self, e8, tmp_path):
+        # Both ttft_by_prompt_grid.csv and tpot_by_prompt_grid.csv now
+        # bucket on the SAME axis (total prompt tokens: r1=1000, r2=2001
+        # from _setup_fixtures_vllm's cache_read=0 profiles), so this test
+        # exercises --ttft-grid-step and --tpot-grid-step producing
+        # DIFFERENT band widths over that one axis.
         frontend, logdir, profdir = self._setup_fixtures_vllm(tmp_path)
         out = tmp_path / "out_split_steps"
         e8.main([
@@ -891,20 +898,20 @@ class TestMainGrid:
         ])
         with (out / "ttft_by_prompt_grid.csv").open() as f:
             ttft_rows = list(csv.DictReader(f))
-        with (out / "tpot_by_output_grid.csv").open() as f:
+        with (out / "tpot_by_prompt_grid.csv").open() as f:
             tpot_rows = list(csv.DictReader(f))
 
         # TTFT bands are on the 2000-wide grid, not the 1000-wide --grid-step
         # default: every upper edge is a multiple of 2000.
         for r in ttft_rows:
             assert int(r["tokens"]) % 2000 == 0
-        # TPOT bands are on the 3-wide grid: r1/r2 both have output_tokens=10
-        # (from _llm_end's fixed tokens.output), so ceil(10/3)=4 -> upper
-        # edge 12, distinct from both --grid-step(1000) and
-        # --ttft-grid-step(2000).
+        # TPOT bands are on the 3-wide grid over prompt tokens: r1's prompt
+        # (1000) -> ceil(1000/3)=334 -> upper edge 1002; r2's prompt (2001)
+        # -> ceil(2001/3)=667 -> upper edge 2001 exactly. Both distinct from
+        # --grid-step(1000) and --ttft-grid-step(2000) multiples.
         for r in tpot_rows:
             assert int(r["tokens"]) % 3 == 0
-        assert {int(r["tokens"]) for r in tpot_rows} == {12}
+        assert {int(r["tokens"]) for r in tpot_rows} == {1002, 2001}
 
 
 # ---------------------------------------------------------------------------
@@ -979,56 +986,84 @@ class TestPromptGridRows:
 
 # ---------------------------------------------------------------------------
 # tpot_grid_rows
+#
+# Buckets on `prompt_tokens` (total ISL), NOT `output_tokens` -- per-token
+# decode cost tracks the context the attention step reads (dominated by the
+# prompt), not how many decode steps ran. `output_tokens` is read only to
+# compute the along-for-the-ride `mean_output_tokens` field; it does not
+# gate which bucket a row lands in.
 # ---------------------------------------------------------------------------
 
-def _tpot_row(output_tokens, tpot_ms):
-    return {"output_tokens": output_tokens, "tpot_ms": tpot_ms}
+def _tpot_row(prompt_tokens, output_tokens, tpot_ms):
+    return {"prompt_tokens": prompt_tokens, "output_tokens": output_tokens,
+            "tpot_ms": tpot_ms}
 
 
 class TestTpotGridRows:
     def test_value_on_step_edge_stays_in_that_bucket(self, e8):
-        rows = [_tpot_row(1000.0, 5.0)]
+        rows = [_tpot_row(1000.0, 10.0, 5.0)]
         out = e8.tpot_grid_rows(rows, 1000)
         assert len(out) == 1
         assert out[0]["tokens"] == 1000
         assert out[0]["token_range"] == "0-1000"
 
     def test_value_just_above_edge_moves_up_a_bucket(self, e8):
-        rows = [_tpot_row(1001.0, 5.0)]
+        rows = [_tpot_row(1001.0, 10.0, 5.0)]
         out = e8.tpot_grid_rows(rows, 1000)
         assert out[0]["tokens"] == 2000
         assert out[0]["token_range"] == "1001-2000"
 
     def test_mean_arithmetic(self, e8):
-        rows = [_tpot_row(500.0, 10.0), _tpot_row(600.0, 30.0)]
+        rows = [_tpot_row(500.0, 20.0, 10.0), _tpot_row(600.0, 40.0, 30.0)]
         out = e8.tpot_grid_rows(rows, 1000)
         assert len(out) == 1
         assert out[0]["n"] == 2
+        assert out[0]["mean_output_tokens"] == 30.0
         assert out[0]["mean_tpot_ms"] == 20.0
 
-    def test_blank_token_or_value_skipped(self, e8):
+    def test_blank_prompt_tokens_or_tpot_skipped(self, e8):
+        # Blankness of prompt_tokens/tpot_ms gates inclusion. output_tokens
+        # blankness does NOT gate inclusion (it only feeds the mean) -- see
+        # the module docstring; every included row here has a real
+        # output_tokens so the mean stays well-defined.
         rows = [
-            {"output_tokens": "", "tpot_ms": 5.0},
-            {"output_tokens": 100.0, "tpot_ms": ""},
-            _tpot_row(100.0, 5.0),
+            {"prompt_tokens": "", "output_tokens": 10.0, "tpot_ms": 5.0},
+            {"prompt_tokens": 100.0, "output_tokens": 10.0, "tpot_ms": ""},
+            _tpot_row(100.0, 10.0, 5.0),
         ]
         out = e8.tpot_grid_rows(rows, 1000)
         assert len(out) == 1
         assert out[0]["n"] == 1
 
     def test_ascending_order(self, e8):
-        rows = [_tpot_row(3000.0, 1.0), _tpot_row(1000.0, 1.0),
-                _tpot_row(2000.0, 1.0)]
+        rows = [_tpot_row(3000.0, 10.0, 1.0), _tpot_row(1000.0, 10.0, 1.0),
+                _tpot_row(2000.0, 10.0, 1.0)]
         out = e8.tpot_grid_rows(rows, 1000)
         assert [r["tokens"] for r in out] == [1000, 2000, 3000]
 
-    def test_zero_output_tokens_lands_in_bucket_one(self, e8):
-        rows = [_tpot_row(0.0, 5.0)]
+    def test_zero_prompt_tokens_lands_in_bucket_one(self, e8):
+        rows = [_tpot_row(0.0, 10.0, 5.0)]
         out = e8.tpot_grid_rows(rows, 1000)
         assert out[0]["tokens"] == 1000
 
     def test_empty_input_returns_empty(self, e8):
         assert e8.tpot_grid_rows([], 1000) == []
+
+    def test_same_prompt_band_different_output_tokens_merge_into_one_row(
+            self, e8):
+        # Two requests with the same prompt-token band but different
+        # output_tokens must land in ONE grid row (bucketing is on
+        # prompt_tokens only), with mean_output_tokens averaging the two.
+        rows = [
+            _tpot_row(100.0, 10.0, 8.0),
+            _tpot_row(150.0, 50.0, 12.0),
+        ]
+        out = e8.tpot_grid_rows(rows, 1000)
+        assert len(out) == 1
+        row = out[0]
+        assert row["n"] == 2
+        assert row["mean_output_tokens"] == 30.0
+        assert row["mean_tpot_ms"] == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -1055,13 +1090,14 @@ class TestPrintTpotGrid:
     def test_empty_rows_prints_no_data(self, e8, capsys):
         e8.print_tpot_grid([], 1000)
         out = capsys.readouterr().out
-        assert "TPOT by output tokens" in out
+        assert "TPOT by total prompt tokens" in out
         assert "(no data)" in out
 
     def test_header_and_row_present(self, e8, capsys):
-        rows = e8.tpot_grid_rows([_tpot_row(1000.0, 12.5)], 1000)
+        rows = e8.tpot_grid_rows([_tpot_row(1000.0, 20.0, 12.5)], 1000)
         e8.print_tpot_grid(rows, 1000)
         out = capsys.readouterr().out
+        assert "mean_output" in out
         assert "mean_tpot_ms" in out
         assert "0-1000" in out
 
