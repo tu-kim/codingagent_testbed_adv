@@ -452,6 +452,21 @@ class TestPrintSla:
 # ---------------------------------------------------------------------------
 
 class TestPlotMetric:
+    def test_x_axis_is_pinned_to_the_models_full_context(self, e9p):
+        # The axis spans 1k..256k on every figure regardless of how far a
+        # given sweep got, so two runs' plots are visually comparable.
+        assert e9p.X_MAX_TOKENS == 262144
+
+    def test_axis_spans_full_context_even_for_a_short_sweep(self, e9p,
+                                                            tmp_path):
+        # A sweep that stopped at 4k still renders (the pinned upper limit
+        # is far beyond its data, which must not trip the log-scale setup).
+        pytest.importorskip("matplotlib")
+        rows = [_rw(1, 1024, 50.0), _rw(1, 4096, 200.0)]
+        out = tmp_path / "short.pdf"
+        e9p.plot_metric(rows, "ttft_ms", "TTFT (ms)", "TTFT", None, [], out)
+        assert out.exists() and out.stat().st_size > 0
+
     def test_writes_a_file_with_data(self, e9p, tmp_path):
         pytest.importorskip("matplotlib")
         rows = [_rw(1, 1000, 50.0), _rw(1, 2000, 150.0),

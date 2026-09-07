@@ -186,6 +186,11 @@ def sla_limits(rows: list[dict], metric: str, sla: float) -> list[dict]:
 # ---------- output ----------
 
 
+# The model's full context; the x axis is pinned here so every figure
+# spans the same range regardless of how far a given sweep got.
+X_MAX_TOKENS = 262144
+
+
 def _ktok(n: int) -> str:
     return f"{n // 1024}k" if n >= 1024 and n % 1024 == 0 else str(n)
 
@@ -273,8 +278,14 @@ def plot_metric(rows: list[dict], metric: str, ylabel: str, title: str,
                             [hi for _x, _lo, hi in band],
                             color=colour, alpha=0.15, linewidth=0)
     if sla is not None:
-        ax.axhline(sla, color="tab:red", ls="--", lw=1.4,
-                   label=f"SLA {sla:g}")
+        # Labelled ON the axes, not in the legend: the legend is for the
+        # batch-size curves, and the threshold reads better sitting on the
+        # line it describes.
+        ax.axhline(sla, color="tab:red", ls="--", lw=1.4)
+        ax.text(0.995, sla, f"SLA {sla:g}", transform=ax.get_yaxis_transform(),
+                ha="right", va="bottom", fontsize=9, color="tab:red",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none",
+                          alpha=0.75))
         lim = {r["batch"]: r for r in limits}
         for i, b in enumerate(batches):
             r = lim.get(b)
@@ -290,6 +301,15 @@ def plot_metric(rows: list[dict], metric: str, ylabel: str, title: str,
                                   ec="none", alpha=0.75))
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
+    # Ticks at the powers of two the sweep grid uses, labelled 1k..256k,
+    # and the axis pinned to the model's full 256k context so figures from
+    # different runs are directly comparable side by side.
+    ticks = [1 << e for e in range(10, 19)]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([_ktok(t) for t in ticks])
+    ax.set_xticks([], minor=True)
+    xs_all = [x for pts in by_batch.values() for x, _y in pts]
+    ax.set_xlim(min(min(xs_all), 1024) * 0.85, X_MAX_TOKENS * 1.05)
     ax.set_xlabel("prompt tokens")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -362,12 +382,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_figures:
         try:
             plot_metric(rows, "ttft_ms", "TTFT (ms)",
-                        "TTFT vs prompt tokens by batch size",
+                        "TTFT",
                         args.ttft_sla_ms,
                         [r for r in limits if r["metric"] == "ttft_ms"],
                         args.out / "fig_ttft.pdf")
             plot_metric(rows, "tpot_ms", "TPOT (ms/token)",
-                        "TPOT vs prompt tokens by batch size",
+                        "TPOT",
                         args.tpot_sla_ms,
                         [r for r in limits if r["metric"] == "tpot_ms"],
                         args.out / "fig_tpot.pdf")
