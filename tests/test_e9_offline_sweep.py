@@ -5,10 +5,19 @@ needs a real accelerator and is not installed on this dev machine. Loaded
 via importlib (script, not a package module) -- see
 tests/test_e8_ttft_tpot.py for the same pattern.
 
-Everything that would otherwise touch a real engine is exercised against
-`_FakeLLM` (a `generate()` that records every call and returns a dummy
-per-prompt list; nested attribute stubs are hung off an instance per-test
-for the config-reader helpers) plus a fake `vllm` module injected into
+This script is now MEASUREMENT ONLY (the SLA/plot/--from-csv reporting
+side moved to `e9_plot_ttft_tpot_sla.py` -- see tests/test_e9_plot_sla.py
+for sla_limits / print_sweep / print_sla / plot_metric / merge_sweeps).
+`main()` always builds an engine; there is no --from-csv path any more.
+It is exercised here by monkeypatching the module's own
+build_engine/chunked_prefill_enabled/engine_limits/run_sweep to fakes, so
+no real vLLM install or GPU is touched even for the end-to-end main()
+tests.
+
+Everything below main() is still exercised against `_FakeLLM` (a
+`generate()` that records every call and returns a dummy per-prompt list;
+nested attribute stubs are hung off an instance per-test for the
+config-reader helpers) plus a fake `vllm` module injected into
 `sys.modules` via `monkeypatch.setitem` so `measure_cell`'s in-function
 `from vllm import SamplingParams` resolves without a real install.
 """
@@ -422,122 +431,17 @@ class TestRunSweep:
 
 
 # ---------------------------------------------------------------------------
-# sla_limits
-# ---------------------------------------------------------------------------
-
-def _rw(batch, prompt_tokens, ttft_ms="", error=""):
-    return {"batch": batch, "prompt_tokens": prompt_tokens,
-            "ttft_ms": ttft_ms, "error": error}
-
-
-class TestSlaLimits:
-    def test_interpolated_crossing(self, e9):
-        rows = [_rw(1, 1000, 50.0), _rw(1, 2000, 150.0)]
-        out = e9.sla_limits(rows, "ttft_ms", 100.0)
-        # y_ok=50 at x=1000, y_bad=150 at x=2000; frac=(100-50)/(150-50)=0.5
-        # -> interp = 1000 + 0.5*(2000-1000) = 1500
-        assert out == [{"metric": "ttft_ms", "sla": 100.0, "batch": 1,
-                        "max_ok_measured": 1000, "max_ok_interp": 1500,
-                        "crossed": True}]
-
-    def test_never_crosses_reports_top_of_grid(self, e9):
-        rows = [_rw(1, 1000, 10.0), _rw(1, 2000, 20.0), _rw(1, 4000, 30.0)]
-        out = e9.sla_limits(rows, "ttft_ms", 100.0)
-        assert out == [{"metric": "ttft_ms", "sla": 100.0, "batch": 1,
-                        "max_ok_measured": 4000, "max_ok_interp": 4000,
-                        "crossed": False}]
-
-    def test_all_fail_reports_zero_and_crossed(self, e9):
-        rows = [_rw(1, 1000, 500.0), _rw(1, 2000, 600.0)]
-        out = e9.sla_limits(rows, "ttft_ms", 100.0)
-        assert out == [{"metric": "ttft_ms", "sla": 100.0, "batch": 1,
-                        "max_ok_measured": 0, "max_ok_interp": 0,
-                        "crossed": True}]
-
-    def test_error_and_blank_rows_excluded(self, e9):
-        # An error row (tiny value, which would otherwise become the new
-        # max_ok) and a blank-metric row both sit strictly between two real
-        # points. Correct exclusion leaves the single real point as a
-        # "never crosses" result rather than corrupting the curve with
-        # either excluded row.
-        rows = [
-            _rw(1, 1000, 50.0),
-            _rw(1, 1500, ""),
-            _rw(1, 2000, 5.0, error="OOM: boom"),
-        ]
-        out = e9.sla_limits(rows, "ttft_ms", 100.0)
-        assert out == [{"metric": "ttft_ms", "sla": 100.0, "batch": 1,
-                        "max_ok_measured": 1000, "max_ok_interp": 1000,
-                        "crossed": False}]
-
-    def test_multiple_batches_sorted_ascending(self, e9):
-        rows = [_rw(4, 1000, 10.0), _rw(1, 1000, 10.0)]
-        out = e9.sla_limits(rows, "ttft_ms", 100.0)
-        assert [r["batch"] for r in out] == [1, 4]
-
-
-# ---------------------------------------------------------------------------
-# print_sweep / print_sla
-# ---------------------------------------------------------------------------
-
-class TestPrintSweep:
-    def test_error_cell_renders_as_x_missing_cell_as_dash(self, e9, capsys):
-        rows = [
-            _rw(1, 1000, 10.0),
-            _rw(1, 2000, 20.0),
-            _rw(4, 1000, "", error="OOM: boom"),
-            # (4, 2000) is simply absent from `rows` -> a missing cell.
-        ]
-        e9.print_sweep(rows, "ttft_ms", "TTFT (ms)")
-        out = capsys.readouterr().out
-        assert "TTFT (ms) (rows = batch size, cols = prompt tokens):" in out
-        lines = [l for l in out.splitlines() if l.strip()]
-        row1 = next(l for l in lines if l.lstrip().startswith("1"))
-        row4 = next(l for l in lines if l.lstrip().startswith("4"))
-        assert row1.split()[1:] == ["10.0", "20.0"]
-        assert row4.split()[1:] == ["x", "-"]
-
-
-class TestPrintSla:
-    def test_crossed_and_never_crossed_notes(self, e9, capsys):
-        limits = [
-            {"metric": "ttft_ms", "sla": 100.0, "batch": 1,
-             "max_ok_measured": 1000, "max_ok_interp": 1500, "crossed": True},
-            {"metric": "ttft_ms", "sla": 100.0, "batch": 2,
-             "max_ok_measured": 4000, "max_ok_interp": 4000,
-             "crossed": False},
-        ]
-        e9.print_sla(limits, "ms")
-        out = capsys.readouterr().out
-        assert "Longest prompt meeting ttft_ms <= 100 ms:" in out
-        lines = [l for l in out.splitlines() if l.strip()]
-        row1 = next(l for l in lines if l.split()[:1] == ["1"])
-        row2 = next(l for l in lines if l.split()[:1] == ["2"])
-        assert row1.split()[:3] == ["1", "1000", "1500"]
-        assert "(never crossed within the grid)" not in row1
-        assert "(never crossed within the grid)" in row2
-
-    def test_empty_limits_prints_nothing(self, e9, capsys):
-        e9.print_sla([], "ms")
-        assert capsys.readouterr().out == ""
-
-
-# ---------------------------------------------------------------------------
-# main() -- --from-csv end to end
+# main() -- always builds an engine now (no --from-csv path); everything
+# that would touch a real vLLM engine is monkeypatched to a fake at the
+# module level.
 # ---------------------------------------------------------------------------
 
 _SWEEP_COLS = ["batch", "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms",
               "decode_ms", "total_ms", "error"]
 
 
-def _write_sweep_csv(path: Path, rows: list) -> None:
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=_SWEEP_COLS)
-        w.writeheader()
-        w.writerows(rows)
-
-
-def _sweep_row(batch, prompt_tokens, ttft_ms, tpot_ms, gen_tokens=8):
+def _fake_row(batch=1, prompt_tokens=1000, gen_tokens=8, ttft_ms=10.0,
+             tpot_ms=1.0):
     decode_ms = tpot_ms * (gen_tokens - 1)
     return {"batch": batch, "prompt_tokens": prompt_tokens,
             "gen_tokens": gen_tokens, "ttft_ms": ttft_ms, "tpot_ms": tpot_ms,
@@ -545,88 +449,113 @@ def _sweep_row(batch, prompt_tokens, ttft_ms, tpot_ms, gen_tokens=8):
             "error": ""}
 
 
-class TestMainFromCsv:
-    def test_end_to_end_returns_zero_and_prints_both_tables(
-            self, e9, tmp_path, capsys):
-        csv_path = tmp_path / "sweep.csv"
-        _write_sweep_csv(csv_path, [
-            _sweep_row(1, 1000, 50.0, 5.0),
-            _sweep_row(1, 2000, 150.0, 6.0),
-        ])
-        out_dir = tmp_path / "out"
-        rc = e9.main(["--from-csv", str(csv_path), "--out", str(out_dir),
-                     "--no-figures"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "TTFT (ms)" in out
-        assert "TPOT (ms/token)" in out
-        # --from-csv skips measurement entirely -- it must not re-derive or
-        # overwrite a sweep.csv of its own in --out.
-        assert not (out_dir / "sweep.csv").exists()
+def _patch_engine(monkeypatch, e9, *, chunked_prefill=False,
+                  max_model_len=65536, vocab_size=32000, rows=None,
+                  record_run_sweep_args=None):
+    """Stub out everything main() uses to talk to a real engine, leaving
+    the grid-building / CSV-writing / exit-code logic in main() itself
+    under test."""
+    monkeypatch.setattr(e9, "build_engine", lambda args: "engine-sentinel")
+    monkeypatch.setattr(e9, "chunked_prefill_enabled",
+                        lambda llm: chunked_prefill)
+    monkeypatch.setattr(e9, "engine_limits",
+                        lambda llm: (max_model_len, vocab_size))
 
-    def test_sla_limits_csv_written_with_header_when_sla_flag_given(
-            self, e9, tmp_path):
-        csv_path = tmp_path / "sweep.csv"
-        _write_sweep_csv(csv_path, [
-            _sweep_row(1, 1000, 50.0, 5.0),
-            _sweep_row(1, 2000, 150.0, 6.0),
-        ])
+    def fake_run_sweep(llm, batches, lengths, gen_tokens, vocab_size, seed,
+                       warmup=True):
+        if record_run_sweep_args is not None:
+            record_run_sweep_args.append({
+                "llm": llm, "batches": batches, "lengths": lengths,
+                "gen_tokens": gen_tokens, "vocab_size": vocab_size,
+                "seed": seed, "warmup": warmup,
+            })
+        return rows if rows is not None else [_fake_row()]
+
+    monkeypatch.setattr(e9, "run_sweep", fake_run_sweep)
+
+
+class TestMain:
+    def test_writes_sweep_csv_with_expected_header_and_prints_pointer(
+            self, e9, monkeypatch, tmp_path, capsys):
+        _patch_engine(monkeypatch, e9, rows=[_fake_row(1, 1000, 8, 10.0, 1.0)])
         out_dir = tmp_path / "out"
-        rc = e9.main(["--from-csv", str(csv_path), "--out", str(out_dir),
-                     "--no-figures", "--ttft-sla-ms", "100"])
+
+        rc = e9.main(["--batch-sizes", "1", "--gen-tokens", "8",
+                     "--out", str(out_dir)])
+
         assert rc == 0
-        sla_path = out_dir / "sla_limits.csv"
-        assert sla_path.exists()
-        with sla_path.open() as fh:
+        out_csv = out_dir / "sweep.csv"
+        assert out_csv.exists()
+        with out_csv.open() as fh:
             reader = csv.DictReader(fh)
-            assert reader.fieldnames == [
-                "metric", "sla", "batch", "max_ok_measured",
-                "max_ok_interp", "crossed",
-            ]
+            assert reader.fieldnames == _SWEEP_COLS
             rows = list(reader)
         assert len(rows) == 1
-        assert rows[0]["metric"] == "ttft_ms"
+        assert rows[0]["batch"] == "1"
+        out = capsys.readouterr().out
+        assert f"wrote {out_csv}" in out
+        assert "e9_plot_ttft_tpot_sla.py" in out
+        assert f"--sweep {out_csv}" in out
 
-    def test_sla_limits_csv_not_written_without_any_sla_flag(
-            self, e9, tmp_path):
-        csv_path = tmp_path / "sweep.csv"
-        _write_sweep_csv(csv_path, [_sweep_row(1, 1000, 50.0, 5.0)])
+    def test_chunked_prefill_enabled_without_flag_returns_3(
+            self, e9, monkeypatch, tmp_path, capsys):
+        calls = []
+        _patch_engine(monkeypatch, e9, chunked_prefill=True,
+                      record_run_sweep_args=calls)
         out_dir = tmp_path / "out"
-        rc = e9.main(["--from-csv", str(csv_path), "--out", str(out_dir),
-                     "--no-figures"])
+
+        rc = e9.main(["--out", str(out_dir)])
+
+        assert rc == 3
+        assert calls == []  # run_sweep must never be reached
+        assert not (out_dir / "sweep.csv").exists()
+        err = capsys.readouterr().err
+        assert "chunked prefill" in err.lower()
+
+    def test_chunked_prefill_enabled_with_flag_proceeds(
+            self, e9, monkeypatch, tmp_path):
+        _patch_engine(monkeypatch, e9, chunked_prefill=True)
+        out_dir = tmp_path / "out"
+
+        rc = e9.main(["--enable-chunked-prefill", "--out", str(out_dir)])
+
         assert rc == 0
-        assert not (out_dir / "sla_limits.csv").exists()
+        assert (out_dir / "sweep.csv").exists()
 
-    def test_empty_csv_returns_two(self, e9, tmp_path):
-        csv_path = tmp_path / "empty.csv"
-        _write_sweep_csv(csv_path, [])  # header only, zero data rows
+    def test_no_prompt_length_fits_returns_2(
+            self, e9, monkeypatch, tmp_path, capsys):
+        calls = []
+        # max_model_len - gen_tokens (default 128) is negative, so every
+        # power-of-two default length is dropped and the grid is empty.
+        _patch_engine(monkeypatch, e9, max_model_len=100,
+                      record_run_sweep_args=calls)
         out_dir = tmp_path / "out"
-        rc = e9.main(["--from-csv", str(csv_path), "--out", str(out_dir),
-                     "--no-figures"])
+
+        rc = e9.main(["--out", str(out_dir)])
+
         assert rc == 2
+        assert calls == []
+        assert not (out_dir / "sweep.csv").exists()
+        err = capsys.readouterr().err
+        assert "no prompt length fits" in err.lower()
 
+    def test_over_long_prompt_len_dropped_with_warning(
+            self, e9, monkeypatch, tmp_path, capsys):
+        calls = []
+        # max_model_len=2000, gen_tokens=100 -> max_prompt=1900. 1000 fits,
+        # 999999 does not.
+        _patch_engine(monkeypatch, e9, max_model_len=2000,
+                      rows=[_fake_row(1, 1000, 100, 10.0, 1.0)],
+                      record_run_sweep_args=calls)
+        out_dir = tmp_path / "out"
 
-# ---------------------------------------------------------------------------
-# plot_metric (matplotlib-dependent)
-# ---------------------------------------------------------------------------
+        rc = e9.main(["--prompt-lens", "1000,999999", "--gen-tokens", "100",
+                     "--out", str(out_dir)])
 
-class TestPlotMetric:
-    def test_writes_a_file_with_data(self, e9, tmp_path):
-        pytest.importorskip("matplotlib")
-        rows = [_rw(1, 1000, 50.0), _rw(1, 2000, 150.0),
-                _rw(4, 1000, 80.0), _rw(4, 2000, 220.0)]
-        limits = e9.sla_limits(rows, "ttft_ms", 100.0)
-        out = tmp_path / "fig.pdf"
-        e9.plot_metric(rows, "ttft_ms", "TTFT (ms)",
-                       "TTFT vs prompt tokens", 100.0, limits, out)
-        assert out.exists()
-        assert out.stat().st_size > 0
-
-    def test_all_error_rows_render_no_data_without_raising(self, e9, tmp_path):
-        pytest.importorskip("matplotlib")
-        rows = [_rw(1, 1000, "", error="boom"),
-                _rw(1, 2000, "", error="boom2")]
-        out = tmp_path / "fig_empty.pdf"
-        e9.plot_metric(rows, "ttft_ms", "TTFT (ms)", "title", None, [], out)
-        assert out.exists()
-        assert out.stat().st_size > 0
+        assert rc == 0
+        assert len(calls) == 1
+        assert calls[0]["lengths"] == [1000]
+        err = capsys.readouterr().err
+        assert "999999" in err
+        assert "dropping" in err.lower()
+        assert (out_dir / "sweep.csv").exists()
