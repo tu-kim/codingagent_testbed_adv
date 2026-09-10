@@ -1362,6 +1362,34 @@ class TestReuseReprefillPoints:
 # fig_reuse_reprefill_density (matplotlib-dependent)
 # ---------------------------------------------------------------------------
 
+class TestClipPoints:
+    def test_no_limits_keeps_everything(self, e8):
+        pts = [(0.0, 10.0), (5.0, 900000.0)]
+        assert e8.clip_points(pts, None, None) == (pts, 0)
+
+    def test_ymax_drops_the_reprefill_outliers(self, e8):
+        pts = [(0.0, 10.0), (5.0, 500000.0), (7.0, 400000.0)]
+        kept, dropped = e8.clip_points(pts, 400000, None)
+        # the limit is INCLUSIVE: a point exactly at it stays
+        assert kept == [(0.0, 10.0), (7.0, 400000.0)]
+        assert dropped == 1
+
+    def test_xmax_applies_to_the_reuse_axis(self, e8):
+        pts = [(1000.0, 10.0), (90000.0, 10.0)]
+        kept, dropped = e8.clip_points(pts, None, 50000)
+        assert kept == [(1000.0, 10.0)]
+        assert dropped == 1
+
+    def test_both_limits_together(self, e8):
+        pts = [(10.0, 10.0), (10.0, 999.0), (999.0, 10.0), (999.0, 999.0)]
+        kept, dropped = e8.clip_points(pts, 100, 100)
+        assert kept == [(10.0, 10.0)]
+        assert dropped == 3
+
+    def test_empty_input(self, e8):
+        assert e8.clip_points([], 400000, None) == ([], 0)
+
+
 class TestFigReuseReprefillDensity:
     def test_writes_nonempty_file_for_normal_input(self, e8, tmp_path):
         pytest.importorskip("matplotlib")

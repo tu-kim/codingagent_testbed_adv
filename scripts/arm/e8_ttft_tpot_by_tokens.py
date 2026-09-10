@@ -78,7 +78,10 @@ Outputs (under --out):
   fig4_reuse_reprefill_density.pdf where the requests THEMSELVES sit in the
                              (c, n) = (reuse, reprefill) plane: log-scaled
                              hexbin density, marginal histograms, and
-                             constant-prompt-size diagonals
+                             constant-prompt-size diagonals. --density-ymax
+                             (default 400000) drops the reprefill outliers
+                             that would otherwise flatten the bulk into one
+                             cell; the count dropped is on the figure
   fig3_ttft_reuse_reprefill.pdf    TTFT over the (reuse, reprefill) plane;
                              the colour scale is LOGARITHMIC and clipped to
                              p2..p98 -- TTFT is right-skewed enough that a
@@ -626,7 +629,20 @@ def reuse_reprefill_points(rows: list[dict]) -> list[tuple[float, float]]:
     return pts
 
 
-def fig_reuse_reprefill_density(rows, path: Path) -> None:
+def clip_points(pts: list[tuple[float, float]], ymax: float | None,
+                xmax: float | None) -> tuple[list[tuple[float, float]], int]:
+    """Drop (c, n) points outside the limits; return (kept, n_dropped).
+
+    Separate from the plotting so the cut is testable and so the dropped
+    count can be stated on the figure rather than vanishing.
+    """
+    kept = [(c, n) for c, n in pts
+            if (ymax is None or n <= ymax) and (xmax is None or c <= xmax)]
+    return kept, len(pts) - len(kept)
+
+
+def fig_reuse_reprefill_density(rows, path: Path, ymax: float | None = None,
+                                xmax: float | None = None) -> None:
     """Where requests actually sit in the (c, n) plane.
 
     fig3 colours this same plane by TTFT; this one is about the
@@ -641,10 +657,18 @@ def fig_reuse_reprefill_density(rows, path: Path) -> None:
     jumps to a higher one when the conversation grows. Requests on the
     x axis (n small) are near-total cache hits; those on the y axis
     (c = 0) are full misses.
+
+    `ymax`/`xmax` DROP points beyond them rather than just narrowing the
+    view. The reprefill axis is the skewed one -- a full-miss turn late
+    in a long conversation recomputes the entire context -- and a handful
+    of those stretch the hexbin's extent so far that every cell in the
+    bulk becomes one coarse blob. Dropped requests are counted in the
+    title, never silently discarded.
     """
     plt = _mpl()
     from matplotlib.colors import LogNorm
     pts = reuse_reprefill_points(rows)
+    pts, n_clipped = clip_points(pts, ymax, xmax)
     fig = plt.figure(figsize=(9, 8))
     gs = fig.add_gridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4),
                           wspace=0.05, hspace=0.05)
@@ -693,9 +717,11 @@ def fig_reuse_reprefill_density(rows, path: Path) -> None:
     ax_right.set_xlabel("count")
 
     n_zero = sum(1 for c in cs if c == 0)
-    ax_top.set_title(
-        f"(c, n) distribution -- {len(pts)} requests, "
-        f"{100.0 * n_zero / len(pts):.1f}% full miss (c=0)", fontsize=10)
+    title = (f"(c, n) distribution -- {len(pts)} requests, "
+             f"{100.0 * n_zero / len(pts):.1f}% full miss (c=0)")
+    if n_clipped:
+        title += f"\n{n_clipped} beyond the axis limits not shown"
+    ax_top.set_title(title, fontsize=10)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -744,8 +770,19 @@ def main(argv: list[str] | None = None) -> int:
                          "every TPOT aggregate and figure (default 1.0 -- "
                          "faster than that is a broken join, not a decode "
                          "rate). 0 disables the filter")
+    ap.add_argument("--density-ymax", type=float, default=400000,
+                    help="fig4: drop requests whose reprefill tokens exceed "
+                         "this (default 400000). That axis is the skewed one "
+                         "-- a few full-miss turns on long conversations "
+                         "stretch the hexbin extent until the bulk is one "
+                         "blob. 0 keeps everything")
+    ap.add_argument("--density-xmax", type=float, default=None,
+                    help="fig4: same cut on the reuse-token axis "
+                         "(default: no cut)")
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args(argv)
+    if args.density_ymax is not None and args.density_ymax <= 0:
+        args.density_ymax = None
 
     if not args.frontend.exists():
         print(f"error: {args.frontend} not found", file=sys.stderr)
@@ -866,7 +903,8 @@ def main(argv: list[str] | None = None) -> int:
                      args.out / "fig1_ttft_vs_prompt_tokens.pdf")
             fig_ttft_plane(rows, args.out / "fig3_ttft_reuse_reprefill.pdf")
             fig_reuse_reprefill_density(
-                rows, args.out / "fig4_reuse_reprefill_density.pdf")
+                rows, args.out / "fig4_reuse_reprefill_density.pdf",
+                ymax=args.density_ymax, xmax=args.density_xmax)
             fig_tpot(tpot_rows,
                      bucket_rows(tpot_rows, "prompt_tokens", "tpot_ms",
                                  PROMPT_BINS, False),
