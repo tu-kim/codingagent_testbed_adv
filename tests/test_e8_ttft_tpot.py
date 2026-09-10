@@ -1310,3 +1310,116 @@ class TestFigTtftPlane:
         e8.fig_ttft_plane(rows, out)
         assert out.exists()
         assert out.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# reuse_reprefill_points
+# ---------------------------------------------------------------------------
+
+class TestReuseReprefillPoints:
+    def test_both_present_rows_kept_in_order(self, e8):
+        rows = [
+            {"cached_tokens": 5.0, "reprefill_tokens": 10.0},
+            {"cached_tokens": 20.0, "reprefill_tokens": 1.0},
+        ]
+        assert e8.reuse_reprefill_points(rows) == [(5.0, 10.0), (20.0, 1.0)]
+
+    def test_blank_cached_tokens_skipped(self, e8):
+        rows = [
+            {"cached_tokens": "", "reprefill_tokens": 10.0},
+            {"cached_tokens": 5.0, "reprefill_tokens": 10.0},
+        ]
+        assert e8.reuse_reprefill_points(rows) == [(5.0, 10.0)]
+
+    def test_blank_reprefill_tokens_skipped(self, e8):
+        rows = [
+            {"cached_tokens": 5.0, "reprefill_tokens": ""},
+            {"cached_tokens": 5.0, "reprefill_tokens": 10.0},
+        ]
+        assert e8.reuse_reprefill_points(rows) == [(5.0, 10.0)]
+
+    def test_missing_key_skipped(self, e8):
+        # .get() rather than [] -- a row missing either field entirely (not
+        # just blank) must be skipped, not raise KeyError.
+        rows = [
+            {"reprefill_tokens": 10.0},
+            {"cached_tokens": 5.0},
+            {"cached_tokens": 5.0, "reprefill_tokens": 10.0},
+        ]
+        assert e8.reuse_reprefill_points(rows) == [(5.0, 10.0)]
+
+    def test_empty_input_returns_empty(self, e8):
+        assert e8.reuse_reprefill_points([]) == []
+
+    def test_zero_valued_fields_are_not_blank(self, e8):
+        # 0.0 is a real value, not a missing one -- must not be treated the
+        # same as "" (an `if not c` guard would wrongly drop it).
+        rows = [{"cached_tokens": 0.0, "reprefill_tokens": 0.0}]
+        assert e8.reuse_reprefill_points(rows) == [(0.0, 0.0)]
+
+
+# ---------------------------------------------------------------------------
+# fig_reuse_reprefill_density (matplotlib-dependent)
+# ---------------------------------------------------------------------------
+
+class TestFigReuseReprefillDensity:
+    def test_writes_nonempty_file_for_normal_input(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        rows = [
+            {"cached_tokens": float(i * 10), "reprefill_tokens": float(200 - i * 5)}
+            for i in range(20)
+        ]
+        out = tmp_path / "fig4.pdf"
+        e8.fig_reuse_reprefill_density(rows, out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_empty_input_writes_no_data_file_without_raising(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        out = tmp_path / "fig4_empty.pdf"
+        e8.fig_reuse_reprefill_density([], out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_single_point_does_not_raise(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        rows = [{"cached_tokens": 100.0, "reprefill_tokens": 200.0}]
+        out = tmp_path / "fig4_single.pdf"
+        e8.fig_reuse_reprefill_density(rows, out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_all_zero_point_does_not_divide_by_zero(self, e8, tmp_path):
+        # hi = max(max(cs), max(ns)) or 1.0 -- with a single (0, 0) point,
+        # max(cs)=max(ns)=0 (falsy), so `or 1.0` substitutes a safe nonzero
+        # axis limit instead of dividing by zero when normalizing xlim/ylim
+        # and the diagonal-line loop bounds. Traced directly (not just
+        # asserted) before writing this test: raises nothing.
+        rows = [{"cached_tokens": 0.0, "reprefill_tokens": 0.0}]
+        out = tmp_path / "fig4_allzero.pdf"
+        e8.fig_reuse_reprefill_density(rows, out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# main() -- fig4 filename
+# ---------------------------------------------------------------------------
+
+class TestMainFig4Filename:
+    def test_fig4_reuse_reprefill_density_written(self, e8, tmp_path):
+        pytest.importorskip("matplotlib")
+        frontend = tmp_path / "frontend.log"
+        _write_frontend(frontend, [("r1", 100.0, 20.0, 10)])
+        profdir = tmp_path / "profiles"
+        profdir.mkdir()
+        _write_jsonl(profdir / "p.jsonl",
+                     [_llm_end("r1", input_tok=100, cache_read=0)])
+        out = tmp_path / "out_fig4"
+        rc = e8.main([
+            "--frontend", str(frontend),
+            "--profiles", str(profdir),
+            "--out", str(out),
+        ])
+        assert rc == 0
+        assert (out / "fig4_reuse_reprefill_density.pdf").exists()

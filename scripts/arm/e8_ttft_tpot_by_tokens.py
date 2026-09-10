@@ -75,6 +75,10 @@ Outputs (under --out):
   fig2_tpot_vs_prompt_tokens.pdf   TPOT distribution vs total prompt tokens
                              (the context drives per-token decode cost; the
                              output count only says how many steps ran)
+  fig4_reuse_reprefill_density.pdf where the requests THEMSELVES sit in the
+                             (c, n) = (reuse, reprefill) plane: log-scaled
+                             hexbin density, marginal histograms, and
+                             constant-prompt-size diagonals
   fig3_ttft_reuse_reprefill.pdf    TTFT over the (reuse, reprefill) plane;
                              the colour scale is LOGARITHMIC and clipped to
                              p2..p98 -- TTFT is right-skewed enough that a
@@ -610,6 +614,92 @@ def fig_ttft_plane(rows, path: Path) -> None:
     plt.close(fig)
 
 
+def reuse_reprefill_points(rows: list[dict]) -> list[tuple[float, float]]:
+    """(c, n) = (reused tokens, re-prefilled tokens) for every request that
+    has both."""
+    pts = []
+    for r in rows:
+        c, n = r.get("cached_tokens"), r.get("reprefill_tokens")
+        if c in ("", None) or n in ("", None):
+            continue
+        pts.append((float(c), float(n)))
+    return pts
+
+
+def fig_reuse_reprefill_density(rows, path: Path) -> None:
+    """Where requests actually sit in the (c, n) plane.
+
+    fig3 colours this same plane by TTFT; this one is about the
+    POPULATION -- how the workload distributes over reuse vs recompute.
+    Density is drawn as a hexbin with a LOG count scale (a coding agent
+    piles most of its turns into a small region and the linear scale
+    would show one hot cell and nothing else), with the marginal
+    histogram of each axis alongside.
+
+    Faint diagonals mark constant prompt size c + n: a request moves
+    ALONG one of them when the cache absorbs more of the same prompt, and
+    jumps to a higher one when the conversation grows. Requests on the
+    x axis (n small) are near-total cache hits; those on the y axis
+    (c = 0) are full misses.
+    """
+    plt = _mpl()
+    from matplotlib.colors import LogNorm
+    pts = reuse_reprefill_points(rows)
+    fig = plt.figure(figsize=(9, 8))
+    gs = fig.add_gridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4),
+                          wspace=0.05, hspace=0.05)
+    ax = fig.add_subplot(gs[1, 0])
+    ax_top = fig.add_subplot(gs[0, 0], sharex=ax)
+    ax_right = fig.add_subplot(gs[1, 1], sharey=ax)
+    if not pts:
+        ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                ha="center", va="center", color="grey")
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return
+    cs = [c for c, _n in pts]
+    ns = [n for _c, n in pts]
+    hb = ax.hexbin(cs, ns, gridsize=45, cmap="viridis", mincnt=1,
+                   norm=LogNorm(), linewidths=0)
+    hi = max(max(cs), max(ns)) or 1.0
+    for total in (1 << e for e in range(10, 20)):
+        if total > 2 * hi:
+            break
+        ax.plot([0, total], [total, 0], color="grey", lw=0.6, ls=":",
+                alpha=0.6, zorder=0)
+        # Only label the diagonals that are far enough out to be legible;
+        # near the origin they overlap into a smear.
+        if 0.15 * hi <= total <= hi:
+            ax.annotate(_ktok(int(total)), xy=(total * 0.5, total * 0.5),
+                        fontsize=7, color="grey", ha="center", va="center",
+                        rotation=-45,
+                        bbox=dict(boxstyle="round,pad=0.1", fc="white",
+                                  ec="none", alpha=0.6))
+    ax.set_xlim(-0.02 * hi, hi * 1.05)
+    ax.set_ylim(-0.02 * hi, hi * 1.05)
+    ax.set_xlabel("reuse tokens c (tokens.cache.read)")
+    ax.set_ylabel("reprefill tokens n (tokens.input)")
+    ax.grid(alpha=0.25)
+    fig.colorbar(hb, ax=ax_right, label="requests per cell", pad=0.25)
+
+    ax_top.hist(cs, bins=60, color="tab:blue", alpha=0.75)
+    ax_top.set_yscale("log")
+    ax_top.tick_params(labelbottom=False)
+    ax_top.set_ylabel("count")
+    ax_right.hist(ns, bins=60, orientation="horizontal", color="tab:blue",
+                  alpha=0.75)
+    ax_right.set_xscale("log")
+    ax_right.tick_params(labelleft=False)
+    ax_right.set_xlabel("count")
+
+    n_zero = sum(1 for c in cs if c == 0)
+    ax_top.set_title(
+        f"(c, n) distribution -- {len(pts)} requests, "
+        f"{100.0 * n_zero / len(pts):.1f}% full miss (c=0)", fontsize=10)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def fig_tpot(rows, buckets, path: Path) -> None:
     """TPOT against TOTAL PROMPT tokens.
 
@@ -775,6 +865,8 @@ def main(argv: list[str] | None = None) -> int:
             fig_ttft(rows, b_prompt,
                      args.out / "fig1_ttft_vs_prompt_tokens.pdf")
             fig_ttft_plane(rows, args.out / "fig3_ttft_reuse_reprefill.pdf")
+            fig_reuse_reprefill_density(
+                rows, args.out / "fig4_reuse_reprefill_density.pdf")
             fig_tpot(tpot_rows,
                      bucket_rows(tpot_rows, "prompt_tokens", "tpot_ms",
                                  PROMPT_BINS, False),
